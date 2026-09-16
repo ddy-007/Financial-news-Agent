@@ -1,0 +1,19 @@
+# 仓库内统一按 LF 存储，工作区按平台检出。
+# 目的：避免换行符翻转导致 git diff 把整个文件显示为"全部改动"，
+# 那会让代码巡检无法定位到真实改动行。
+* text=auto
+
+# Windows 脚本保留 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不做换行转换
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.db binary
+*.pyc binary

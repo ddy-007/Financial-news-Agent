@@ -1,0 +1,41 @@
+# Web 框架
+fastapi
+uvicorn[standard]
+
+# LangChain 生态
+langchain
+langchain-community
+langchain-huggingface
+langchain-openai
+langgraph
+
+# RAG
+chromadb
+FlagEmbedding
+sentence-transformers
+jieba
+rank_bm25
+
+# 数据采集
+akshare
+yfinance
+pandas
+httpx
+feedparser
+
+# 存储
+sqlalchemy
+
+# 调度与工具
+apscheduler
+tenacity
+loguru
+
+# 配置
+pydantic
+pydantic-settings
+python-dotenv
+
+# 前端
+streamlit
+plotly

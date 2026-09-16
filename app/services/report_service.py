@@ -1,0 +1,182 @@
+"""研判报告服务 + 预测回测。"""
+from __future__ import annotations
+
+import json
+
+from loguru import logger
+from sqlalchemy.orm import Session
+
+from app.agent.graph import generate_daily_report, score_news_sentiment
+from app.models.market import MarketData
+from app.models.report import MarketReport
+
+
+def run_daily_pipeline(db: Session) -> MarketReport:
+    """每日主流程：新闻情绪打分 → 生成研判报告 → 追加评估日志。
+
+    注：末尾会向 data/eval_log.jsonl 追加一行评估结果（副作用）。
+    评估失败不影响主流程。
+    """
+    score_news_sentiment(db)
+    report = generate_daily_report(db)
+    try:
+        from app.services.evaluation import append_eval_log
+
+        append_eval_log(db)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"评估日志追加失败（不影响主流程）: {e}")
+    return report
+
+
+def generate_weekly(db: Session) -> MarketReport | None:
+    """生成周报（供调度器调用）。日报不足 2 份时返回 None。"""
+    from app.agent.weekly import generate_weekly_report
+
+    return generate_weekly_report(db)
+
+
+def get_latest_daily(db: Session) -> MarketReport | None:
+    """最近一份**日报**（排除周报）。"""
+    return (
+        db.query(MarketReport)
+        .filter((MarketReport.report_type == "daily")
+                | (MarketReport.report_type.is_(None)))
+        .order_by(MarketReport.date.desc())
+        .first()
+    )
+
+
+def get_latest_weekly(db: Session) -> MarketReport | None:
+    return (
+        db.query(MarketReport)
+        .filter(MarketReport.report_type == "weekly")
+        .order_by(MarketReport.date.desc())
+        .first()
+    )
+
+
+def list_reports(db: Session, limit: int = 30,
+                 report_type: str | None = "daily") -> list[MarketReport]:
+    q = db.query(MarketReport)
+    if report_type == "daily":
+        q = q.filter((MarketReport.report_type == "daily")
+                     | (MarketReport.report_type.is_(None)))
+    elif report_type:
+        q = q.filter(MarketReport.report_type == report_type)
+    return q.order_by(MarketReport.date.desc()).limit(limit).all()
+
+
+def report_to_dict(r: MarketReport) -> dict:
+    try:
+        content = json.loads(r.content)
+    except (json.JSONDecodeError, TypeError):
+        content = r.content
+    try:
+        experts = json.loads(r.expert_opinions) if r.expert_opinions else []
+    except (json.JSONDecodeError, TypeError):
+        experts = []
+    return {
+        "id": r.id,
+        "date": r.date.isoformat(),
+        "report_type": r.report_type or "daily",
+        "title": r.title,
+        "content": content,
+        "sentiment": r.sentiment,
+        "confidence": r.confidence,
+        "score": r.score,
+        "low_info": r.low_info,
+        "data_stale": r.data_stale,
+        "risk_veto": r.risk_veto,
+        "divergence": r.divergence,
+        "expert_opinions": experts,
+        "model": r.model,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+def _score_bucket(score: float) -> str:
+    """按综合情绪分分档。"""
+    if score > 0.5:
+        return "强多(>0.5)"
+    if score > 0.1:
+        return "偏多(0.1~0.5)"
+    if score < -0.5:
+        return "强空(<-0.5)"
+    if score < -0.1:
+        return "偏空(-0.5~-0.1)"
+    return "中性(-0.1~0.1)"
+
+
+def compute_backtest(db: Session) -> dict:
+    """用上证指数次日涨跌回测历史研判方向准确率，并按情绪分档统计胜率。
+
+    注：只统计**日报**——周报与日报同日、会被重复计数，且周报不对应"次日"。
+    """
+    reports = (
+        db.query(MarketReport)
+        .filter((MarketReport.report_type == "daily")
+                | (MarketReport.report_type.is_(None)))
+        .order_by(MarketReport.date.asc())
+        .all()
+    )
+    sh = (
+        db.query(MarketData)
+        .filter(MarketData.symbol == "sh000001")
+        .order_by(MarketData.date.asc())
+        .all()
+    )
+    date_to_pct: dict = {r.date.date(): r.change_pct for r in sh}
+    dates = sorted(date_to_pct.keys())
+
+    correct = 0
+    total = 0
+    buckets: dict[str, dict] = {}
+    details = []
+    for rep in reports:
+        if rep.score is None:
+            continue
+        pred_dir = 1 if rep.score > 0.1 else (-1 if rep.score < -0.1 else 0)
+        if pred_dir == 0:
+            continue  # 中性不纳入方向统计
+        rd = rep.date.date()
+        next_dates = [d for d in dates if d > rd]
+        if not next_dates:
+            continue
+        next_pct = date_to_pct[next_dates[0]]
+        if next_pct is None:
+            continue
+        actual_dir = 1 if next_pct > 0 else (-1 if next_pct < 0 else 0)
+        if actual_dir == 0:
+            continue
+        ok = pred_dir == actual_dir
+        total += 1
+        correct += int(ok)
+        bucket = _score_bucket(rep.score)
+        b = buckets.setdefault(bucket, {"total": 0, "correct": 0})
+        b["total"] += 1
+        b["correct"] += int(ok)
+        details.append({
+            "date": str(rd),
+            "score": rep.score,
+            "pred_dir": "看多" if pred_dir > 0 else "看空",
+            "next_change_pct": next_pct,
+            "correct": ok,
+        })
+
+    accuracy = round(correct / total * 100, 2) if total else 0.0
+    by_bucket = [
+        {
+            "bucket": k,
+            "total": v["total"],
+            "correct": v["correct"],
+            "accuracy": round(v["correct"] / v["total"] * 100, 2) if v["total"] else 0.0,
+        }
+        for k, v in buckets.items()
+    ]
+    return {
+        "total": total,
+        "correct": correct,
+        "accuracy": accuracy,
+        "by_bucket": by_bucket,
+        "details": details,
+    }
