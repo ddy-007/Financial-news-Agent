@@ -95,7 +95,13 @@ class Settings(BaseSettings):
     sentiment_score_days: int = 3
 
     # ---- 采集调度 ----
-    news_lookback_days: int = 3
+    # 新闻采集的**回看天数**：采集器翻页到此天数之前的新闻就停（`news_collector.py`
+    # 的 cutoff）。注意它只是「何时停止翻页」的启发式，**不是硬过滤**——同一页里
+    # 更老的条目仍会被收下，真正上限是「每个源最多翻 20 页」。
+    #
+    # 研判时喂给分析师的新闻窗口是另一回事（`graph.py` 里写死的近 1 天），
+    # 与这里无关。默认值与 `.env.example`、`EXPERTS_DESIGN.md`（「近 1 天」）保持一致。
+    news_lookback_days: int = 1
     market_collect_time: str = "17:30"
     sector_collect_time: str = "17:40"   # 板块数据（在行情之后）
     report_time: str = "18:00"
