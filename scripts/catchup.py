@@ -93,23 +93,32 @@ def diagnose(db) -> dict:
 
 
 def backfill_reports(db, diag: dict) -> dict:
-    """对「缺报告、但当天有新闻」的交易日补生成报告。
+    """对「缺报告、且当天既有新闻又有行情」的交易日补生成报告。
 
-    缺新闻的日子**跳过** —— 拿前后几天的新闻去凑一份"那天的报告"，
-    等于凭空编造，比没有更糟（回测会被污染）。
+    - 缺新闻的日子**跳过**：拿前后几天的新闻去凑一份"那天的报告"，
+      等于凭空编造，比没有更糟（回测会被污染）。
+    - 缺行情的日子也跳过：那种报告里没有行情快照，是残缺品。
     """
-    from app.agent.graph import generate_daily_report
+    from app.agent.graph import _report_time_on, generate_daily_report
 
     no_news = set(diag["no_news"])
-    candidates = [d for d in diag["no_report"] if d not in no_news]
-    skipped = [d for d in diag["no_report"] if d in no_news]
+    no_market = set(diag["no_market"])
+    candidates = [
+        d for d in diag["no_report"] if d not in no_news and d not in no_market
+    ]
+    skip_news = [d for d in diag["no_report"] if d in no_news]
+    skip_market = [d for d in diag["no_report"]
+                   if d in no_market and d not in no_news]
 
-    if skipped:
-        print(f"  跳过 {len(skipped)} 天（当天无新闻，补出来是编造）："
-              f"{[str(d) for d in skipped]}")
+    if skip_news:
+        print(f"  跳过 {len(skip_news)} 天（当天无新闻，补出来是编造）："
+              f"{[str(d) for d in skip_news]}")
+    if skip_market:
+        print(f"  跳过 {len(skip_market)} 天（当天无行情，报告会残缺）："
+              f"{[str(d) for d in skip_market]}")
     if not candidates:
         print("  没有可补报告的日子")
-        return {"done": [], "failed": [], "skipped": skipped}
+        return {"done": [], "failed": [], "skipped": skip_news + skip_market}
 
     print(f"  可补 {len(candidates)} 天：{[str(d) for d in candidates]}")
     print(f"  预计调用 LLM 约 {len(candidates) * 6} 次（4 分析师 + 风险官 + 首席）")
@@ -118,14 +127,21 @@ def backfill_reports(db, diag: dict) -> dict:
     for d in candidates:
         t = time.time()
         try:
-            rep = generate_daily_report(db, date=datetime(d.year, d.month, d.day, 18, 0))
+            # 用当天的 REPORT_TIME 作时间戳——与流程内部算出的 as_of 同源，
+            # 改了 REPORT_TIME 也不会出现"标签 18:00、截止却是别的点"
+            rep = generate_daily_report(
+                db, date=_report_time_on(datetime(d.year, d.month, d.day))
+            )
             print(f"    [OK] {d}  score={rep.score}  情绪={rep.sentiment}"
                   f"  ({time.time() - t:.0f}s)", flush=True)
             done.append(str(d))
         except Exception as e:  # noqa: BLE001
+            # 必须 rollback：commit 失败后 session 会进入"待回滚"状态，
+            # 不清理的话后续每一天都会连锁失败
+            db.rollback()
             print(f"    [X]  {d}  失败：{type(e).__name__}: {e}", flush=True)
             failed.append(str(d))
-    return {"done": done, "failed": failed, "skipped": skipped}
+    return {"done": done, "failed": failed, "skipped": skip_news + skip_market}
 
 
 def main() -> int:
@@ -183,10 +199,16 @@ def main() -> int:
             print("      可能是周末/节假日本来就没发，也可能是采集够不着了")
             print("      （新闻采集受「每个源最多 20 页」限制）")
 
-        if after["no_report"]:
-            print(f"  [i] 有 {len(after['no_report'])} 个交易日缺报告："
-                  f"{[str(d) for d in after['no_report']]}")
-            print("      加 --reports 可补（只补当天有新闻的；缺新闻的跳过）")
+        # 扣掉本次刚补出来的，否则补成功了这里还在喊"缺报告"，自相矛盾
+        done = set((report_result or {}).get("done", []))
+        still_no_report = [d for d in after["no_report"] if str(d) not in done]
+        if still_no_report:
+            print(f"  [i] 仍缺 {len(still_no_report)} 份报告："
+                  f"{[str(d) for d in still_no_report]}")
+            if report_result is None:
+                print("      加 --reports 可补（只补当天有新闻且有行情的）")
+            else:
+                print("      这些日子当天无新闻或无行情，补不出来（见 未完成事项.md B5）")
 
         if not (before["no_market"] or before["no_news"] or before["no_report"]):
             print("  本次没有需要补的东西（近 %d 天数据本来就是齐的）" % DIAGNOSE_DAYS)

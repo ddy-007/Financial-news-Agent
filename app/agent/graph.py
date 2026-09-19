@@ -464,9 +464,12 @@ def _report_time_on(day: datetime) -> datetime:
 
     try:
         hh, mm = (int(x) for x in settings.report_time.split(":")[:2])
-    except (ValueError, AttributeError):
-        hh, mm = 18, 0
-    return datetime(day.year, day.month, day.day, hh, mm)
+        # 构造也放进 try：越界值（如 "25:00" / "18:60"）同样抛 ValueError，
+        # 放在外面会漏网
+        return datetime(day.year, day.month, day.day, hh, mm)
+    except (ValueError, AttributeError, TypeError):
+        logger.warning(f"REPORT_TIME 配置不可用（{settings.report_time!r}），按 18:00 处理")
+        return datetime(day.year, day.month, day.day, 18, 0)
 
 
 def generate_daily_report(db: Session, date: datetime | None = None) -> MarketReport:
