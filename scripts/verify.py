@@ -10,9 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def check_config():
+    from app.agent.llm import _GROUPS, resolve
     from app.config import settings
 
-    print(f"  model={settings.deepseek_model}")
+    # 只打印 model 与 base_url，不打印 api_key
+    for part in _GROUPS:
+        _, base_url, model = resolve(part)
+        print(f"  [{part}] {model} @ {base_url}")
     print(f"  bge-m3={settings.bge_m3_model_path}")
     print(f"  reranker={settings.bge_reranker_path}")
     print(f"  db={settings.database_url}")
@@ -57,7 +61,7 @@ def check_market():
 def check_llm():
     from app.agent.llm import get_llm
 
-    llm = get_llm()
+    llm = get_llm(part="expert")
     resp = llm.invoke("用一句话回答：今天天气如何？")
     print(f"  DeepSeek 回复: {resp.content[:100]}")
 

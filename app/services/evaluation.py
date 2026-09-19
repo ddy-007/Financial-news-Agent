@@ -190,7 +190,7 @@ def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict
     from app.agent.llm import get_llm
 
     fn = _expert_func(expert)
-    llm = get_llm(temperature=0.2)
+    llm = get_llm(temperature=0.2, part="expert")
     scenarios, passed = [], 0
     for name, ctx, ok in [
         ("bullish", _bullish_ctx(), lambda s: s > 0.3),
@@ -231,7 +231,7 @@ def check_reproducibility(db: Session, runs: int = 3, expert: str = "行业") ->
 
     ctx = prepare_node({}).get("ctx", {})
     fn = _expert_func(expert)
-    llm = get_llm(temperature=0.2)
+    llm = get_llm(temperature=0.2, part="expert")
 
     scores, stances = [], []
     for _ in range(max(2, runs)):

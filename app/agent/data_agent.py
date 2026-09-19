@@ -80,7 +80,7 @@ def classify_news(items: list[NewsItem]) -> list[dict]:
     """LLM 批量分类。返回 [{item, relevant, category, market, themes}]。"""
     if not items:
         return []
-    llm = get_llm(temperature=0.0)
+    llm = get_llm(temperature=0.0, part="news")
     results: list[dict] = []
     for i in range(0, len(items), BATCH_SIZE):
         batch = items[i:i + BATCH_SIZE]
@@ -138,7 +138,7 @@ def _find_similar(db: Session, text: str) -> tuple[News, float] | None:
 
 def _llm_is_duplicate(a: News, b_title: str, b_source: str) -> bool:
     """灰色区间复核：LLM 判断两条是否同一事件。"""
-    llm = get_llm(temperature=0.0)
+    llm = get_llm(temperature=0.0, part="news")
     prompt = DEDUP_PROMPT.format(
         source_a=a.source, title_a=a.title,
         source_b=b_source, title_b=b_title[:150],

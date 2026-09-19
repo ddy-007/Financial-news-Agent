@@ -13,7 +13,7 @@ def get_chat_agent():
     global _agent
     if _agent is None:
         _agent = create_agent(
-            get_llm(temperature=0.3),
+            get_llm(temperature=0.3, part="chat"),
             ALL_TOOLS,
             system_prompt=SYSTEM_PROMPT,
         )

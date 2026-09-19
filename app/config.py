@@ -7,10 +7,40 @@ class Settings(BaseSettings):
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    # ---- DeepSeek LLM ----
+    # ---- DeepSeek LLM（全局默认：各分组未单独配置时回落到这里）----
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
+
+    # ---- 按环节分组的 LLM 配置 ----
+    # 每个分组的三个字段都可留空；留空的字段回落到上面的 DEEPSEEK_*。
+    # 用途：给不同环节接不同的服务商 / 模型（例如把新闻采集换成便宜或本地的模型），
+    #       而研判仍用主力模型。分组对应关系见 app/agent/llm.py 的 _GROUPS。
+    #   news   ：每日新闻采集（新闻分类 / 语义判重 / 情绪打分）
+    #   expert ：多专家研判（4 位分析师 / 风险官 / 首席 / 兜底 / 评估层）
+    #   chat   ：前端问答 Agent
+    #   weekly ：周报
+    news_api_key: str = ""
+    news_base_url: str = ""
+    news_model: str = ""
+    expert_api_key: str = ""
+    expert_base_url: str = ""
+    expert_model: str = ""
+    chat_api_key: str = ""
+    chat_base_url: str = ""
+    chat_model: str = ""
+    weekly_api_key: str = ""
+    weekly_base_url: str = ""
+    weekly_model: str = ""
+
+    # ---- 备用模型（可选，主模型失败时自动切换）----
+    # 三项**全部非空**才启用；任一为空则不启用（行为与未配置时完全一致）。
+    # 用途：主模型超时 / 限流 / 5xx / 模型下线 / key 失效时，自动切到备用模型再试一次。
+    # 建议指向**另一家服务商**——同一家的账号级故障（限流、欠费）换了模型也一样中招。
+    # 触发条件见 app/agent/llm.py 的 _FALLBACK_EXCEPTIONS。
+    llm_fallback_api_key: str = ""
+    llm_fallback_base_url: str = ""
+    llm_fallback_model: str = ""
 
     # ---- 本地嵌入 / 重排模型 ----
     bge_m3_model_path: str = "BAAI/bge-m3"

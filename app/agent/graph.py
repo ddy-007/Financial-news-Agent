@@ -236,7 +236,7 @@ def _expert_node(name: str, fn) -> callable:
     def node(state: AnalystState) -> dict:
         ctx = state.get("ctx", {})
         try:
-            opinion = fn(get_llm(temperature=0.2), ctx)
+            opinion = fn(get_llm(temperature=0.2, part="expert"), ctx)
             return {"opinions": [opinion.model_dump()]}
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{name}] 分析失败，跳过：{e}")
@@ -256,7 +256,7 @@ def risk_node(state: AnalystState) -> dict:
         for o in opinions
     ) or "无（其他专家分析均失败）"
     try:
-        risk = run_risk_officer(get_llm(temperature=0.3), ctx)
+        risk = run_risk_officer(get_llm(temperature=0.3, part="expert"), ctx)
         return {"risk_opinion": risk.model_dump()}
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[风险官] 分析失败，跳过：{e}")
@@ -340,7 +340,7 @@ def chief_node(state: AnalystState) -> dict:
     risk = RiskOpinion(**state["risk_opinion"]) if state.get("risk_opinion") else RiskOpinion()
 
     try:
-        narrative = run_chief(get_llm(temperature=0.2), ctx, opinions, risk, quant)
+        narrative = run_chief(get_llm(temperature=0.2, part="expert"), ctx, opinions, risk, quant)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[首席] 汇总失败，使用降级结构：{e}")
         narrative = {
@@ -365,7 +365,7 @@ def _fallback_report(db: Session) -> dict:
 
     news_rows = db.query(News).order_by(News.publish_time.desc()).limit(20).all()
     news_text = _fmt_news(news_rows)
-    llm = get_llm(temperature=0.2)
+    llm = get_llm(temperature=0.2, part="expert")
     resp = llm.invoke(REPORT_PROMPT_TEMPLATE.format(
         date=datetime.now().date(), market_data=a_share, news_context=news_text
     ))
@@ -458,7 +458,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         risk_veto=final.get("risk_veto"),
         low_info=info_level.get("low_info"),
         data_stale=data_freshness.get("stale"),
-        model=get_llm_model_name(),
+        model=get_llm_model_name("expert"),
     )
     db.add(report)
     db.commit()
@@ -487,7 +487,7 @@ def score_news_sentiment(db: Session, limit: int = 400) -> int:
     )
     if not rows:
         return 0
-    llm = get_llm(temperature=0.0)
+    llm = get_llm(temperature=0.0, part="news")
     count = 0
     for i in range(0, len(rows), 20):
         batch = rows[i:i + 20]
