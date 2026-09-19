@@ -81,8 +81,12 @@ def classify_news(items: list[NewsItem]) -> list[dict]:
     if not items:
         return []
     llm = get_llm(temperature=0.0, part="news")
+    # 逐批打印进度：分类整批可能跑十几分钟，不打日志的话外部完全看不到进展
+    total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
+    logger.info(f"[分类] 共 {len(items)} 条，分 {total_batches} 批")
     results: list[dict] = []
-    for i in range(0, len(items), BATCH_SIZE):
+    for batch_idx, i in enumerate(range(0, len(items), BATCH_SIZE), start=1):
+        logger.info(f"[分类] 第 {batch_idx}/{total_batches} 批")
         batch = items[i:i + BATCH_SIZE]
         news_list = "\n".join(
             f"{j + 1}. {it.title}｜{(it.content or '')[:100]}"

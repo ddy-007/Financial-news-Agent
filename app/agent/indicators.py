@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy.orm import Session
 
 from app.models.market import MarketData
@@ -32,14 +34,17 @@ def _rsi(closes: list[float], n: int = 14) -> float | None:
     return round(100 - 100 / (1 + rs), 2)
 
 
-def compute_indicators(db: Session, symbol: str = "sh000001") -> dict:
-    """计算某指数（默认上证）的技术指标。"""
-    rows = (
-        db.query(MarketData)
-        .filter(MarketData.symbol == symbol)
-        .order_by(MarketData.date.asc())
-        .all()
-    )
+def compute_indicators(db: Session, symbol: str = "sh000001",
+                       as_of: datetime | None = None) -> dict:
+    """计算某指数（默认上证）的技术指标。
+
+    `as_of` 不为空时只用该时点**及之前**的行情（补跑按历史日期算指标）；
+    为空时行为与改动前完全一致（用全库行情）。
+    """
+    q = db.query(MarketData).filter(MarketData.symbol == symbol)
+    if as_of is not None:
+        q = q.filter(MarketData.date <= as_of)
+    rows = q.order_by(MarketData.date.asc()).all()
     closes = [r.close for r in rows if r.close is not None]
     volumes = [r.volume for r in rows if r.volume is not None]
     if len(closes) < 2:

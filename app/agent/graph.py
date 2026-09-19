@@ -52,6 +52,10 @@ EXPERT_WEIGHTS = {
 
 
 class AnalystState(TypedDict, total=False):
+    # 补跑用的「截止时点」（ISO 字符串）。**实时生成时不传**——此时全程走
+    # datetime.now()，行为与引入本字段前完全一致。补跑必须传，否则流程会
+    # 拿"今天"的数据去写"过去某天"的报告，回测时等于用未来信息预测过去。
+    as_of: str
     ctx: dict
     info_level: dict                             # 信息量评估结果（prepare 阶段产出）
     data_freshness: dict                         # 数据时效（是否走了陈旧回退）
@@ -71,28 +75,28 @@ def _fmt_news(rows) -> str:
 
 
 def _fetch_news(db: Session, cats: list[str], limit: int,
-                since: datetime) -> tuple[list, bool]:
+                since: datetime, until: datetime | None = None
+                ) -> tuple[list, bool]:
     """按类别取近期新闻。
 
     近 1 天无数据时回退到最新若干条（保证可跑），并返回 `stale=True`，
     以便下游**标注「数据陈旧」**——不再静默替换数据源。
+
+    `until` 不为空时只取该时点**及之前**的新闻（补跑用）。
+    **回退分支同样受 `until` 约束**——否则补跑时会捞到"未来"的新闻。
     """
-    rows = (
-        db.query(News)
-        .filter(News.category.in_(cats), News.publish_time >= since)
-        .order_by(News.publish_time.desc())
-        .limit(limit)
-        .all()
-    )
+    def _query(with_since: bool):
+        q = db.query(News).filter(News.category.in_(cats))
+        if with_since:
+            q = q.filter(News.publish_time >= since)
+        if until is not None:
+            q = q.filter(News.publish_time <= until)
+        return q.order_by(News.publish_time.desc()).limit(limit).all()
+
+    rows = _query(with_since=True)
     if rows:
         return rows, False
-    rows = (
-        db.query(News)
-        .filter(News.category.in_(cats))
-        .order_by(News.publish_time.desc())
-        .limit(limit)
-        .all()
-    )
+    rows = _query(with_since=False)
     return rows, bool(rows)
 
 
@@ -103,9 +107,16 @@ def _calendar_degraded() -> bool:
     return is_degraded()
 
 
-def _market_snapshot(db: Session) -> tuple[str, str]:
-    """返回 (A股行情, 美股行情)。"""
-    rows = db.query(MarketData).order_by(MarketData.date.desc()).all()
+def _market_snapshot(db: Session, as_of: datetime | None = None) -> tuple[str, str]:
+    """返回 (A股行情, 美股行情)。
+
+    `as_of` 不为空时只取该时点**及之前**的行情（补跑用）；
+    为空时行为与改动前完全一致（取全库最新）。
+    """
+    q = db.query(MarketData)
+    if as_of is not None:
+        q = q.filter(MarketData.date <= as_of)
+    rows = q.order_by(MarketData.date.desc()).all()
     latest: dict = {}
     for r in rows:
         latest.setdefault(r.symbol, r)
@@ -131,37 +142,48 @@ def _safe_extra(fn, default, label: str):
 
 
 def prepare_node(state: AnalystState) -> dict:
-    """组装所有专家需要的输入（含「综合」类新闻，用于广播）。"""
+    """组装所有专家需要的输入（含「综合」类新闻，用于广播）。
+
+    `state["as_of"]`（可选）是补跑的截止时点。**不传时全程用 `datetime.now()`，
+    行为与引入该字段前逐字节一致**——这是硬性要求，实时生成走的就是这条路径。
+    """
+    raw_as_of = state.get("as_of")
+    as_of = datetime.fromisoformat(raw_as_of) if raw_as_of else None
     db = SessionLocal()
     try:
-        since = datetime.now() - timedelta(days=1)
-        macro, st1 = _fetch_news(db, ["宏观", "政策"], NEWS_PER_CATEGORY, since)
-        industry, st2 = _fetch_news(db, ["行业", "公司"], NEWS_PER_CATEGORY, since)
-        capital, st3 = _fetch_news(db, ["资金", "市场"], NEWS_PER_CATEGORY, since)
-        comprehensive, st4 = _fetch_news(db, ["综合"], 10, since)
+        since = (as_of or datetime.now()) - timedelta(days=1)
+        macro, st1 = _fetch_news(db, ["宏观", "政策"], NEWS_PER_CATEGORY, since, as_of)
+        industry, st2 = _fetch_news(db, ["行业", "公司"], NEWS_PER_CATEGORY, since, as_of)
+        capital, st3 = _fetch_news(db, ["资金", "市场"], NEWS_PER_CATEGORY, since, as_of)
+        comprehensive, st4 = _fetch_news(db, ["综合"], 10, since, as_of)
 
-        all_news = (
-            db.query(News).filter(News.publish_time >= since)
-            .order_by(News.publish_time.desc()).limit(ALL_NEWS_LIMIT).all()
-        )
+        q = db.query(News).filter(News.publish_time >= since)
+        if as_of is not None:
+            q = q.filter(News.publish_time <= as_of)
+        all_news = q.order_by(News.publish_time.desc()).limit(ALL_NEWS_LIMIT).all()
         if not all_news:
+            # 回退分支同样要受 as_of 约束，否则补跑会捞到"未来"的新闻
+            q2 = db.query(News)
+            if as_of is not None:
+                q2 = q2.filter(News.publish_time <= as_of)
             all_news = (
-                db.query(News).order_by(News.publish_time.desc())
-                .limit(ALL_NEWS_LIMIT).all()
+                q2.order_by(News.publish_time.desc()).limit(ALL_NEWS_LIMIT).all()
             )
-        a_share, us = _market_snapshot(db)
+        a_share, us = _market_snapshot(db, as_of)
         # 三项增量数据均加保护：任一失败只按缺省处理，不拖垮核心研判
         from app.services.info_level import assess_info_level
         from app.services.sector_service import format_sector_summary
 
         indicators = _safe_extra(
-            lambda: format_indicators(compute_indicators(db)),
+            lambda: format_indicators(compute_indicators(db, as_of=as_of)),
             "技术指标不可用（获取失败）", "技术指标",
         )
-        info_level = _safe_extra(lambda: assess_info_level(db), {}, "信息量评估")
+        info_level = _safe_extra(
+            lambda: assess_info_level(db, target_date=as_of.date() if as_of else None),
+            {}, "信息量评估")
         # 板块实际表现：给行业分析师做「新闻 vs 市场反应」的交叉验证
         sector_summary = _safe_extra(
-            lambda: format_sector_summary(db), "无", "板块数据"
+            lambda: format_sector_summary(db, as_of=as_of), "无", "板块数据"
         )
 
         # 数据时效：**按类目分别记录**——若只取全局最大值，会出现
@@ -189,7 +211,8 @@ def prepare_node(state: AnalystState) -> dict:
                 max(stale_dates).date().isoformat() if stale_dates else None
             ),
             "newest_news_date": newest.date().isoformat() if newest else None,
-            "today": date.today().isoformat(),
+            # 补跑时"今天"应指截止时点那一天，而不是真正的今天
+            "today": (as_of.date() if as_of else date.today()).isoformat(),
         }
         if stale_cats:
             # 快讯是 7×24 的，出现"近 1 天无新闻"通常意味着**采集故障**，
@@ -357,17 +380,24 @@ def chief_node(state: AnalystState) -> dict:
 
 
 # ================= 降级：单次生成 =================
-def _fallback_report(db: Session) -> dict:
-    """全部专家失败时的兜底：沿用单次 LLM 生成，保证每天都有报告。"""
+def _fallback_report(db: Session, as_of: datetime | None = None) -> dict:
+    """全部专家失败时的兜底：沿用单次 LLM 生成，保证每天都有报告。
+
+    `as_of` 不为空时按该时点取数与标注日期（补跑用）。
+    """
     logger.warning("触发降级：使用单次生成模式")
-    a_share, _ = _market_snapshot(db)
+    a_share, _ = _market_snapshot(db, as_of)
     from app.agent.experts import extract_json
 
-    news_rows = db.query(News).order_by(News.publish_time.desc()).limit(20).all()
+    q = db.query(News)
+    if as_of is not None:
+        q = q.filter(News.publish_time <= as_of)
+    news_rows = q.order_by(News.publish_time.desc()).limit(20).all()
     news_text = _fmt_news(news_rows)
     llm = get_llm(temperature=0.2, part="expert")
     resp = llm.invoke(REPORT_PROMPT_TEMPLATE.format(
-        date=datetime.now().date(), market_data=a_share, news_context=news_text
+        date=(as_of.date() if as_of else datetime.now().date()),
+        market_data=a_share, news_context=news_text,
     ))
     data = extract_json(resp.content) or {}
     if not isinstance(data, dict):
@@ -425,12 +455,43 @@ def get_app():
 
 
 # ================= 对外入口 =================
+def _report_time_on(day: datetime) -> datetime:
+    """某天的「报告生成时点」——取 config 的 `REPORT_TIME`（默认 18:00）。
+
+    补跑以这个时点为截止，与当天实时生成的口径一致，两份报告可直接对比。
+    """
+    from app.config import settings
+
+    try:
+        hh, mm = (int(x) for x in settings.report_time.split(":")[:2])
+    except (ValueError, AttributeError):
+        hh, mm = 18, 0
+    return datetime(day.year, day.month, day.day, hh, mm)
+
+
 def generate_daily_report(db: Session, date: datetime | None = None) -> MarketReport:
-    """跑多专家流程并入库，返回 MarketReport。"""
-    date = date or datetime.now()
+    """跑多专家流程并入库，返回 MarketReport。
+
+    - `date` 为空（调度器 / 实时生成）→ 走「现在」，**行为与改动前完全一致**。
+    - `date` 非空（补跑）→ 以该日 `REPORT_TIME` 为截止时点取**历史**数据，
+      否则会把今天的新闻/行情塞进标着过去日期的报告，回测时等于用未来预测过去。
+    """
+    if date is None:
+        date = datetime.now()
+        as_of: datetime | None = None
+    else:
+        as_of = _report_time_on(date)
+        if as_of > datetime.now():
+            # 截止时点在未来（补跑当天、但还没到 REPORT_TIME）——退回"现在"。
+            # 否则会把今天的数据全部过滤掉，生成一份空报告。
+            logger.warning(f"截止时点 {as_of} 晚于当前时间，回退为当前时间")
+            as_of = datetime.now()
+
     final: dict = {}
     try:
-        result = get_app().invoke({})
+        result = get_app().invoke(
+            {"as_of": as_of.isoformat()} if as_of is not None else {}
+        )
         final = result.get("final", {}) or {}
         if not final.get("expert_opinions") and result.get("opinions"):
             final["expert_opinions"] = result["opinions"]
@@ -438,7 +499,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         logger.error(f"多专家流程异常，降级：{e}")
 
     if not final.get("market_summary"):
-        final = _fallback_report(db)
+        final = _fallback_report(db, as_of)
 
     opinions = final.get("expert_opinions", [])
 

@@ -1,7 +1,7 @@
 """板块数据业务：采集入库 + 供研判使用的摘要格式化。"""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 from loguru import logger
 from sqlalchemy.orm import Session
@@ -63,11 +63,17 @@ def collect_and_store_sectors(db: Session) -> int:
     return n
 
 
-def get_latest_sectors(db: Session) -> tuple[list[SectorData], str | None]:
-    """取库中最新一天的板块数据，返回 (记录列表, 日期字符串)。"""
-    latest = (
-        db.query(SectorData.date).order_by(SectorData.date.desc()).first()
-    )
+def get_latest_sectors(db: Session, as_of: datetime | None = None
+                       ) -> tuple[list[SectorData], str | None]:
+    """取库中最新一天的板块数据，返回 (记录列表, 日期字符串)。
+
+    `as_of` 不为空时，只取该时点**及之前**的数据——供补跑按历史日期取数。
+    为空时行为与改动前完全一致（取全库最新一天）。
+    """
+    q = db.query(SectorData.date)
+    if as_of is not None:
+        q = q.filter(SectorData.date <= as_of)
+    latest = q.order_by(SectorData.date.desc()).first()
     if not latest:
         return [], None
     d = latest[0]
@@ -80,13 +86,16 @@ def get_latest_sectors(db: Session) -> tuple[list[SectorData], str | None]:
     return rows, d.date().isoformat()
 
 
-def format_sector_summary(db: Session, top_n: int = 8) -> str:
+def format_sector_summary(db: Session, top_n: int = 8,
+                          as_of: datetime | None = None) -> str:
     """格式化为**给分析师阅读**的板块摘要。
 
     只给结论性的头部信息（领涨/领跌/涨跌家数），不堆全量数据——
     84 个板块全塞进 prompt 只会稀释注意力。
+
+    `as_of` 不为空时按该时点取历史板块数据（补跑用）；为空时行为与改动前一致。
     """
-    rows, d = get_latest_sectors(db)
+    rows, d = get_latest_sectors(db, as_of=as_of)
     if not rows:
         return "无"
 
@@ -105,7 +114,8 @@ def format_sector_summary(db: Session, top_n: int = 8) -> str:
         leader = f"（领涨 {r.leader}）" if (show_leader and r.leader) else ""
         return f"{r.name} {r.change_pct:+.2f}%{leader}"
 
-    stale_note = "" if d == date.today().isoformat() else "，**非今日数据**"
+    ref_day = (as_of.date() if as_of else date.today()).isoformat()
+    stale_note = "" if d == ref_day else "，**非今日数据**"
     lines = [
         f"（数据日期 {d}{stale_note}，共 {len(ranked)} 个板块）",
         "领涨：" + "、".join(fmt(r, True) for r in ranked[:n]),

@@ -1,16 +1,18 @@
-"""补跑：把停机期间缺的**数据**尽量补回来。
+"""补跑：把停机期间缺的**数据**和**报告**尽量补回来。
 
 用法：
-    .venv/Scripts/python.exe scripts/catchup.py
+    .venv/Scripts/python.exe scripts/catchup.py            # 只补数据（默认）
+    .venv/Scripts/python.exe scripts/catchup.py --reports  # 数据 + 报告
 
-**只补数据（新闻 + 行情），不生成报告。**
+**补报告（--reports）会真调 LLM**（每天约 6 次：4 分析师 + 风险官 + 首席），
+所以默认不跑，要显式加参数。
 
-为什么报告不补：当前流程把"现在"写死（`graph.py` 的 `prepare_node` 用
-`datetime.now()` 取数据），`generate_daily_report(db, date=...)` 的 `date`
-只用来写报告上的日期标签。用旧日期调用会得到"标签写 A 日、内容却是今天"
-的报告 —— 回测时等于用未来信息预测过去，比不补更糟。
+**报告怎么补**（`--reports`）：流程已支持 `as_of` 截止时点——
+`generate_daily_report(db, date=X)` 会以 X 日 `REPORT_TIME`（默认 18:00）
+为截止取**历史**数据，与当天实时生成的口径一致，两份报告可直接对比。
 
-补报告需要先让 `as_of` 日期穿透整条流程，见 `未完成事项.md` 的 B5。
+**只在「当天有新闻 且 有行情」时才补报告**：缺新闻的日子补出来的报告
+等于凭空编造，不如没有。所以能补的通常只有最近几天（源站只保留有限新闻）。
 
 **能补回多少，两种数据不一样**：
 
@@ -27,7 +29,7 @@ emoji 会让 print 直接抛 UnicodeEncodeError。
 """
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # 确保项目根目录在 sys.path，使 `from app...` 可导入
@@ -90,6 +92,42 @@ def diagnose(db) -> dict:
     return {"no_market": no_market, "no_report": no_report, "no_news": no_news}
 
 
+def backfill_reports(db, diag: dict) -> dict:
+    """对「缺报告、但当天有新闻」的交易日补生成报告。
+
+    缺新闻的日子**跳过** —— 拿前后几天的新闻去凑一份"那天的报告"，
+    等于凭空编造，比没有更糟（回测会被污染）。
+    """
+    from app.agent.graph import generate_daily_report
+
+    no_news = set(diag["no_news"])
+    candidates = [d for d in diag["no_report"] if d not in no_news]
+    skipped = [d for d in diag["no_report"] if d in no_news]
+
+    if skipped:
+        print(f"  跳过 {len(skipped)} 天（当天无新闻，补出来是编造）："
+              f"{[str(d) for d in skipped]}")
+    if not candidates:
+        print("  没有可补报告的日子")
+        return {"done": [], "failed": [], "skipped": skipped}
+
+    print(f"  可补 {len(candidates)} 天：{[str(d) for d in candidates]}")
+    print(f"  预计调用 LLM 约 {len(candidates) * 6} 次（4 分析师 + 风险官 + 首席）")
+
+    done, failed = [], []
+    for d in candidates:
+        t = time.time()
+        try:
+            rep = generate_daily_report(db, date=datetime(d.year, d.month, d.day, 18, 0))
+            print(f"    [OK] {d}  score={rep.score}  情绪={rep.sentiment}"
+                  f"  ({time.time() - t:.0f}s)", flush=True)
+            done.append(str(d))
+        except Exception as e:  # noqa: BLE001
+            print(f"    [X]  {d}  失败：{type(e).__name__}: {e}", flush=True)
+            failed.append(str(d))
+    return {"done": done, "failed": failed, "skipped": skipped}
+
+
 def main() -> int:
     from app.db import SessionLocal
 
@@ -116,8 +154,19 @@ def main() -> int:
         _sep("第四步：跑完之后的现状")
         after = diagnose(db)
 
+        if "--reports" in sys.argv[1:]:
+            _sep("第五步：补报告（--reports，会计费调 LLM）")
+            report_result = backfill_reports(db, after)
+        else:
+            _sep("第五步：补报告")
+            print("  已跳过（默认只补数据）。要补报告加参数：--reports")
+            report_result = None
+
         _sep("总结")
         print(f"  本次补入：行情 {n_market} 条、新闻 {n_news} 条")
+        if report_result:
+            print(f"  补出报告 {len(report_result['done'])} 份，"
+                  f"失败 {len(report_result['failed'])} 份")
 
         if after["no_market"]:
             print(f"  [!] 仍有 {len(after['no_market'])} 个交易日缺行情："
@@ -137,7 +186,7 @@ def main() -> int:
         if after["no_report"]:
             print(f"  [i] 有 {len(after['no_report'])} 个交易日缺报告："
                   f"{[str(d) for d in after['no_report']]}")
-            print("      报告**无法事后补**（会让回测失真），见 未完成事项.md B5")
+            print("      加 --reports 可补（只补当天有新闻的；缺新闻的跳过）")
 
         if not (before["no_market"] or before["no_news"] or before["no_report"]):
             print("  本次没有需要补的东西（近 %d 天数据本来就是齐的）" % DIAGNOSE_DAYS)
