@@ -256,6 +256,7 @@ def _invoke_expert(llm, name: str, prompt: str) -> ExpertOpinion:
     **重试覆盖网络与解析两步**——LLM 输出不稳时重试往往能拿到合规结果，
     这样「专家缺席」这个降级点基本不会触发。
     """
+    from app.agent.llm import llm_retry_times
     from app.retry import call_with_retry
 
     def _attempt() -> ExpertOpinion:
@@ -265,7 +266,8 @@ def _invoke_expert(llm, name: str, prompt: str) -> ExpertOpinion:
             raise ValueError(f"{name}分析师输出无法解析为 JSON")
         return _to_opinion(name, data)
 
-    op = call_with_retry(_attempt, retry_label=f"{name}分析师")
+    op = call_with_retry(_attempt, retry_label=f"{name}分析师",
+                         retry_times=llm_retry_times())
     logger.info(f"[{name}] {op.stance} score={op.score:.2f} conf={op.confidence}")
     return op
 
@@ -315,6 +317,7 @@ def run_risk_officer(llm, ctx: dict) -> RiskOpinion:
         all_news=ctx.get("all_news", "无"),
         other_opinions=ctx.get("other_opinions", "无"),
     )
+    from app.agent.llm import llm_retry_times
     from app.retry import call_with_retry
 
     def _attempt() -> RiskOpinion:
@@ -324,7 +327,8 @@ def run_risk_officer(llm, ctx: dict) -> RiskOpinion:
             raise ValueError("风险官输出无法解析为 JSON")
         return _to_risk_opinion(data)
 
-    risk = call_with_retry(_attempt, retry_label="风险官")
+    risk = call_with_retry(_attempt, retry_label="风险官",
+                           retry_times=llm_retry_times())
     logger.info(f"[风险官] 风险等级={risk.risk_level} 风险点={len(risk.risks)}")
     return risk
 
@@ -433,11 +437,13 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
         fail_hint=fail_hint,
         data_hint=data_hint,
     )
+    from app.agent.llm import llm_retry_times
     from app.retry import call_with_retry
 
     data = call_with_retry(
         lambda: _require_dict(llm.invoke(prompt).content, "首席策略师"),
         retry_label="首席策略师",
+        retry_times=llm_retry_times(),
     )
 
     # 强制并入风险官的全部风险点（不得被 LLM 过滤）

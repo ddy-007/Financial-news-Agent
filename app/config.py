@@ -33,6 +33,20 @@ class Settings(BaseSettings):
     weekly_base_url: str = ""
     weekly_model: str = ""
 
+    # ---- 关闭「思考模式」（按环节，可选）----
+    # 只对**不需要推理**的环节开：新闻分类 / 判重 / 情绪打分这类任务，
+    # 模型花在思考上的时间纯属浪费（实测单批 29.7s -> 8.0s）。
+    # ⚠️ 该参数（enable_thinking）是百炼 / qwen 系模型特有的；
+    #    分组指向其它服务商时**不要开**，否则请求里会多出对方不认识的参数。
+    news_disable_thinking: bool = False
+    expert_disable_thinking: bool = False
+    chat_disable_thinking: bool = False
+    weekly_disable_thinking: bool = False
+
+    # ---- LLM 请求超时（秒）----
+    # 不设时 openai SDK 默认 600s，主备都挂时单个 attempt 会拖到 1200s。
+    llm_timeout: float = 120.0
+
     # ---- 备用模型（可选，主模型失败时自动切换）----
     # 三项**全部非空**才启用；任一为空则不启用（行为与未配置时完全一致）。
     # 用途：主模型超时 / 限流 / 5xx / 模型下线 / key 失效时，自动切到备用模型再试一次。

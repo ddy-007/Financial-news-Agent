@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from app.agent.llm import get_llm
+from app.agent.llm import get_llm, llm_retry_times
 from app.agent.prompts import CLASSIFY_PROMPT, DEDUP_PROMPT
 from app.collectors.news_collector import NewsItem, collect_all_news
 from app.models.news import News
@@ -97,7 +97,8 @@ def classify_news(items: list[NewsItem]) -> list[dict]:
             return d
 
         try:
-            data = call_with_retry(_classify, prompt, retry_label="新闻分类")
+            data = call_with_retry(_classify, prompt, retry_label="新闻分类",
+                                   retry_times=llm_retry_times())
             for entry in data:
                 if not isinstance(entry, dict):
                     continue

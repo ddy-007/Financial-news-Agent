@@ -28,7 +28,7 @@ from app.agent.experts import (
     run_technical_expert,
 )
 from app.agent.indicators import compute_indicators, format_indicators
-from app.agent.llm import get_llm, get_llm_model_name
+from app.agent.llm import get_llm, get_llm_model_name, llm_retry_times
 from app.agent.prompts import REPORT_PROMPT_TEMPLATE
 from app.agent.schemas import ExpertOpinion, RiskOpinion
 from app.config import settings
@@ -505,6 +505,7 @@ def score_news_sentiment(db: Session, limit: int = 400) -> int:
             data = call_with_retry(
                 _score, SENTIMENT_BATCH_PROMPT.format(news_list=news_list),
                 retry_label="情绪打分",
+                retry_times=llm_retry_times(),
             )
             for entry in data:
                 if not isinstance(entry, dict):
