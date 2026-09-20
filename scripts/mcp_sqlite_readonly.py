@@ -13,12 +13,21 @@
 自己实现才能从机制上锁死。
 
 **只读有三重保证**（全部在代码里，不靠调用方自觉）：
-  1. SQLite 用 `file:...?mode=ro` 打开 —— 写入尝试被**数据库本身**拒绝
-  2. 只放行**单条** `SELECT` / `WITH` 语句；多语句、写操作、DDL、PRAGMA 一律拒绝
-  3. 结果行数有上限，避免一条查询把内存打满
+  1. SQLite 用 `file:...?mode=ro` 打开 —— 主库的写入被**数据库本身**拒绝
+  2. 用 `set_authorizer` 在 **SQLite 引擎层**拒绝 INSERT/UPDATE/DELETE、DDL、
+     ATTACH/DETACH、事务语句 —— 这层是**机制**，不依赖对 SQL 文本的匹配
+  3. SQL 文本前缀白名单（只放行单条 SELECT/WITH）+ 结果行数上限
+
+⚠️ 第 3 条是**粗筛，不是保证**：SQLite 允许"CTE 后接写操作"，所以
+`WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x` 这类语句**能通过前缀检查**。
+真正兜住它的是第 2 条 authorizer 与第 1 条 `mode=ro`。
+（本文档原来把第 3 条写成"写操作一律拒绝"，属**过度声明**，已纠正。）
 
 **启动方式**（见项目根的 `.mcp.json`）：
-    uv run --no-project --with mcp python scripts/mcp_sqlite_readonly.py
+    uv run --no-project --with "mcp>=2,<3" python scripts/mcp_sqlite_readonly.py
+
+⚠️ **只适用于默认库路径**：数据库固定解析为 `<项目根>/data/app.db`。
+若 `.env` 用 `DATABASE_URL` 指向了别处，本工具查的库会与 app 实际用的库不是同一个。
 
 数据库路径按**本文件位置**推算（`<项目根>/data/app.db`），不含任何本机绝对路径，
 所以本文件可以安全提交到仓库。
@@ -44,11 +53,51 @@ DEFAULT_ROWS = 200
 mcp = MCPServer("sqlite-readonly")
 
 
+# SQLite 引擎层要拒绝的操作类别（authorizer 的 action 参数）。
+# 这一层不看 SQL 文本，因此**不依赖白名单是否被绕过** —— 是真正的机制保证。
+_DENY_ACTIONS = frozenset({
+    sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
+    sqlite3.SQLITE_ALTER_TABLE, sqlite3.SQLITE_REINDEX, sqlite3.SQLITE_ANALYZE,
+    sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TABLE,
+    sqlite3.SQLITE_CREATE_TEMP_INDEX, sqlite3.SQLITE_CREATE_TEMP_TABLE,
+    sqlite3.SQLITE_CREATE_TEMP_TRIGGER, sqlite3.SQLITE_CREATE_TEMP_VIEW,
+    sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_CREATE_VIEW,
+    sqlite3.SQLITE_CREATE_VTABLE,
+    sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE,
+    sqlite3.SQLITE_DROP_TEMP_INDEX, sqlite3.SQLITE_DROP_TEMP_TABLE,
+    sqlite3.SQLITE_DROP_TEMP_TRIGGER, sqlite3.SQLITE_DROP_TEMP_VIEW,
+    sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_VIEW,
+    sqlite3.SQLITE_DROP_VTABLE,
+    # ATTACH/DETACH 尤其要拦：mode=ro 只作用于**主库**，挂进来的别的库不受它约束
+    sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
+    sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT,
+})
+
+# PRAGMA 单独处理：describe_table 需要 table_info，只放行只读的那几个。
+_ALLOWED_PRAGMAS = frozenset({
+    "table_info", "table_xinfo", "index_list", "index_info",
+    "foreign_key_list", "database_list",
+})
+
+
+def _authorizer(action: int, arg1, arg2, dbname, source) -> int:
+    """SQLite 引擎层的只读闸门。
+
+    对**每一次**底层操作回调（不是对 SQL 文本做正则），所以
+    `WITH ... INSERT`、藏在注释里的语句、将来新增的语法都绕不过它。
+    """
+    if action == sqlite3.SQLITE_PRAGMA:
+        name = str(arg1 or "").lower()
+        return sqlite3.SQLITE_OK if name in _ALLOWED_PRAGMAS else sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_DENY if action in _DENY_ACTIONS else sqlite3.SQLITE_OK
+
+
 def _connect() -> sqlite3.Connection:
     """以**只读模式**打开数据库。
 
-    `mode=ro` 是 SQLite 自身的能力：即使有人绕过下面的 SQL 检查，
-    任何写入也会被数据库直接拒绝（报 attempt to write a readonly database）。
+    两层保护：
+      · `mode=ro` —— 主库的写入被 SQLite 自己拒绝
+      · `set_authorizer` —— 在引擎层拒绝写/DDL/ATTACH（不依赖 SQL 文本）
     """
     if not DB_PATH.exists():
         raise FileNotFoundError(f"数据库不存在：{DB_PATH}")
@@ -56,6 +105,7 @@ def _connect() -> sqlite3.Connection:
     uri = f"file:{quote(DB_PATH.as_posix(), safe='/:')}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
+    conn.set_authorizer(_authorizer)
     return conn
 
 
@@ -76,8 +126,13 @@ def _reject_reason(sql: str) -> str | None:
     return None
 
 
-def _rows_to_json(rows) -> str:
-    return json.dumps([dict(r) for r in rows], ensure_ascii=False, default=str)
+def _q(ident: str) -> str:
+    """把标识符安全地放进双引号里（SQLite 用 `""` 转义双引号）。
+
+    表名来自 sqlite_master 而非用户输入，但万一库里有名字含 `"` 的表，
+    不转义会把语句结构撑破 —— 转义是一行的事，不做没道理。
+    """
+    return '"' + ident.replace('"', '""') + '"'
 
 
 @mcp.tool()
@@ -96,8 +151,7 @@ def list_tables() -> str:
         ]
         out = []
         for n in names:
-            # 表名来自 sqlite_master，不是用户输入；仍用引号包裹以防特殊字符
-            cnt = conn.execute(f'SELECT COUNT(*) AS c FROM "{n}"').fetchone()["c"]
+            cnt = conn.execute(f"SELECT COUNT(*) AS c FROM {_q(n)}").fetchone()["c"]
             out.append({"table": n, "rows": cnt})
         return json.dumps(out, ensure_ascii=False)
     finally:
@@ -117,7 +171,7 @@ def describe_table(table: str) -> str:
         ).fetchone()
         if not exists:
             return f"表不存在：{table!r}（先用 list_tables 看有哪些表）"
-        cols = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        cols = conn.execute(f"PRAGMA table_info({_q(table)})").fetchall()
         return json.dumps(
             [{"name": c["name"], "type": c["type"],
               "nullable": not c["notnull"], "pk": bool(c["pk"])} for c in cols],
@@ -129,25 +183,45 @@ def describe_table(table: str) -> str:
 
 @mcp.tool()
 def query(sql: str, limit: int = DEFAULT_ROWS) -> str:
-    """执行一条**只读** SQL（SELECT / WITH），返回 JSON 数组。
+    """执行一条**只读** SQL（SELECT / WITH）。
+
+    返回 JSON 对象：`{"rows": [...], "returned": N, "truncated": bool}`。
+    **`truncated` 为 true 时说明结果还有更多行没返回**，请据此判断是否
+    需要收窄条件（比如加 WHERE / 聚合），不要拿不完整的结果下结论。
 
     只允许单条 SELECT 或 WITH 语句；写操作、DDL、PRAGMA、多语句都会被拒绝
-    （数据库本身也以只读方式打开，是第二重保险）。
+    （SQLite 引擎层还有 authorizer 兜底，不依赖这里的前缀检查）。
     limit 默认 200，上限 1000。
     """
     reason = _reject_reason(sql)
     if reason:
         return f"已拒绝：{reason}\n收到的 SQL：{sql.strip()[:200]}"
 
-    n = max(1, min(int(limit), MAX_ROWS))
-    conn = _connect()
     try:
+        n = max(1, min(int(limit), MAX_ROWS))
+    except (TypeError, ValueError):
+        return f"limit 必须是整数，收到：{limit!r}"
+
+    conn = None
+    try:
+        conn = _connect()          # 放进 try：库被删/被占用时给友好提示而非抛栈
         cur = conn.execute(sql.strip().rstrip(";"))
-        return _rows_to_json(cur.fetchmany(n))
+        # 多取一行用来判断是否被截断，再丢掉
+        rows = cur.fetchmany(n + 1)
+        truncated = len(rows) > n
+        return json.dumps(
+            {"rows": [dict(r) for r in rows[:n]],
+             "returned": min(len(rows), n),
+             "truncated": truncated},
+            ensure_ascii=False, default=str,
+        )
     except sqlite3.Error as e:
         return f"SQL 执行失败：{type(e).__name__}: {e}"
+    except OSError as e:
+        return f"数据库不可用：{type(e).__name__}: {e}"
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 if __name__ == "__main__":
