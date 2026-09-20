@@ -299,6 +299,14 @@ class NewsRetriever:
 
 每个工具都用 LangChain 的 `@tool` 装饰器 + 清晰的 docstring（LLM 靠它判断何时调用）。
 
+> **实现状态校准（2026-09-20）**：上表是**设计意图**，与当前代码**不一一对应**。
+> 实际实现于 `app/agent/tools.py` 的 6 个工具是：
+> `search_news` · `get_market_overview`（对应上表 `get_market_data`）·
+> `get_recent_news` · `get_report_history` · `web_search` ·
+> `get_sector_performance`（对应上表 `get_sector_data`）。
+> **`get_fund_flow` / `get_macro_data` 尚未实现**（`macro_data` 表存在，但未接工具）。
+> ⚠️ 照本表找函数会找不到 —— **以 `ALL_TOOLS` 为准**。
+
 ### 6.3 研判生成流程（LangGraph 固定流程）
 
 ```

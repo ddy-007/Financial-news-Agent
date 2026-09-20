@@ -201,6 +201,11 @@
 | `get_market_overview` | 查行情 | 不变 |
 | `get_recent_news` | 按关键词/分类查新闻 | **新增 category 筛选参数** |
 | `get_report_history` | 查历史报告 | 不变 |
+| `web_search` | 联网搜最新消息 | 后续加入 |
+| `get_sector_performance` | 查板块涨跌排行（可选指定日期） | **新增**；返回值首行是数据日期，须如实转述 |
+
+> 上表是**问答 Agent 用到的工具**，当前实为 6 个。以 `app/agent/tools.py` 的
+> `ALL_TOOLS` 为准（本表曾长期只列 4 个，漏了 `web_search`）。
 
 ### 4.4 与主流程的关系
 

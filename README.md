@@ -91,6 +91,7 @@ curl -X POST http://localhost:8000/api/v1/reports/generate
 | POST | `/api/v1/news/collect` | 采集新闻 |
 | GET | `/api/v1/market` | 行情列表 |
 | POST | `/api/v1/market/collect` | 采集行情 |
+| GET | `/api/v1/sectors` | 板块涨跌排行（可选 `?target_date=YYYY-MM-DD`） |
 | POST | `/api/v1/agent/chat` | AI 问答 |
 
 ## 目录结构

@@ -150,8 +150,13 @@ def get_sector_performance(date: str = "") -> str:
 
         up = sum(1 for r in ranked if r.change_pct > 0)
         down = sum(1 for r in ranked if r.change_pct < 0)
-        # rows 已按涨跌幅降序，取头尾各 5 个
-        top, bottom = ranked[:5], ranked[-5:][::-1]
+        flat = len(ranked) - up - down
+        # 板块数不足时**收窄窗口**，否则两侧会重叠——极端情况下"领跌"行里
+        # 列出的其实是上涨板块，自相矛盾。做法与 format_sector_summary 一致。
+        n = max(1, min(5, len(ranked) // 2)) if len(ranked) > 1 else 1
+        top = ranked[:n]
+        # 只有 1 个板块时不列"领跌"——那会和"领涨"是同一条，列两遍只会让人困惑
+        bottom = ranked[-n:][::-1] if len(ranked) > 1 else []
 
         def fmt(r) -> str:
             # 只在**上涨**板块标注领涨股 —— 对下跌板块说"领涨"自相矛盾
@@ -159,12 +164,14 @@ def get_sector_performance(date: str = "") -> str:
             leader = f"（领涨 {r.leader}）" if (r.change_pct > 0 and r.leader) else ""
             return f"{r.name} {r.change_pct:+.2f}%{leader}"
 
-        return "\n".join([
-            f"数据日期：{day}",
-            f"全市场 {len(ranked)} 个板块：{up} 涨 / {down} 跌",
-            "领涨：" + "、".join(fmt(r) for r in top),
-            "领跌：" + "、".join(fmt(r) for r in bottom),
-        ])
+        breadth = f"全市场 {len(ranked)} 个板块：{up} 涨 / {down} 跌"
+        if flat:
+            breadth += f" / {flat} 平"     # 不写会让"涨+跌 ≠ 总数"看着像算错了
+        lines = [f"数据日期：{day}", breadth,
+                 "领涨：" + "、".join(fmt(r) for r in top)]
+        if bottom:
+            lines.append("领跌：" + "、".join(fmt(r) for r in bottom))
+        return "\n".join(lines)
     finally:
         db.close()
 

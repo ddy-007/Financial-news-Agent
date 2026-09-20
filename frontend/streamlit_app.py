@@ -349,6 +349,7 @@ def page_market():
     data = api_get("/api/v1/market", {"limit": 500})
     if not data:
         st.info("暂无行情数据，点击上方「采集最新行情」按钮。")
+        _render_sector_board()   # 板块榜不依赖行情数据，行情为空也要显示
         return
 
     df = pd.DataFrame(data)
@@ -388,7 +389,15 @@ def page_market():
     table.columns = ["名称", "代码", "收盘", "涨跌幅%", "日期"]
     st.dataframe(table, use_container_width=True)
 
-    # ================= 板块涨跌榜 =================
+    _render_sector_board()
+
+
+def _render_sector_board():
+    """板块涨跌榜。
+
+    独立成函数是为了**不受行情数据影响** —— 原先是内联在 `page_market()` 里，
+    而行情为空时那个函数会提前 return，导致板块有数据也看不到。
+    """
     st.divider()
     st.subheader("🏭 板块涨跌榜")
 
@@ -400,7 +409,7 @@ def page_market():
     # 数据日期必须显著：板块采集只在工作日跑，后端一停就断档。
     # 只写个日期不够——人看到"09-16"不会立刻反应过来那是几天前。
     sec_date = sec["date"]
-    days_ago = (date.today() - date.fromisoformat(sec_date)).days
+    days_ago = max(0, (date.today() - date.fromisoformat(sec_date)).days)
     if days_ago == 0:
         st.caption(f"数据日期：{sec_date}（今日）")
     else:
@@ -414,21 +423,32 @@ def page_market():
         st.info("该日板块数据为空。")
         return
 
-    # 只画头尾各 8 个：84 个板块全塞进去没法读（全市场只有十几个在涨）
+    # 只画头尾各 TOP_N 个：84 个板块全塞进去没法读（全市场常常只有十几个在涨）。
+    # 板块数不足时**收窄窗口**，否则两侧会重叠——极端情况下"领跌"行里
+    # 列出的其实是上涨板块，自相矛盾。
     TOP_N = 8
     ranked = df_sec.sort_values("change_pct", ascending=False)
-    show = pd.concat([ranked.head(TOP_N), ranked.tail(TOP_N)]).drop_duplicates("name")
-    show = show.sort_values("change_pct")          # 升序 -> 图上最大的涨在上方
-    show["方向"] = show["change_pct"].apply(lambda v: "涨" if v > 0 else "跌")
+    n = max(1, min(TOP_N, len(ranked) // 2)) if len(ranked) > 1 else 1
+    show = pd.concat([ranked.head(n), ranked.tail(n)]).drop_duplicates("name")
+    # 升序：plotly 把数据第一行画在最下面，故最大的涨落在最上方
+    show = show.sort_values("change_pct")
+    show["方向"] = show["change_pct"].apply(
+        lambda v: "涨" if v > 0 else ("跌" if v < 0 else "平")
+    )
     show["标签"] = show["change_pct"].map(lambda v: f"{v:+.2f}%")
 
     up_n = int((df_sec["change_pct"] > 0).sum())
     down_n = int((df_sec["change_pct"] < 0).sum())
-    st.caption(f"全市场 {len(df_sec)} 个板块：**{up_n} 涨 / {down_n} 跌**（图中只列头尾各 {TOP_N} 个）")
+    flat_n = len(df_sec) - up_n - down_n
+    breadth = f"全市场 {len(df_sec)} 个板块：**{up_n} 涨 / {down_n} 跌**"
+    if flat_n:                      # 不写会让"涨+跌 ≠ 总数"看着像算错了
+        breadth += f" / {flat_n} 平"
+    st.caption(breadth + f"（图中只列头尾各 {n} 个）")
 
     fig2 = px.bar(
         show, x="change_pct", y="name", orientation="h",
-        color="方向", color_discrete_map={"涨": UP_COLOR, "跌": DOWN_COLOR},
+        color="方向",
+        color_discrete_map={"涨": UP_COLOR, "跌": DOWN_COLOR, "平": NEUTRAL},
         text="标签",
     )
     # 条上直接标数值 —— 这同时是 CVD 对比度不足时必须的补偿（dataviz 技能硬性要求）
