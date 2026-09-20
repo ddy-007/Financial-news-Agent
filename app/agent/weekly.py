@@ -130,6 +130,14 @@ def generate_weekly_report(db: Session,
     start, end = _week_range(d)
 
     rows = _load_dailies(db, start, end)
+    # 按天去重，取当天最后一份（`date` 最晚）。
+    # 与 compute_backtest() 同一个理由：同一天可能因手动重跑留下多份，
+    # 不去重的话这一天在周汇总（均分、分歧度、风险否决）里会被重复加权。
+    _by_day: dict = {}
+    for r in sorted(rows, key=lambda r: r.date):
+        _by_day[r.date.date()] = r
+    rows = list(_by_day.values())
+
     if len(rows) < 2:
         logger.info(f"本周日报仅 {len(rows)} 份（需 ≥2），不生成周报")
         return None

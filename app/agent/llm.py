@@ -17,8 +17,6 @@ from openai import (
 
 from app.config import settings
 
-DEFAULT_PART = "expert"
-
 # 分组名 -> (api_key 字段, base_url 字段, model 字段, 关闭思考的开关字段)
 _GROUPS = {
     "news": ("news_api_key", "news_base_url", "news_model",
@@ -73,10 +71,14 @@ def _group_fields(part: str) -> tuple[str, str, str, str]:
     return _GROUPS[part]
 
 
-def resolve(part: str = DEFAULT_PART) -> tuple[str, str, str]:
+def resolve(part: str) -> tuple[str, str, str]:
     """解析某分组的生效配置，返回 (api_key, base_url, model)。
 
+    `part` **必填**，理由同 `get_llm`：有默认值就会让漏填静默用错模型。
     分组名写错会直接抛错，而不是静默回落到默认模型——避免"配了不生效"。
+
+    ⚠️ **返回值含明文 api_key，不要整个打印**（会泄露到对话/日志）。
+    要打印配置请只取下标，如 `resolve(p)[2]` 取模型名。
     """
     key_field, url_field, model_field, _ = _group_fields(part)
     # 先 strip 再判空：填了空白字符串（" "）等于没填。不然空白会被当成有效值

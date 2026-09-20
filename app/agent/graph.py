@@ -491,10 +491,15 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
     else:
         as_of = _report_time_on(date)
         if as_of > datetime.now():
-            # 截止时点在未来（补跑当天、但还没到 REPORT_TIME）——退回"现在"。
+            # 截止时点在未来（补跑当天、但还没到 REPORT_TIME）——退回实时口径。
             # 否则会把今天的数据全部过滤掉，生成一份空报告。
-            logger.warning(f"截止时点 {as_of} 晚于当前时间，回退为当前时间")
-            as_of = datetime.now()
+            # 置回 None（而不是设成 now()）：这样 prepare_node 走的是**与实时生成
+            # 完全相同的分支**——含信号①按入库统计——两份报告口径才可比。
+            logger.warning(
+                f"截止时点 {as_of} 晚于当前时间，回退为实时口径；"
+                f"报告日期仍记为传入的 {date:%Y-%m-%d %H:%M}"
+            )
+            as_of = None
 
     final: dict = {}
     try:

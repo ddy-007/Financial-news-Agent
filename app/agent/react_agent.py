@@ -2,30 +2,31 @@
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 
-from app.agent.llm import get_llm, resolve
+from app.agent.llm import get_llm
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.tools import ALL_TOOLS
 
 _agent = None
-_agent_cfg: tuple[str, str, str] | None = None
 
 
 def get_chat_agent():
-    """取问答 Agent（惰性构建；**配置变了会自动重建**）。
+    """取问答 Agent（惰性构建，进程内复用）。
 
-    其它环节每次调用都新建 LLM，改了 `.env` 立刻生效；这里为了省下重复构建
-    做了缓存，但若不检查配置就会「改了配置不生效、必须重启后端」。
-    所以额外记一个配置指纹，变了就重建。
+    **改 `.env` 后必须重启后端才生效。** 这不是本模块的特例——
+    `settings` 是 import 时实例化的单例，pydantic-settings 只在那时读一次 `.env`，
+    之后改文件或环境变量都不会刷新。**所有环节都一样**（它们虽然每次新建 LLM 对象，
+    但读的还是同一个冻结的 `settings`）。
+
+    > 曾试过在这里加「配置指纹」做热更新，但指纹本身也取自那个冻结的 settings，
+    > 条件永远为假 —— 是个看着像修好了的空转逻辑，已删除。
     """
-    global _agent, _agent_cfg
-    cfg = resolve("chat")
-    if _agent is None or cfg != _agent_cfg:
+    global _agent
+    if _agent is None:
         _agent = create_agent(
             get_llm(temperature=0.3, part="chat"),
             ALL_TOOLS,
             system_prompt=SYSTEM_PROMPT,
         )
-        _agent_cfg = cfg
     return _agent
 
 

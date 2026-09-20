@@ -2,7 +2,7 @@
 
 四个信号，**任一满足即视为有料**；全不满足则 low_info=True。
 
-    ① 新颖度    —— 今日新增入库的新闻数
+    ① 新颖度    —— 今日新增入库的新闻数（补跑时改按「今日发布」，见 use_publish_time）
     ②a 事件强度 —— 今日新闻中存在多源佐证（source_count 高）
     ②b 情绪强度 —— 今日新闻中存在明确多空倾向（|sentiment| 大）※依赖情绪分覆盖
     ③ 市场异动  —— 任一主要指数涨跌幅超阈值
@@ -77,11 +77,15 @@ def assess_info_level(db: Session, target_date: date | None = None,
     changes = [abs(r.change_pct) for r in rows if r.change_pct is not None]
     max_change = round(max(changes), 2) if changes else 0.0
 
+    # 文案随口径切换——这些字会随 final 落进报告正文存档，
+    # 补跑时写「新增」会与实际统计口径（发布）不符
+    new_short = "发布" if use_publish_time else "新增"
+
     signals = {
         "new_count": {
             "value": new_count, "threshold": settings.info_new_threshold,
             "pass": new_count >= settings.info_new_threshold,
-            "desc": "今日新增新闻数",
+            "desc": f"今日{new_short}新闻数",
         },
         "multi_source": {
             "value": multi_source, "threshold": 1,
@@ -104,7 +108,7 @@ def assess_info_level(db: Session, target_date: date | None = None,
     low_info = len(passed) == 0
     if low_info:
         reason = (
-            f"四信号均未触发（新增{new_count}条、多源{multi_source}条、"
+            f"四信号均未触发（{new_short}{new_count}条、多源{multi_source}条、"
             f"强情绪{strong_sentiment}条、最大波动{max_change}%）"
         )
     else:

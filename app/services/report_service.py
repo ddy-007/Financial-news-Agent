@@ -119,13 +119,17 @@ def compute_backtest(db: Session) -> dict:
         .order_by(MarketReport.date.asc())
         .all()
     )
-    # 按天去重，取当天**最后一份**。
-    # 为什么需要：`report.date` 存的是 datetime，唯一约束只到秒级，
-    # 「一天一份」实际没约束住——开发期手动重跑会留下多份。
-    # 不去重的话同一天会被当成多个独立样本，在准确率里被重复加权。
+    # ① 先剔掉没有 score 的（聚合失败留下的），② 再按天去重取最后一份。
+    # **顺序不能反**：若先去重、而某天最后一份恰好无 score，这一天会整个从回测消失，
+    # 而不是退回到当天那份有 score 的。
+    scored = [r for r in reports if r.score is not None]
+    # 「最后一份」= `date` 最晚的那份（遍历顺序是 date 升序，dict 覆盖即取最后）。
+    # 为什么需要去重：`report.date` 存的是**含微秒**的 datetime，唯一约束作用在它上面，
+    # 同一天不同秒即不同值 —— 「一天一份」实际没约束住，开发期手动重跑会留下多份。
+    # 不去重的话，同一天会被当成多个独立样本，在准确率里被重复加权。
     by_day: dict = {}
-    for rep in reports:
-        by_day[rep.date.date()] = rep   # order_by asc，后者覆盖前者 = 取最后一份
+    for rep in scored:
+        by_day[rep.date.date()] = rep
     reports = list(by_day.values())
     sh = (
         db.query(MarketData)
@@ -141,8 +145,7 @@ def compute_backtest(db: Session) -> dict:
     buckets: dict[str, dict] = {}
     details = []
     for rep in reports:
-        if rep.score is None:
-            continue
+        # score 为 None 的已在上面去重前剔除（见注释），这里无需再判
         pred_dir = 1 if rep.score > 0.1 else (-1 if rep.score < -0.1 else 0)
         if pred_dir == 0:
             continue  # 中性不纳入方向统计
