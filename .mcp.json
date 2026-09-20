@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "sqlite-readonly": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--no-project",
+        "--with",
+        "mcp>=2,<3",
+        "python",
+        "scripts/mcp_sqlite_readonly.py"
+      ]
+    }
+  }
+}
