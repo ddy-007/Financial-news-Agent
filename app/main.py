@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
 
 
-app = FastAPI(title="金融新闻股市预测 Agent", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="金融新闻情报简报 Agent", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

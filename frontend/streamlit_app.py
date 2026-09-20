@@ -19,7 +19,7 @@ UP_COLOR = "#a32a2a"    # 涨（红，深）
 DOWN_COLOR = "#6ec96e"  # 跌（绿，浅）
 NEUTRAL = "#898781"     # 中性/文字
 
-st.set_page_config(page_title="金融新闻股市预测 Agent", page_icon="📈", layout="wide")
+st.set_page_config(page_title="金融新闻情报简报 Agent", page_icon="📈", layout="wide")
 
 
 # ================= 基础工具 =================
@@ -517,7 +517,7 @@ def page_history():
 
 # ================= 主入口 =================
 def main():
-    st.sidebar.title("📈 金融预测 Agent")
+    st.sidebar.title("📈 金融情报简报 Agent")
     api_base = st.sidebar.text_input("后端地址", value=get_api_base())
     st.session_state.api_base = api_base
 
