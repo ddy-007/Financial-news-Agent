@@ -85,6 +85,16 @@ class Settings(BaseSettings):
     divergence_low: float = 0.5
     divergence_high: float = 1.0
 
+    # ---- 综合分（加权平均后的 score）判定阈值 ----
+    # **三处共用这一套值**，不许各写各的：
+    #   aggregate_node 定调（偏多/中性/偏空）
+    #   compute_backtest 判方向（算不算"看多"）
+    #   _score_bucket 分档（按情绪分档统计胜率）
+    # 历史上它们分别是 ±0.15 与 ±0.1，导致同一份综合分 -0.12 被一处判「看空」、
+    # 另一处判「中性」—— 自己跟自己打架。统一后由这两项一处控制。
+    score_neutral_band: float = 0.15   # |综合分| < 此值 → 中性（无明确方向）
+    score_strong_band: float = 0.5     # |综合分| > 此值 → 强多 / 强空
+
     # ---- 信息量门槛（任一满足即视为「有料」）----
     # 四个信号全不满足 → low_info=True（仍生成报告，仅标记 + 精简）
     info_new_threshold: int = 15          # ① 今日新增新闻数

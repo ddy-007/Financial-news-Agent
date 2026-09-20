@@ -332,9 +332,11 @@ def aggregate_node(state: AnalystState) -> dict:
     else:
         desc = "专家存在分歧"
 
-    if weighted > 0.15:
+    # 边界与 compute_backtest / _score_bucket **共用同一套 config**——
+    # 各写各的会让同一份综合分被一处判「看空」、另一处判「中性」
+    if weighted > settings.score_neutral_band:
         sentiment = "偏多"
-    elif weighted < -0.15:
+    elif weighted < -settings.score_neutral_band:
         sentiment = "偏空"
     else:
         sentiment = "中性"

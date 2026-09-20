@@ -7,6 +7,7 @@ from loguru import logger
 from sqlalchemy.orm import Session
 
 from app.agent.graph import generate_daily_report, score_news_sentiment
+from app.config import settings
 from app.models.market import MarketData
 from app.models.report import MarketReport
 
@@ -95,16 +96,21 @@ def report_to_dict(r: MarketReport) -> dict:
 
 
 def _score_bucket(score: float) -> str:
-    """按综合情绪分分档。"""
-    if score > 0.5:
-        return "强多(>0.5)"
-    if score > 0.1:
-        return "偏多(0.1~0.5)"
-    if score < -0.5:
-        return "强空(<-0.5)"
-    if score < -0.1:
-        return "偏空(-0.5~-0.1)"
-    return "中性(-0.1~0.1)"
+    """按综合情绪分分档。
+
+    边界取自 config（与 `aggregate_node` 定调、`compute_backtest` 判方向**同源**），
+    档位文案随之生成 —— 改配置时文案自动跟上，不会出现"标签写 0.1、实际判 0.15"。
+    """
+    n, s = settings.score_neutral_band, settings.score_strong_band
+    if score > s:
+        return f"强多(>{s})"
+    if score > n:
+        return f"偏多({n}~{s})"
+    if score < -s:
+        return f"强空(<-{s})"
+    if score < -n:
+        return f"偏空(-{s}~-{n})"
+    return f"中性(-{n}~{n})"
 
 
 def compute_backtest(db: Session) -> dict:
@@ -146,7 +152,9 @@ def compute_backtest(db: Session) -> dict:
     details = []
     for rep in reports:
         # score 为 None 的已在上面去重前剔除（见注释），这里无需再判
-        pred_dir = 1 if rep.score > 0.1 else (-1 if rep.score < -0.1 else 0)
+        # 边界与 aggregate_node 定调、_score_bucket 分档同源（config 一处控制）
+        _n = settings.score_neutral_band
+        pred_dir = 1 if rep.score > _n else (-1 if rep.score < -_n else 0)
         if pred_dir == 0:
             continue  # 中性不纳入方向统计
         rd = rep.date.date()
