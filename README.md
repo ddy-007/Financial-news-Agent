@@ -101,7 +101,8 @@ curl -X POST http://localhost:8000/api/v1/reports/generate
 | POST | `/api/v1/reports/weekly/generate` | 手动生成周报 |
 | GET | `/api/v1/reports/backtest` | 方向回测（判断质量的自我检查，非战绩展示） |
 | GET | `/api/v1/reports/evaluation` | 评估层（加 `?diagnostic=true` 跑敏感性/复现性） |
-| GET | `/api/v1/news` | 新闻列表 |
+| GET | `/api/v1/news` | 新闻列表（可选 `days` / `start`+`end` / `keyword` / `limit`） |
+| GET | `/api/v1/news/dates` | 有新闻的日期清单（含每天条数，供日期筛选用） |
 | POST | `/api/v1/news/collect` | 采集新闻 |
 | GET | `/api/v1/market` | 行情列表 |
 | POST | `/api/v1/market/collect` | 采集行情 |

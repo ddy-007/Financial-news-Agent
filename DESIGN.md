@@ -362,7 +362,8 @@ class MarketReport(BaseModel):
 |------|------|------|
 | GET | `/api/v1/reports/today` | 今日研判报告 |
 | GET | `/api/v1/reports?date=YYYY-MM-DD` | 历史报告 |
-| GET | `/api/v1/news?date=&keyword=&limit=` | 新闻查询 |
+| GET | `/api/v1/news?days=&start=&end=&keyword=&limit=` | 新闻查询（`start`/`end` 为发布日期区间） |
+| GET | `/api/v1/news/dates` | 有新闻的日期清单（前端日期标签与覆盖率提示用） |
 | GET | `/api/v1/market?symbol=&start=&end=` | 行情查询 |
 | POST | `/api/v1/agent/chat` | 交互问答（调用 Agent） |
 | POST | `/api/v1/agent/generate` | 手动触发研判生成 |

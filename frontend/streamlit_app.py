@@ -271,18 +271,26 @@ def page_news():
     # ① 日期清单单独取 —— 它回答的是「库里有哪些日期」，与新闻总量无关（一条聚合查询）。
     #    原先是拿一批新闻（limit=1000）再从中"推"日期，数据量一超过上限，
     #    老日期连按钮都不会出现（实证：库里 4632 条覆盖 10 天，前端那 1000 条只剩 2 天）。
-    dates_resp = api_get("/api/v1/news/dates") or {}
+    dates_resp = api_get("/api/v1/news/dates")
+    if dates_resp is None:
+        # 请求失败——api_get 已弹出具体错误。别再往下走，
+        # 否则会显示"暂无新闻"，把"后端没起"误导成"库是空的"。
+        return
     date_rows = dates_resp.get("dates") or []
     if not date_rows:
-        st.info("暂无新闻，点击「采集最新新闻」按钮。")
+        st.info("库里还没有新闻，点击「采集最新新闻」按钮。")
         return
 
     dates = [date.fromisoformat(r["date"]) for r in date_rows]   # 接口已按日期降序
     # 跨年时标签必须带年份，否则「9月5日」会撞键、导致某一年那一天点不到
     _multi_year = dates[0].year != dates[-1].year
-    date_map = {
-        (d.isoformat() if _multi_year else f"{d.month}月{d.day}日"): d for d in dates
-    }
+    date_map: dict = {}
+    date_count: dict = {}
+    for r in date_rows:
+        d = date.fromisoformat(r["date"])
+        label = d.isoformat() if _multi_year else f"{d.month}月{d.day}日"
+        date_map[label] = d
+        date_count[label] = r["count"]
     selected = st.pills("按日期筛选", ["全部日期"] + list(date_map.keys()), default="全部日期")
 
     # 数据可用范围必须显式说明：下面的滑块能拉到 30 天，但库里未必有那么多天。
@@ -321,7 +329,15 @@ def page_news():
         return
 
     df = pd.DataFrame(data)
-    df["date"] = pd.to_datetime(df["publish_time"]).dt.date
+
+    # 单日条数可能超过「显示条数」而被服务端截断 —— 不说明会让人以为那天只有这么多
+    if selected and selected != "全部日期":
+        _total = date_count.get(selected, 0)
+        if _total > len(df):
+            st.caption(
+                f"⚠️ 该日共 **{_total}** 条，此处按「显示条数」只展示最新的 "
+                f"**{len(df)}** 条（调大「显示条数」可看更多）。"
+            )
 
     df["源数"] = df["source_count"].apply(
         lambda x: f"🔥 {int(x)}源" if x and x >= 2 else "1源"

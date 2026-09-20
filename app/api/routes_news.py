@@ -43,6 +43,9 @@ def news_dates(db: Session = Depends(get_db)):
     day = func.substr(News.publish_time, 1, 10)
     rows = (
         db.query(day.label("d"), func.count().label("n"))
+        # 排除 publish_time 为 NULL 的行：否则会归出一个 date=null 的组，
+        # 前端 date.fromisoformat(None) 会直接抛异常、整页崩
+        .filter(News.publish_time.isnot(None))
         .group_by("d")
         .order_by(day.desc())
         .all()
@@ -67,9 +70,14 @@ def list_news(
     """
     q = db.query(News).order_by(News.publish_time.desc())
     if keyword:
-        q = q.filter(News.title.contains(keyword))
+        # autoescape：否则关键词里的 % / _ 会被当成 LIKE 通配符
+        # （搜 "a_c" 会命中 "abc"）—— 用户输入应当按字面匹配
+        q = q.filter(News.title.contains(keyword, autoescape=True))
     if days:
-        since = datetime.now() - timedelta(days=days)
+        # 按**日历天**回推：days=1 表示"今天"，days=7 表示"今天及之前 6 天"。
+        # 若写成 now()-timedelta(days=days)，语义会变成"滚动 N×24 小时"，
+        # 跨零点时与"近 N 天"的直觉不符。
+        since = datetime.combine(date.today() - timedelta(days=days - 1), time.min)
         q = q.filter(News.publish_time >= since)
     if start:
         q = q.filter(News.publish_time >= datetime.combine(start, time.min))
