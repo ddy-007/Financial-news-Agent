@@ -2,21 +2,30 @@
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 
-from app.agent.llm import get_llm
+from app.agent.llm import get_llm, resolve
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.tools import ALL_TOOLS
 
 _agent = None
+_agent_cfg: tuple[str, str, str] | None = None
 
 
 def get_chat_agent():
-    global _agent
-    if _agent is None:
+    """取问答 Agent（惰性构建；**配置变了会自动重建**）。
+
+    其它环节每次调用都新建 LLM，改了 `.env` 立刻生效；这里为了省下重复构建
+    做了缓存，但若不检查配置就会「改了配置不生效、必须重启后端」。
+    所以额外记一个配置指纹，变了就重建。
+    """
+    global _agent, _agent_cfg
+    cfg = resolve("chat")
+    if _agent is None or cfg != _agent_cfg:
         _agent = create_agent(
             get_llm(temperature=0.3, part="chat"),
             ALL_TOOLS,
             system_prompt=SYSTEM_PROMPT,
         )
+        _agent_cfg = cfg
     return _agent
 
 

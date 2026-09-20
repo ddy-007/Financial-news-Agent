@@ -179,7 +179,13 @@ def prepare_node(state: AnalystState) -> dict:
             "技术指标不可用（获取失败）", "技术指标",
         )
         info_level = _safe_extra(
-            lambda: assess_info_level(db, target_date=as_of.date() if as_of else None),
+            lambda: assess_info_level(
+                db,
+                target_date=as_of.date() if as_of else None,
+                # 补跑时信号①改按发布时间——否则 collected_at 落在补跑当天，
+                # 对目标日恒为 0，low_info 会偏保守
+                use_publish_time=as_of is not None,
+            ),
             {}, "信息量评估")
         # 板块实际表现：给行业分析师做「新闻 vs 市场反应」的交叉验证
         sector_summary = _safe_extra(
@@ -522,7 +528,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         risk_veto=final.get("risk_veto"),
         low_info=info_level.get("low_info"),
         data_stale=data_freshness.get("stale"),
-        model=get_llm_model_name("expert"),
+        model=get_llm_model_name(part="expert"),
     )
     db.add(report)
     db.commit()

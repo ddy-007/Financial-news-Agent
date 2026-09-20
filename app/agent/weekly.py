@@ -243,7 +243,7 @@ def generate_weekly_report(db: Session,
     report.expert_opinions = None
     report.divergence = divergence
     report.risk_veto = risk_veto
-    report.model = get_llm_model_name("weekly")
+    report.model = get_llm_model_name(part="weekly")
 
     db.commit()
     db.refresh(report)

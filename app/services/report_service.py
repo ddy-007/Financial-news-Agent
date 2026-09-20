@@ -119,6 +119,14 @@ def compute_backtest(db: Session) -> dict:
         .order_by(MarketReport.date.asc())
         .all()
     )
+    # 按天去重，取当天**最后一份**。
+    # 为什么需要：`report.date` 存的是 datetime，唯一约束只到秒级，
+    # 「一天一份」实际没约束住——开发期手动重跑会留下多份。
+    # 不去重的话同一天会被当成多个独立样本，在准确率里被重复加权。
+    by_day: dict = {}
+    for rep in reports:
+        by_day[rep.date.date()] = rep   # order_by asc，后者覆盖前者 = 取最后一份
+    reports = list(by_day.values())
     sh = (
         db.query(MarketData)
         .filter(MarketData.symbol == "sh000001")

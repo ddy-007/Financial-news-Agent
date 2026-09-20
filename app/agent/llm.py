@@ -142,8 +142,13 @@ def llm_retry_times() -> int:
     return 1 if fallback_enabled() else 3
 
 
-def get_llm(temperature: float = 0.0, part: str = DEFAULT_PART):
+def get_llm(temperature: float = 0.0, *, part: str):
     """取某个分组的 LLM 客户端。
+
+    `part` **必填**——故意不给默认值。给了默认值（如 "expert"）的话，
+    将来新增调用点漏写 `part=` 不会报错，而是**静默用错模型**
+    （比如新闻采集悄悄走了研判的模型），只有看账单才发现。
+    现在漏写当场 `TypeError`，在写代码时就暴露。
 
     **未配备用模型时返回 `ChatOpenAI`**（类型与行为同改动前）；
     配了备用才返回 `RunnableWithFallbacks`，主模型在
@@ -165,8 +170,10 @@ def get_llm(temperature: float = 0.0, part: str = DEFAULT_PART):
     ).with_config(callbacks=[_ModelRecorder(part)])
 
 
-def get_llm_model_name(part: str = DEFAULT_PART) -> str:
+def get_llm_model_name(*, part: str) -> str:
     """该分组**实际产出**报告用的模型名。
+
+    `part` 必填，理由同 `get_llm`。
 
     备用生效过就返回备用模型名（由 `_ModelRecorder` 记录），
     否则返回主模型名——未配备用时行为与改动前完全一致。

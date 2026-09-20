@@ -22,16 +22,26 @@ from app.models.market import MarketData
 from app.models.news import News
 
 
-def assess_info_level(db: Session, target_date: date | None = None) -> dict:
-    """评估指定日期（默认今天）的信息量。"""
+def assess_info_level(db: Session, target_date: date | None = None,
+                      use_publish_time: bool = False) -> dict:
+    """评估指定日期（默认今天）的信息量。
+
+    `use_publish_time`：信号①改按**发布时间**统计。补跑时必须打开——
+    补跑是"今天才把旧新闻采集进来"，`collected_at` 落在补跑当天而非目标日，
+    按它统计信号①会**恒为 0**，让 `low_info` 偏保守。
+    实时生成不传（默认 False），行为与改动前逐字段一致。
+    """
     d = target_date or date.today()
     day_start = datetime.combine(d, time.min)
     day_end = datetime.combine(d, time.max)
 
-    # ① 新颖度：今日新入库的新闻（数据采集 Agent 当天新增的事件数）
+    # ① 新颖度：今日新入库的新闻（数据采集 Agent 当天新增的事件数）。
+    # ②a/②b 本来就用 publish_time，① 是唯一的例外——因为它要衡量的是
+    # "今天的采集动作拿到了多少新东西"；但补跑场景下这个口径失效（见 docstring）。
+    new_col = News.publish_time if use_publish_time else News.collected_at
     new_count = (
         db.query(News)
-        .filter(News.collected_at >= day_start, News.collected_at <= day_end)
+        .filter(new_col >= day_start, new_col <= day_end)
         .count()
     )
 
