@@ -268,54 +268,60 @@ def page_news():
             api_post("/api/v1/news/collect")
             st.rerun()
 
-    data = api_get("/api/v1/news", {"limit": 1000})
-    if not data:
+    # ① 日期清单单独取 —— 它回答的是「库里有哪些日期」，与新闻总量无关（一条聚合查询）。
+    #    原先是拿一批新闻（limit=1000）再从中"推"日期，数据量一超过上限，
+    #    老日期连按钮都不会出现（实证：库里 4632 条覆盖 10 天，前端那 1000 条只剩 2 天）。
+    dates_resp = api_get("/api/v1/news/dates") or {}
+    date_rows = dates_resp.get("dates") or []
+    if not date_rows:
         st.info("暂无新闻，点击「采集最新新闻」按钮。")
         return
 
-    df = pd.DataFrame(data)
-    df["date"] = pd.to_datetime(df["publish_time"]).dt.date
-
-    # 日期标签按钮组
-    dates = sorted(df["date"].unique(), reverse=True)
-    date_map = {f"{d.month}月{d.day}日": d for d in dates}
+    dates = [date.fromisoformat(r["date"]) for r in date_rows]   # 接口已按日期降序
+    # 跨年时标签必须带年份，否则「9月5日」会撞键、导致某一年那一天点不到
+    _multi_year = dates[0].year != dates[-1].year
+    date_map = {
+        (d.isoformat() if _multi_year else f"{d.month}月{d.day}日"): d for d in dates
+    }
     selected = st.pills("按日期筛选", ["全部日期"] + list(date_map.keys()), default="全部日期")
 
     # 数据可用范围必须显式说明：下面的滑块能拉到 30 天，但库里未必有那么多天。
-    # 标签组只列「有数据的日期」，空缺是**静默跳过**的（比如 09-18 直接跳到 09-16），
-    # 不说清楚会被当成 bug。
-    if dates:
-        _span = (dates[-1] - dates[0]).days + 1
-        _missing = _span - len(dates)
-        _suffix = f"，其中 **{_missing} 天无数据**）" if _missing > 0 else "）"
-        st.caption(
-            f"📅 库中新闻覆盖 **{dates[-1]} ~ {dates[0]}**"
-            f"（共 {len(dates)} 天有数据" + _suffix
-        )
+    # 标签组只列「有数据的日期」，空缺是**静默跳过**的（比如 09-18 直接跳到 09-16）。
+    _span = (dates[0] - dates[-1]).days + 1
+    _missing = _span - len(dates)
+    _suffix = f"，其中 **{_missing} 天无数据**）" if _missing > 0 else "）"
+    st.caption(
+        f"📅 库中新闻覆盖 **{dates[-1]} ~ {dates[0]}**"
+        f"（共 {len(dates)} 天有数据" + _suffix
+    )
 
     col_a, col_b = st.columns([2, 1])
     days = col_a.slider("近 N 天", 1, 30, 7)
     limit = col_b.selectbox("显示条数", [100, 300, 500, 1000], index=1)
 
+    # ② 按需向后端取，筛选交给数据库做 —— 不再拿一坨固定数据在本地硬筛。
+    #    选具体某天就只要那天；否则按「近 N 天」窗口。
+    params: dict = {"limit": limit}
     if selected and selected != "全部日期":
-        df = df[df["date"] == date_map[selected]]
+        d = date_map[selected]
+        params["start"] = d.isoformat()
+        params["end"] = d.isoformat()
     else:
-        since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date()
-        df = df[df["date"] >= since]
-
+        params["days"] = days
     if keyword:
-        df = df[df["title"].astype(str).str.contains(keyword, na=False)]
+        params["keyword"] = keyword
 
-    df = df.head(limit)
-
-    # 筛选结果为空时给明确原因，而不是甩一张空表（原先是空白，看不出是没数据还是坏了）
-    if df.empty:
+    data = api_get("/api/v1/news", params)
+    if not data:
         st.info(
             "该筛选条件下**没有新闻数据**。\n\n"
             "常见原因：① 选定日期当天没有采集到新闻；"
             "② 「近 N 天」窗口内库里没有数据；③ 关键词没有命中。"
         )
         return
+
+    df = pd.DataFrame(data)
+    df["date"] = pd.to_datetime(df["publish_time"]).dt.date
 
     df["源数"] = df["source_count"].apply(
         lambda x: f"🔥 {int(x)}源" if x and x >= 2 else "1源"
