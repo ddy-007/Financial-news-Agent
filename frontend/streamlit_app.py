@@ -47,16 +47,6 @@ def api_post(path: str, json_data: dict | None = None):
         return None
 
 
-def sentiment_color(v: float | None) -> str:
-    if v is None:
-        return NEUTRAL
-    if v > 0:
-        return UP_COLOR
-    if v < 0:
-        return DOWN_COLOR
-    return NEUTRAL
-
-
 # ================= 页面：每日研判 =================
 def page_dashboard():
     st.title("📊 每日市场研判")
@@ -345,6 +335,7 @@ def page_market():
     st.title("📉 指数行情")
     if st.button("采集最新行情"):
         api_post("/api/v1/market/collect")
+        st.rerun()   # 与新闻页的同名按钮一致：不 rerun 就看不到刷新
 
     data = api_get("/api/v1/market", {"limit": 500})
     if not data:
