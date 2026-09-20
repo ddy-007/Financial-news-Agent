@@ -130,11 +130,18 @@ def generate_weekly_report(db: Session,
     start, end = _week_range(d)
 
     rows = _load_dailies(db, start, end)
-    # 按天去重，取当天最后一份（`date` 最晚）。
-    # 与 compute_backtest() 同一个理由：同一天可能因手动重跑留下多份，
-    # 不去重的话这一天在周汇总（均分、分歧度、风险否决）里会被重复加权。
+
+    # 风险否决必须在**去重之前**用全体日报算：`any()` 是布尔或，本就不受
+    # 重复影响；先去重反而可能丢掉只出现在当天较早那份上的 `veto=True`。
+    risk_veto = any(r.risk_veto for r in rows)
+
+    # 按天去重：优先保留当天**有 score** 的最后一份，若全天无 score 则保留
+    # date 最晚的那份。与 `compute_backtest()` 同一口径。
+    # 为什么要去重：均分与分歧度是**平均值**，同一天因手动重跑留下多份会重复加权。
+    # 排序键 `(date, score is not None)`：同一天里无分的排前、有分的排后，
+    # dict 覆盖后留下的即「最后一份有分的」。
     _by_day: dict = {}
-    for r in sorted(rows, key=lambda r: r.date):
+    for r in sorted(rows, key=lambda r: (r.date, r.score is not None)):
         _by_day[r.date.date()] = r
     rows = list(_by_day.values())
 
@@ -176,7 +183,7 @@ def generate_weekly_report(db: Session,
     sentiment = "偏多" if weekly_score > 0.15 else ("偏空" if weekly_score < -0.15 else "中性")
     divs = [r.divergence for r in rows if r.divergence is not None]
     divergence = round(sum(divs) / len(divs), 3) if divs else None
-    risk_veto = any(r.risk_veto for r in rows)
+    # risk_veto 已在上面（去重之前）算好
 
     # LLM 撰写
     llm = get_llm(temperature=0.2, part="weekly")

@@ -484,6 +484,9 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
     - `date` 为空（调度器 / 实时生成）→ 走「现在」，**行为与改动前完全一致**。
     - `date` 非空（补跑）→ 以该日 `REPORT_TIME` 为截止时点取**历史**数据，
       否则会把今天的新闻/行情塞进标着过去日期的报告，回测时等于用未来预测过去。
+    - ⚠️ 若该截止时点**仍晚于当前时间**（补跑当天、但还没到 `REPORT_TIME`），
+      则回退为**实时口径**（`as_of=None`）——避免把今天的数据全过滤掉生成空报告。
+      此时**报告日期仍是传入的 `date`**，与内容口径不完全对应，日志里会说明。
     """
     if date is None:
         date = datetime.now()
