@@ -6,7 +6,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from app.api import routes_agent, routes_market, routes_news, routes_reports
+from app.api import (
+    routes_agent,
+    routes_market,
+    routes_news,
+    routes_reports,
+    routes_sectors,
+)
 from app.collectors.scheduler import start_scheduler, stop_scheduler
 from app.db import init_db
 
@@ -63,6 +69,7 @@ app.add_middleware(
 app.include_router(routes_reports.router)
 app.include_router(routes_news.router)
 app.include_router(routes_market.router)
+app.include_router(routes_sectors.router)
 app.include_router(routes_agent.router)
 
 

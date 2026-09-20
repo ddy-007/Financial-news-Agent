@@ -1,4 +1,6 @@
-"""Agent 工具集：RAG 检索 + 行情查询 + 新闻浏览 + 历史报告 + 联网搜索。"""
+"""Agent 工具集：RAG 检索 + 行情查询 + 新闻浏览 + 历史报告 + 联网搜索 + 板块排行。"""
+from datetime import datetime, time
+
 import httpx
 from langchain_core.tools import tool
 
@@ -117,4 +119,55 @@ def get_report_history(limit: int = 5) -> str:
         db.close()
 
 
-ALL_TOOLS = [search_news, get_market_overview, get_recent_news, get_report_history, web_search]
+@tool
+def get_sector_performance(date: str = "") -> str:
+    """查询行业板块涨跌排行：哪些板块在涨、哪些在跌、领涨股是谁。
+
+    用于回答"钱往哪个方向去了"这类问题——指数只告诉你大盘涨跌，
+    板块才看得出结构（比如"大盘跌但半导体在涨"）。
+
+    date 留空取库中最新一天；也可指定日期，格式 YYYY-MM-DD。
+
+    ⚠️ **返回值第一行是数据日期。回答时必须把这个日期说出来** ——
+    板块采集只在工作日进行，后端没开的那几天会断档，数据可能不是最新的。
+    """
+    from app.services.sector_service import get_latest_sectors
+
+    db = SessionLocal()
+    try:
+        as_of = None
+        if date.strip():
+            try:
+                d = datetime.strptime(date.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                return f"日期格式不对：{date!r}，应为 YYYY-MM-DD。"
+            as_of = datetime.combine(d, time.max)
+
+        rows, day = get_latest_sectors(db, as_of=as_of)
+        ranked = [r for r in rows if r.change_pct is not None]
+        if not ranked:
+            return "暂无板块数据（可能尚未采集过，或该日期之前没有数据）。"
+
+        up = sum(1 for r in ranked if r.change_pct > 0)
+        down = sum(1 for r in ranked if r.change_pct < 0)
+        # rows 已按涨跌幅降序，取头尾各 5 个
+        top, bottom = ranked[:5], ranked[-5:][::-1]
+
+        def fmt(r) -> str:
+            # 只在**上涨**板块标注领涨股 —— 对下跌板块说"领涨"自相矛盾
+            # （该字段是"板块内涨幅第一的个股"，板块整体下跌时它也可能在跌）
+            leader = f"（领涨 {r.leader}）" if (r.change_pct > 0 and r.leader) else ""
+            return f"{r.name} {r.change_pct:+.2f}%{leader}"
+
+        return "\n".join([
+            f"数据日期：{day}",
+            f"全市场 {len(ranked)} 个板块：{up} 涨 / {down} 跌",
+            "领涨：" + "、".join(fmt(r) for r in top),
+            "领跌：" + "、".join(fmt(r) for r in bottom),
+        ])
+    finally:
+        db.close()
+
+
+ALL_TOOLS = [search_news, get_market_overview, get_recent_news,
+             get_report_history, web_search, get_sector_performance]

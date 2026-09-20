@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 import httpx
 import pandas as pd
@@ -9,8 +10,13 @@ import plotly.express as px
 import streamlit as st
 
 # ---- 配色（中国金融惯例：红涨绿跌；同时用 +/- 符号做次要编码，不单靠颜色）----
-UP_COLOR = "#d03b3b"    # 涨（红）
-DOWN_COLOR = "#0ca30c"  # 跌（绿）
+# 色值经过 CVD（色盲）验证：红绿对是色盲最易混的组合，原先的 #d03b3b/#0ca30c
+# 在 deuteranopia 下 ΔE 仅 4.1（几乎分不出）。改成下面这组后 ΔE = 27.0。
+# 靠的是**拉开明度差**——色盲者分不出红绿，但分得出深浅。
+# 校验方式：dataviz 技能的 scripts/validate_palette.js（light 模式全项通过）。
+# ⚠️ 暗色模式需要另一套步进值；本项目所有图表目前都是单套配色，属于既有待办。
+UP_COLOR = "#a32a2a"    # 涨（红，深）
+DOWN_COLOR = "#6ec96e"  # 跌（绿，浅）
 NEUTRAL = "#898781"     # 中性/文字
 
 st.set_page_config(page_title="金融新闻股市预测 Agent", page_icon="📈", layout="wide")
@@ -381,6 +387,61 @@ def page_market():
     table = latest[["name", "symbol", "close", "change_pct", "date"]]
     table.columns = ["名称", "代码", "收盘", "涨跌幅%", "日期"]
     st.dataframe(table, use_container_width=True)
+
+    # ================= 板块涨跌榜 =================
+    st.divider()
+    st.subheader("🏭 板块涨跌榜")
+
+    sec = api_get("/api/v1/sectors")
+    if not sec or not sec.get("rows"):
+        st.info("暂无板块数据。板块采集在工作日 17:40 进行 —— 后端没开的那几天不会采集。")
+        return
+
+    # 数据日期必须显著：板块采集只在工作日跑，后端一停就断档。
+    # 只写个日期不够——人看到"09-16"不会立刻反应过来那是几天前。
+    sec_date = sec["date"]
+    days_ago = (date.today() - date.fromisoformat(sec_date)).days
+    if days_ago == 0:
+        st.caption(f"数据日期：{sec_date}（今日）")
+    else:
+        st.warning(
+            f"⚠️ **数据日期：{sec_date} —— {days_ago} 天前**，不是今日行情。"
+            "板块采集仅在交易日 17:40 进行。"
+        )
+
+    df_sec = pd.DataFrame(sec["rows"]).dropna(subset=["change_pct"])
+    if df_sec.empty:
+        st.info("该日板块数据为空。")
+        return
+
+    # 只画头尾各 8 个：84 个板块全塞进去没法读（全市场只有十几个在涨）
+    TOP_N = 8
+    ranked = df_sec.sort_values("change_pct", ascending=False)
+    show = pd.concat([ranked.head(TOP_N), ranked.tail(TOP_N)]).drop_duplicates("name")
+    show = show.sort_values("change_pct")          # 升序 -> 图上最大的涨在上方
+    show["方向"] = show["change_pct"].apply(lambda v: "涨" if v > 0 else "跌")
+    show["标签"] = show["change_pct"].map(lambda v: f"{v:+.2f}%")
+
+    up_n = int((df_sec["change_pct"] > 0).sum())
+    down_n = int((df_sec["change_pct"] < 0).sum())
+    st.caption(f"全市场 {len(df_sec)} 个板块：**{up_n} 涨 / {down_n} 跌**（图中只列头尾各 {TOP_N} 个）")
+
+    fig2 = px.bar(
+        show, x="change_pct", y="name", orientation="h",
+        color="方向", color_discrete_map={"涨": UP_COLOR, "跌": DOWN_COLOR},
+        text="标签",
+    )
+    # 条上直接标数值 —— 这同时是 CVD 对比度不足时必须的补偿（dataviz 技能硬性要求）
+    fig2.update_traces(textposition="outside", cliponaxis=False)
+    fig2.update_layout(
+        xaxis_title="涨跌幅 %", yaxis_title=None, legend_title=None,
+        height=max(320, 34 * len(show)),
+        margin=dict(l=0, r=40, t=10, b=0),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        bargap=0.25,
+    )
+    fig2.add_vline(x=0, line_width=1, line_color=NEUTRAL)
+    st.plotly_chart(fig2, use_container_width=True)
 
 
 # ================= 页面：AI 问答 =================
