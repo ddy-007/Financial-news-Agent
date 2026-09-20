@@ -161,7 +161,13 @@ class EastmoneyCollector(BaseCollector):
 
 class ClsCollector(BaseCollector):
     source_name = "财联社"
-    BASE = "https://www.cls.cn/api/cache"
+    # ⚠️ 端点必须是 v1/roll/get_roll_list。
+    # 曾经用的是 `api/cache`，那个端点的 `last_time` 游标**完全不生效**——
+    # 翻 20 页拿回的是同一批 20 条，每轮采集实际只贡献 20 条唯一内容
+    # （库里财联社长期只有 123 条，而新浪 3473、东财 987，就是这个原因）。
+    # 2026-09-20 实测：该端点连续请求两次 id 完全相同；换成 v1 端点后
+    # 连续 10 页取得 200 条、**全部唯一**且时间稳定倒推。
+    BASE = "https://www.cls.cn/v1/roll/get_roll_list"
 
     @staticmethod
     def _sign(params: dict) -> str:

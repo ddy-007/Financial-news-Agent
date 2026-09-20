@@ -281,6 +281,18 @@ def page_news():
     date_map = {f"{d.month}月{d.day}日": d for d in dates}
     selected = st.pills("按日期筛选", ["全部日期"] + list(date_map.keys()), default="全部日期")
 
+    # 数据可用范围必须显式说明：下面的滑块能拉到 30 天，但库里未必有那么多天。
+    # 标签组只列「有数据的日期」，空缺是**静默跳过**的（比如 09-18 直接跳到 09-16），
+    # 不说清楚会被当成 bug。
+    if dates:
+        _span = (dates[-1] - dates[0]).days + 1
+        _missing = _span - len(dates)
+        _suffix = f"，其中 **{_missing} 天无数据**）" if _missing > 0 else "）"
+        st.caption(
+            f"📅 库中新闻覆盖 **{dates[-1]} ~ {dates[0]}**"
+            f"（共 {len(dates)} 天有数据" + _suffix
+        )
+
     col_a, col_b = st.columns([2, 1])
     days = col_a.slider("近 N 天", 1, 30, 7)
     limit = col_b.selectbox("显示条数", [100, 300, 500, 1000], index=1)
@@ -295,6 +307,15 @@ def page_news():
         df = df[df["title"].astype(str).str.contains(keyword, na=False)]
 
     df = df.head(limit)
+
+    # 筛选结果为空时给明确原因，而不是甩一张空表（原先是空白，看不出是没数据还是坏了）
+    if df.empty:
+        st.info(
+            "该筛选条件下**没有新闻数据**。\n\n"
+            "常见原因：① 选定日期当天没有采集到新闻；"
+            "② 「近 N 天」窗口内库里没有数据；③ 关键词没有命中。"
+        )
+        return
 
     df["源数"] = df["source_count"].apply(
         lambda x: f"🔥 {int(x)}源" if x and x >= 2 else "1源"
