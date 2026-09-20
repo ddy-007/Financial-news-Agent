@@ -12,16 +12,25 @@
 保证，不能信任供应商的 --readonly 标志"——工具投毒恰恰能绕过这种信任。
 自己实现才能从机制上锁死。
 
-**只读有三重保证**（全部在代码里，不靠调用方自觉）：
-  1. SQLite 用 `file:...?mode=ro` 打开 —— 主库的写入被**数据库本身**拒绝
-  2. 用 `set_authorizer` 在 **SQLite 引擎层**拒绝 INSERT/UPDATE/DELETE、DDL、
-     ATTACH/DETACH、事务语句 —— 这层是**机制**，不依赖对 SQL 文本的匹配
-  3. SQL 文本前缀白名单（只放行单条 SELECT/WITH）+ 结果行数上限
+**只读的保证有两层，都在机制里**（不靠对 SQL 文本的匹配）：
 
-⚠️ 第 3 条是**粗筛，不是保证**：SQLite 允许"CTE 后接写操作"，所以
-`WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x` 这类语句**能通过前缀检查**。
-真正兜住它的是第 2 条 authorizer 与第 1 条 `mode=ro`。
-（本文档原来把第 3 条写成"写操作一律拒绝"，属**过度声明**，已纠正。）
+  1. `set_authorizer` —— 在 **SQLite 引擎层**按操作类别拒绝：
+     INSERT/UPDATE/DELETE、全部 `CREATE_*`/`DROP_*`、ALTER/REINDEX/ANALYZE、
+     TRANSACTION/SAVEPOINT、**ATTACH/DETACH**（PRAGMA 另走只读白名单）。
+     它**不看 SQL 文本**，所以「CTE 后接写操作」、注释里藏语句、将来新增的
+     语法都绕不过它。
+  2. `file:...?mode=ro` —— 主库的写入被 SQLite 自身拒绝。
+     注意它**只管主库**：`ATTACH DATABASE` 挂进来的别库不受约束，
+     所以第 1 层里对 ATTACH 的拦截是必要的，不是冗余。
+
+另有两道**辅助**（不是安全边界）：
+  · SQL 文本前缀白名单 —— 只为给更清楚的报错文案。它拦得住 `DELETE ...`，
+    但**拦不住** `WITH x AS (...) INSERT ...`（SQLite 合法语法），后者由第 1 层兜住
+  · 结果行数上限 —— 防一条查询把内存打满
+
+⚠️ 别把文本白名单当安全边界。这条注释是纠正过来的 —— 原文曾把第 3 条写成
+"写操作一律拒绝"，属**过度声明**（实测那条 CTE 语句能通过前缀检查）。
+教训：**提示是建议，机制才是规则。**
 
 **启动方式**（见项目根的 `.mcp.json`）：
     uv run --no-project --with "mcp>=2,<3" python scripts/mcp_sqlite_readonly.py
@@ -113,14 +122,19 @@ _READ_ONLY_RE = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
 
 
 def _reject_reason(sql: str) -> str | None:
-    """放行返回 None，否则返回拒绝原因。"""
+    """放行返回 None，否则返回拒绝原因。
+
+    **这一层只是「更清楚的报错文案」，不是安全边界。** 真正的保证在
+    `_authorizer`（SQLite 引擎层）与 `sqlite3.execute` 自身。
+
+    曾经这里还查过「语句里有没有分号」，现已删除 —— 它是**纯冗余**：
+    `sqlite3.execute()` 本来就拒绝多语句（`You can only execute one
+    statement at a time`），而它带来的只有误伤（`LIKE '%;%'` 这种
+    字符串字面量里的分号会被错杀）。三层防护里唯一只减分不加分的。
+    """
     s = sql.strip().rstrip(";").strip()
     if not s:
         return "SQL 为空"
-    if ";" in s:
-        # 注：字符串字面量里的分号也会被拒（如 LIKE '%;%'）。
-        # 这是刻意的保守取舍 —— 开发期查库不值得为这点便利放开多语句。
-        return "只允许单条语句（检测到分号）"
     if not _READ_ONLY_RE.match(s):
         return "只允许 SELECT / WITH 开头的只读查询"
     return None
