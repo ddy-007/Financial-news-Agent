@@ -185,6 +185,11 @@ def _expert_func(name: str):
 def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict:
     """S1 敏感性/空转检测：喂极端合成输入，看是否朝对应方向响应。
 
+    三个场景各自过/不过（绝对阈值），**外加一条看多/看空的对称性检查**——
+    绝对阈值只能测"是否响应"，测不出"刻度是否偏向一边"（`EVAL_SPEC.md` §附注
+    本就承认了这一点）。看多与看空的合成场景是**对称构造的**（同为 ±2.50%、
+    ±180~200 亿北向、多头/空头排列），所以两边评分绝对值理应相当。
+
     不读写数据库——ctx 为手工构造。
     """
     from app.agent.llm import get_llm
@@ -213,11 +218,40 @@ def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict
 
     result = {"check": "sensitivity", "status": "ok", "expert": expert,
               "scenarios": scenarios, "passed": passed, "total": len(scenarios)}
+
+    # 对称性检查：看多与看空的评分绝对值应当相当。
+    #
+    # 为什么单独查这一条：绝对阈值（>0.3）若恰好落在模型输出的正中间，
+    # 检查会时过时不过；而「刻度偏向一边」这种问题，**只有对比两个方向才看得出**。
+    # 依据：LLM 的极性偏差是已知现象，且方向因模型而异（文献建议评估须分极性看），
+    # 所以需要一条显式的对称性约束兜住。
+    # 参考区间取 1.67 倍：真实市场的波动率不对称通常在 1.2~1.5 倍量级。
+    SYM_MIN, SYM_MAX = 0.6, 1.67
+    symmetry = None
+    bull, bear = scenarios[0]["score"], scenarios[1]["score"]
+    if bull is not None and bear is not None and bear != 0:
+        ratio = abs(bull) / abs(bear)
+        ok_sym = SYM_MIN <= ratio <= SYM_MAX
+        symmetry = {"ratio": round(ratio, 2), "in_range": ok_sym,
+                    "range": [SYM_MIN, SYM_MAX]}
+
     flags = []
-    if not scenarios[0]["pass"] or not scenarios[1]["pass"]:
+    # 「空转」的判据是**方向**，不是幅度：分值朝对的方向动了就算响应了数据。
+    # 幅度不够是**刻度问题**，由下面的对称性检查负责——
+    # 若沿用 pass（含 >0.3 的幅度阈值）来判空转，会在"看多 0.30"这种
+    # "确实响应了、只是偏低"的情况下误报"空转"，与对称性结论自相矛盾。
+    bull_s, bear_s = scenarios[0]["score"], scenarios[1]["score"]
+    if (bull_s is not None and bull_s <= 0) or (bear_s is not None and bear_s >= 0):
         flags.append("agent 可能未在响应数据（空转）")
     if not scenarios[2]["pass"]:
         flags.append("数据缺失时仍在编造结论")
+    if symmetry and not symmetry["in_range"]:
+        side = "看多" if symmetry["ratio"] < SYM_MIN else "看空"
+        flags.append(
+            f"打分不对称：|看多|/|看空|={symmetry['ratio']}，超出 "
+            f"{SYM_MIN}~{SYM_MAX}，{side}方向评分偏低（锚点刻度可能未对齐）"
+        )
+    result["symmetry"] = symmetry
     if flags:
         result["flag"] = "；".join(flags)
     return result
