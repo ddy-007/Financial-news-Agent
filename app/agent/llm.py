@@ -79,10 +79,12 @@ def resolve(part: str = DEFAULT_PART) -> tuple[str, str, str]:
     分组名写错会直接抛错，而不是静默回落到默认模型——避免"配了不生效"。
     """
     key_field, url_field, model_field, _ = _group_fields(part)
+    # 先 strip 再判空：填了空白字符串（" "）等于没填。不然空白会被当成有效值
+    # 传给服务商，报错时很难看出根因
     return (
-        getattr(settings, key_field) or settings.deepseek_api_key,
-        getattr(settings, url_field) or settings.deepseek_base_url,
-        getattr(settings, model_field) or settings.deepseek_model,
+        (getattr(settings, key_field) or "").strip() or settings.deepseek_api_key.strip(),
+        (getattr(settings, url_field) or "").strip() or settings.deepseek_base_url.strip(),
+        (getattr(settings, model_field) or "").strip() or settings.deepseek_model.strip(),
     )
 
 

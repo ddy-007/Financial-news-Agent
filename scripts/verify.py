@@ -13,10 +13,14 @@ def check_config():
     from app.agent.llm import _GROUPS, resolve
     from app.config import settings
 
-    # 只打印 model 与 base_url，不打印 api_key
+    # 只打印 model 与主机名：不打印 api_key，也不打印 base_url 全文
+    # —— 有些网关会把令牌内嵌在 URL 里，打全文就等于泄露
+    from urllib.parse import urlparse
+
     for part in _GROUPS:
         _, base_url, model = resolve(part)
-        print(f"  [{part}] {model} @ {base_url}")
+        host = urlparse(base_url).netloc or base_url
+        print(f"  [{part}] {model} @ {host}")
     print(f"  bge-m3={settings.bge_m3_model_path}")
     print(f"  reranker={settings.bge_reranker_path}")
     print(f"  db={settings.database_url}")
