@@ -208,7 +208,7 @@ def get_llm(temperature: float = 0.0, *, part: str):
     **未配备用模型时返回 `ChatOpenAI`**（类型与行为同改动前）；
     配了备用才返回 `RunnableWithFallbacks`，主模型在
     `_FALLBACK_EXCEPTIONS` 命中的错误上失败时，**按配置顺序逐个尝试备用**
-    （顺序见 `_build_fallbacks`），直到有一个成功。
+    （顺序由 `effective_fallback_models` 定义，剔除规则也只写在那里），直到有一个成功。
 
     ⚠️ **已知局限**：`with_fallbacks` 的异常捕获对**每一个** runnable 都生效，
     所以若**中间某个备用**抛的是**未列入 `_FALLBACK_EXCEPTIONS`** 的异常
