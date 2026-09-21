@@ -712,7 +712,12 @@ def check_fact_consistency(db: Session, limit: int = 90) -> dict:
 
 @_safe("risk_level_distribution")
 def check_risk_level_distribution(db: Session, limit: int = 180) -> dict:
-    """A3 风险等级分布：捕捉风险官"永远判高"的退化信号。"""
+    """A3 风险等级分布：捕捉风险官退化的**两个方向**。
+
+    只盯"永远判高"是不够的 —— 等级锚点放开后，退化可能摆向另一头：
+    "永远判低"同样让降档机制失去区分度，只是换成了「不起作用」而非「天天起作用」。
+    两个方向都会让 `risk_veto` 退化为常数，故一并监控。
+    """
     reports = _load_reports(db, limit)
     levels = []
     for r in reports:
@@ -726,13 +731,17 @@ def check_risk_level_distribution(db: Session, limit: int = 180) -> dict:
 
     dist = {k: levels.count(k) for k in ("高", "中", "低")}
     ratio = round(dist["高"] / len(levels), 3)
+    low_ratio = round(dist["低"] / len(levels), 3)
     result = {"check": "risk_level_distribution", "status": "ok",
-              "total": len(levels), "distribution": dist, "high_ratio": ratio}
+              "total": len(levels), "distribution": dist,
+              "high_ratio": ratio, "low_ratio": low_ratio}
     if len(levels) < 5:
         result["status"] = "insufficient_data"
         result["reason"] = f"仅 {len(levels)} 份样本（需 ≥5），当前分布供观察"
     elif ratio > 0.8:
         result["flag"] = "风险官可能过度谨慎，降档机制趋于常态化"
+    elif low_ratio > 0.8:
+        result["flag"] = "风险官可能退化为走过场，降档机制失去区分度"
     return result
 
 
@@ -883,7 +892,13 @@ def check_risk_officer_overcaution(db: Session, limit: int = 180) -> dict:
     ratio = round(ups / tot, 3)
     result = {"check": "risk_officer_overcaution", "status": "ok",
               "samples": tot, "up_ratio": ratio}
-    if ratio > 0.55:
+    # 最小样本保护：n=1 且次日恰好上涨 → ratio=1.0 > 0.55，会直接误报。
+    # 10 是**最低可判**线，不是统计显著线（n=10 照样说明不了什么，只是比 n=1 强）。
+    # 样本不够时仍返回比值供观察，只是不下结论 —— 与 A3 同一口径。
+    if tot < 10:
+        result["status"] = "insufficient_data"
+        result["reason"] = f"仅 {tot} 个样本（需 ≥10），当前比值供观察"
+    elif ratio > 0.55:
         result["flag"] = "可能系统性误伤看多判断"
     return result
 
