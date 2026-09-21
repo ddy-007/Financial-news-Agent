@@ -26,6 +26,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.services import evaluation as ev  # noqa: E402
 
+# **必须在任何 _patch 之前**抓住真实函数的引用。
+# 教训（2026-09-21，本脚本第一版就栽在这）：哨兵当初写的是 `ev._load_reports`，
+# 而 `_b2` 最后一次 `_patch` 已把该模块属性换成了假数据函数 —— 于是哨兵核对的是
+# **假数据自己**，8 个键永远齐全，missing 恒为空，只会 PASS/SKIP、永不 FAIL。
+# 一个"只会通过"的保护等于没有保护，而且比没有更糟：它给出的是**虚假的安心**。
+_REAL_LOAD_REPORTS = ev._load_reports
+_REAL_HAS_COLUMN = ev._has_column
+
 
 # ============ 假数据 ============
 # 与 _load_reports 返回的 dict 同构；结构由末尾的哨兵对真实函数核对
@@ -45,6 +53,7 @@ def _levels(*spec) -> list[dict]:
 
 # ============ 断言框架 ============
 _RESULTS: list[tuple[bool, str]] = []
+_SKIPS: list[str] = []          # 未验证项：既不算通过，也不算失败
 
 
 def check(label: str, got, want, contract: str) -> None:
@@ -58,8 +67,19 @@ def check(label: str, got, want, contract: str) -> None:
 
 
 def _patch(levels_or_reports, next_day=None):
-    """替换掉读库的两个私有函数，让判定逻辑可以脱离数据库单独跑。"""
+    """替换掉读库的私有函数，让判定逻辑可以脱离数据库单独跑。
+
+    `_next_day_stats` 只在显式传入时替换；B2 的非空样本用例**必须**传，
+    否则会打到真实实现上拿 `db=None` 崩掉。
+
+    ⚠️ 这里改的是**模块属性且不还原** —— 所以任何需要真实函数的地方
+    （见 `_sentinel`）都得用 import 时抓好的 `_REAL_*` 引用，不能用 `ev.*`。
+    """
     ev._load_reports = lambda db, limit=90: levels_or_reports
+    # `_has_column` 会 inspect 真实引擎（B2 用它判断 report 表有没有 risk_veto 列）。
+    # 不替换的话，缺库/缺列的环境下 B2 会走 skipped 而不是被断言的 insufficient_data，
+    # 整段无谓变红 —— 本脚本不该依赖数据库是否存在。
+    ev._has_column = lambda *a, **k: True
     if next_day is not None:
         ev._next_day_stats = next_day
 
@@ -90,7 +110,8 @@ def _a3():
     _patch(_levels(("高", 3), ("中", 4), ("低", 3)))
     r = ev.check_risk_level_distribution(None)
     check("混合分布 → 不报 flag", r.get("flag"), None,
-          "两方向都未超 0.8 时不得报警；且两分支互斥（高+低 ≤ 1）")
+          "两方向都未超 0.8 时不得报警（本断言不验证两分支互斥 —— 那只在"
+          "「同时超 0.8」这种数学上不可能的情形下才有意义）")
     check("混合分布 → 两个 ratio 并存",
           (r.get("high_ratio"), r.get("low_ratio")), (0.3, 0.3),
           "high_ratio 与 low_ratio 同时返回")
@@ -187,17 +208,29 @@ def _sentinel():
     没有这一步，本脚本会**静默失效**：若 `_load_reports` 改了返回结构，
     monkeypatch 依然"成功"，上面所有断言照过 —— 但已经跑在一条不存在的契约上。
 
-    需要能打开数据库；打不开就 SKIP（**不判失败**：这是额外的保险，不是主检查）。
+    ⚠️ **必须用 `_REAL_LOAD_REPORTS`**（import 时抓的引用），不能用 `ev._load_reports`
+    —— 后者此刻已被 `_patch` 换成假数据函数，核对等于自己核对自己。
+    本脚本第一版就是这么错的，见文件头注释。
+
+    需要能打开数据库；打不开就记 SKIP（**不判失败**：这是额外的保险，不是主检查，
+    但不计进"通过"的分母 —— 否则会在无库环境下报一个虚高的全绿）。
     """
     print("\n结构哨兵 _load_reports")
     required = {"date", "sentiment", "confidence", "score", "divergence",
                 "risk_veto", "expert_opinions", "content"}
+    # 先自证：真实引用确实不是当前被 patch 的那个，否则哨兵又在自欺
+    if _REAL_LOAD_REPORTS is ev._load_reports:
+        _RESULTS.append((False, "结构哨兵（未生效）"))
+        print("  [FAIL] 哨兵拿到的仍是已被替换的函数，核对无意义")
+        return
+
     db = None
     try:
         from app.db import SessionLocal
         db = SessionLocal()
-        rows = ev._load_reports(db, 1)
+        rows = _REAL_LOAD_REPORTS(db, 1)
     except Exception as e:  # noqa: BLE001
+        _SKIPS.append(f"结构哨兵（无法核对真实结构：{type(e).__name__}: {e}）")
         print(f"  [SKIP] 无法核对真实结构：{type(e).__name__}: {e}")
         return
     finally:
@@ -205,6 +238,7 @@ def _sentinel():
             db.close()
 
     if not rows:
+        _SKIPS.append("结构哨兵（库中没有日报）")
         print("  [SKIP] 库里没有日报，无法核对结构")
         return
     missing = required - set(rows[0])
@@ -221,7 +255,12 @@ def main() -> int:
     _b2()
     _sentinel()
     failed = [name for ok, name in _RESULTS if not ok]
-    print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
+    # 跳过项**不计入分母**：把它混进「N/N 通过」会在无库环境下虚报全绿
+    print(f"\n{len(_RESULTS) - len(failed)} 通过 / {len(failed)} 失败 / {len(_SKIPS)} 跳过")
+    if _SKIPS:
+        print("跳过项（未验证，不算通过）：")
+        for s in _SKIPS:
+            print(f"  - {s}")
     if failed:
         print("失败项：")
         for n in failed:
