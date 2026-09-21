@@ -6,6 +6,7 @@
 """
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_openai import ChatOpenAI
+from loguru import logger
 from openai import (
     APIConnectionError,
     AuthenticationError,
@@ -49,19 +50,32 @@ _USED_MODEL: dict[str, str] = {}
 
 
 class _ModelRecorder(BaseCallbackHandler):
-    """记录该分组实际调用到的模型名。
+    """记录该分组实际调用到的模型名，并在**启用备用时打日志**。
 
     只在启用备用时挂上——没挂即说明主模型必被使用，
     `get_llm_model_name` 会照常回落到主模型名。
-    """
 
-    def __init__(self, part: str) -> None:
+    **为什么要打日志**：LangChain 的 `with_fallbacks` **默认静默切换**。
+    更麻烦的是全部失败时它抛的是 `first_error`（主模型的错），
+    所以日志里只会看到主模型的报错 —— **看起来像"备用压根没生效"**。
+    2026-09-21 就因此误判过一次：实际是切了，但备用自己模型名写错（404）。
+    """
+    def __init__(self, part: str, primary_model: str) -> None:
         self.part = part
+        self.primary_model = primary_model
 
     def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
         name = (kwargs.get("metadata") or {}).get("ls_model_name")
-        if name:
-            _USED_MODEL[self.part] = name
+        if not name:
+            return
+        _USED_MODEL[self.part] = name
+        # 收到「非主模型」的 start 事件 = 主模型已经失败并切走了。
+        # 注意本回调在**发起时**触发（不保证成功），所以措辞是"尝试切到"。
+        if name != self.primary_model:
+            logger.warning(
+                f"[{self.part}] 主模型 {self.primary_model} 未成功，"
+                f"尝试切到备用 {name}"
+            )
 
 
 def _group_fields(part: str) -> tuple[str, str, str, str]:
@@ -226,7 +240,7 @@ def get_llm(temperature: float = 0.0, *, part: str):
         return primary
     return primary.with_fallbacks(
         fallbacks, exceptions_to_handle=_FALLBACK_EXCEPTIONS
-    ).with_config(callbacks=[_ModelRecorder(part)])
+    ).with_config(callbacks=[_ModelRecorder(part, model)])
 
 
 def get_llm_model_name(*, part: str) -> str:
