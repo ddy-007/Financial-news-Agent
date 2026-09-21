@@ -234,6 +234,14 @@ def _b2():
 
 
 # ============ 结构哨兵 ============
+def _sqlite_path(url: str) -> Path | None:
+    """从 SQLAlchemy 的 sqlite URL 取出本地文件路径；不是 sqlite 就返回 None。"""
+    prefix = "sqlite:///"
+    if not url.startswith(prefix):
+        return None
+    return Path(url[len(prefix):]).resolve()
+
+
 def _sentinel():
     """确认真实 `_load_reports` 的返回结构与假数据同构。
 
@@ -254,6 +262,18 @@ def _sentinel():
     if _REAL_LOAD_REPORTS is ev._load_reports:
         _RESULTS.append((False, "结构哨兵（未生效）"))
         print("  [FAIL] 哨兵拿到的仍是已被替换的函数，核对无意义")
+        return
+
+    # 先判库文件在不在 —— **必须赶在 import app.db 之前**。
+    # 原因：`app/db.py` 一被 import 就会 `mkdir` 库文件的父目录，而 SQLite 首次连接
+    # 会直接把文件建出来。于是「只是想核对一下结构」会**留下垃圾** ——
+    # 库不存在时凭空多出一个空库和一个空目录。2026-09-21 实测确认过。
+    # 本脚本不该有副作用，所以库不在就 SKIP，连碰都不碰。
+    from app.config import settings
+    db_path = _sqlite_path(settings.database_url)
+    if db_path is not None and not db_path.exists():
+        _SKIPS.append(f"结构哨兵（库文件不存在：{db_path.name}，未创建）")
+        print(f"  [SKIP] 库文件不存在（{db_path.name}），不创建、直接跳过")
         return
 
     db = None
