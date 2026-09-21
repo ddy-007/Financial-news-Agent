@@ -116,6 +116,20 @@ def _a3():
           (r.get("high_ratio"), r.get("low_ratio")), (0.3, 0.3),
           "high_ratio 与 low_ratio 同时返回")
 
+    # 边界：high_ratio 恰好 0.8。代码用**严格** `>`，故 0.8 不该报警。
+    # 不锁这条的话，有人把 `>` 改成 `>=` 不会有任何断言拦得住。
+    _patch(_levels(("高", 8), ("低", 2)))
+    r = ev.check_risk_level_distribution(None)
+    check("high_ratio 恰为 0.8 → 不报 flag", r.get("flag"), None,
+          "阈值是严格大于：0.8 本身不触发（改成 >= 会被这条抓住）")
+
+    # 边界：样本恰好 5。代码用 `< 5` 判不足，故 5 份应当**开始下结论**。
+    _patch(_levels(("高", 5)))
+    r = ev.check_risk_level_distribution(None)
+    check("样本恰为 5 → ok + flag", (r.get("status"), r.get("flag")),
+          ("ok", "风险官可能过度谨慎，降档机制趋于常态化"),
+          "样本阈值是 <5 判不足；恰好 5 份即达线（改成 <=5 会被这条抓住）")
+
     _patch(_levels(("低", 3)))
     r = ev.check_risk_level_distribution(None)
     check("样本 <5 → insufficient_data", r.get("status"), "insufficient_data",
@@ -190,15 +204,33 @@ def _b2():
     check("n=2 全部上涨 → 仍不下结论", r.get("status"), "insufficient_data",
           "最小样本保护对任意 n<10 都生效，不只是 n=1")
 
-    # 候选池口径本身：有 veto 但 sentiment 不是「偏多」→ 一条都不该进池。
-    # 注意这条**不区分新旧行为**（两边都返回 insufficient_data），
-    # 它锁的是「池子怎么定义」，不是这轮改的东西。
-    _patch([_report("高", veto=True, sentiment="中性") for _ in range(12)],
+    # 边界：up_ratio 恰好 0.55。代码用严格 `>`，故 0.55 不该报警。
+    # 11/20 = 0.55 恰好落在阈值上。
+    _b2_counter = {"i": 0}
+
+    def _eleven_of_20(db, d):
+        _b2_counter["i"] += 1
+        return {"change_pct": 1.0 if _b2_counter["i"] <= 11 else -1.0}
+
+    _patch([_report("高", veto=True) for _ in range(20)], next_day=_eleven_of_20)
+    r = ev.check_risk_officer_overcaution(None)
+    check("up_ratio 恰为 0.55 → 不报 flag", r.get("flag"), None,
+          "阈值是严格大于：0.55 本身不触发（改成 >= 会被这条抓住）")
+
+    # 候选池口径：**两个方向都要锁**。
+    # 只证「中性被排除」是不够的 —— 若过滤条件误写成 `sentiment != "偏空"`，
+    # 中性照样被排除，那条断言会照过。所以这里混合喂数据，断言**池子大小**
+    # 恰好等于偏多的条数（12），多一条或少一条都算契约破坏。
+    _patch([_report("高", veto=True, sentiment="偏多") for _ in range(12)]
+           + [_report("高", veto=True, sentiment="中性") for _ in range(12)],
            next_day=lambda db, d: {"change_pct": 1.5})
     r = ev.check_risk_officer_overcaution(None)
-    check("sentiment≠偏多 → 不进候选池", "无「risk_veto=True" in r.get("reason", ""),
-          True,
-          "候选池口径：risk_veto=True **且** sentiment=偏多，两者缺一不可")
+    check("候选池只收 sentiment=偏多（12 偏多 + 12 中性 → 池子 12）",
+          r.get("samples"), 12,
+          "候选池口径：risk_veto=True **且** sentiment=偏多。"
+          "断言池子大小而非「中性被排除」—— 后者拦不住误写成 !=偏空 的情形")
+
+    # （「池子为空 → 带 reason 的 insufficient_data」已由本节第一条断言覆盖，不重复。）
 
 
 # ============ 结构哨兵 ============
