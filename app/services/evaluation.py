@@ -182,7 +182,8 @@ def _expert_func(name: str):
 
 
 @_safe("sensitivity")
-def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict:
+def check_sensitivity(db: Session | None = None, expert: str = "行业",
+                      repeats: int = 1) -> dict:
     """S1 敏感性/空转检测：喂极端合成输入，看是否朝对应方向响应。
 
     三个场景各自过/不过（绝对阈值），**外加一条看多/看空的对称性检查**——
@@ -190,10 +191,18 @@ def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict
     本就承认了这一点）。看多与看空的合成场景是**对称构造的**（同为 ±2.50%、
     ±180~200 亿北向、多头/空头排列），所以两边评分绝对值理应相当。
 
+    `repeats > 1` 时每个场景跑 N 次、**判定用均值**，逐次的原始值随 `scores` 一并返回。
+
+    **为什么必须有这个参数**（2026-09-21 实测）：`temperature=0.2` 下单次测量
+    的抖动足以跨过阈值 —— 同一位分析师、同一个场景，重复三次的 |看多|/|看空|
+    分别在 **0.47~0.62** 之间摆动。拿单次值去断言"锚点刻度未对齐"会频繁误报，
+    而这条误报曾把一个不存在的问题（A9「看多偏低」）拖了整整两天。
+
     不读写数据库——ctx 为手工构造。
     """
     from app.agent.llm import get_llm
 
+    n = max(1, int(repeats))
     fn = _expert_func(expert)
     llm = get_llm(temperature=0.2, part="expert")
     scenarios, passed = [], 0
@@ -202,21 +211,29 @@ def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict
         ("bearish", _bearish_ctx(), lambda s: s < -0.3),
         ("empty", _empty_ctx(), lambda s: abs(s) <= 0.2),
     ]:
-        try:
-            op = fn(llm, ctx)
-            good = bool(ok(op.score))
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[S1] 场景 {name} 调用失败: {e}")
-            op, good = None, False
+        scores, stance = [], None
+        for _ in range(n):
+            try:
+                op = fn(llm, ctx)
+                scores.append(op.score)
+                stance = op.stance          # 保留最后一次的立场（兼容原输出字段）
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[S1] 场景 {name} 调用失败: {e}")
+        if scores:
+            mean, good = sum(scores) / len(scores), bool(ok(sum(scores) / len(scores)))
+        else:
+            mean, good = None, False
         scenarios.append({
             "name": name,
-            "score": round(op.score, 3) if op else None,
-            "stance": op.stance if op else None,
+            "score": round(mean, 3) if mean is not None else None,
+            "scores": [round(s, 3) for s in scores],   # 逐次值：让抖动可见
+            "stance": stance,
             "pass": good,
         })
         passed += int(good)
 
     result = {"check": "sensitivity", "status": "ok", "expert": expert,
+              "repeats": n,
               "scenarios": scenarios, "passed": passed, "total": len(scenarios)}
 
     # 对称性检查：看多与看空的评分绝对值应当相当。
@@ -233,7 +250,7 @@ def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict
         ratio = abs(bull) / abs(bear)
         ok_sym = SYM_MIN <= ratio <= SYM_MAX
         symmetry = {"ratio": round(ratio, 2), "in_range": ok_sym,
-                    "range": [SYM_MIN, SYM_MAX]}
+                    "range": [SYM_MIN, SYM_MAX], "repeats": n}
 
     flags = []
     # 「空转」的判据是**方向**，不是幅度：分值朝对的方向动了就算响应了数据。
@@ -247,9 +264,13 @@ def check_sensitivity(db: Session | None = None, expert: str = "行业") -> dict
         flags.append("数据缺失时仍在编造结论")
     if symmetry and not symmetry["in_range"]:
         side = "看多" if symmetry["ratio"] < SYM_MIN else "看空"
+        # repeats=1 时不能说死：实测同一场景重复三次的 ratio 可在 0.47~0.62 间摆动，
+        # 单次出界很可能是抖动。如实标出来源，别让读者把它当成定论。
+        caveat = ("（⚠️ 单次测量，抖动足以跨过阈值 —— 建议 repeats≥3 复核后再下结论）"
+                  if n == 1 else "")
         flags.append(
-            f"打分不对称：|看多|/|看空|={symmetry['ratio']}，超出 "
-            f"{SYM_MIN}~{SYM_MAX}，{side}方向评分偏低（锚点刻度可能未对齐）"
+            f"打分不对称：|看多|/|看空|={symmetry['ratio']}（{n} 次均值），超出 "
+            f"{SYM_MIN}~{SYM_MAX}，{side}方向评分偏低（锚点刻度可能未对齐）{caveat}"
         )
     result["symmetry"] = symmetry
     if flags:
@@ -945,7 +966,10 @@ def run_all_checks(db: Session, limit: int = 90,
         check_attribution_consistency(db, limit),
     ]
     if include_diagnostic:
-        checks.insert(0, check_sensitivity(db))
+        # S1 跑 3 次取均值：单次测量在 temperature=0.2 下的抖动会跨过阈值，
+        # 导致「打分不对称」这条频繁误报（2026-09-21 实测：同一场景 ratio 在
+        # 0.47~0.62 间摆动）。代价是 3×3=9 次调用，但只在手动开诊断时才发生。
+        checks.insert(0, check_sensitivity(db, repeats=3))
         checks.insert(1, check_reproducibility(db))
 
     return {

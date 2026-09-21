@@ -121,9 +121,19 @@
 
 # 阶段 S —— 瞬时检验（最高优先级，现在就能做）
 
-## S1 `check_sensitivity(db=None, expert="行业")` → dict ⭐**最有价值**
+## S1 `check_sensitivity(db=None, expert="行业", repeats=1)` → dict ⭐**最有价值**
 
 **目的**：敏感性 / 空转检测——Agent 是真的在"读数据"，还是在输出固定模板？
+
+**`repeats`（2026-09-21 新增）**：每个场景跑 N 次，**判定用均值**，逐次值随 `scores` 返回。
+`repeats=1` 时行为与改动前完全一致（除多出的 `scores` 字段）。
+
+> **为什么必须有它**：`temperature=0.2` 下**单次测量的抖动足以跨过阈值** ——
+> 同一位分析师、同一个场景，重复三次的 `|看多|/|看空|` 分别在 **0.47~0.62** 之间摆动。
+> 拿单次值断言"锚点刻度未对齐"会频繁误报，而这条误报曾把一个**不存在的问题**
+> （「看多偏低」，即 `未完成事项.md` 的 A9）拖了整整两天。
+> 现在 `?diagnostic=true` 走的是 `repeats=3`；`repeats=1` 时若仍出界，
+> flag 文案里会**自带**一句「单次测量，抖动足以跨过阈值」的提示。
 
 **方法**：构造 3 组**极端合成输入**，直接调用专家函数，看是否朝对应方向响应。
 **不读写数据库**——ctx 为手工构造的 dict。
@@ -155,14 +165,16 @@
 
 **返回**：
 ```json
-{"check":"sensitivity","status":"ok","expert":"行业",
- "scenarios":[{"name":"bullish","score":0.30,"stance":"中性","pass":false},
-              {"name":"bearish","score":-0.55,"stance":"看空","pass":true},
-              {"name":"empty","score":0.0,"stance":"中性","pass":true}],
+{"check":"sensitivity","status":"ok","expert":"行业","repeats":3,
+ "scenarios":[{"name":"bullish","score":0.30,"scores":[0.30,0.30,0.30],"stance":"中性","pass":false},
+              {"name":"bearish","score":-0.45,"scores":[-0.45,-0.45,-0.45],"stance":"看空","pass":true},
+              {"name":"empty","score":0.0,"scores":[0.0,0.0,0.0],"stance":"中性","pass":true}],
  "passed":2,"total":3,
- "symmetry":{"ratio":0.55,"in_range":false,"range":[0.6,1.67]},
- "flag":"打分不对称：|看多|/|看空|=0.55，超出 0.6~1.67，看多方向评分偏低（锚点刻度可能未对齐）"}
+ "symmetry":{"ratio":0.67,"in_range":true,"range":[0.6,1.67],"repeats":3}}
 ```
+
+> `score` 是**均值**；`scores` 是逐次原始值 —— 保留它是为了**让抖动可见**，
+> 否则读者无从判断均值可不可信。`stance` 保留最后一次的取值（兼容原字段）。
 
 **关键价值**：**不需要任何历史数据**，能立刻暴露"agent 是死的"这种致命问题。
 
