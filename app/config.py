@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     llm_fallback_base_url: str = ""
     llm_fallback_model: str = ""
 
+    # 追加备用模型（**逗号分隔**，与上面三项**共用** key / base_url）。
+    # 按顺序排在 `llm_fallback_model` **之后**，主模型和前面的备用都失败时才轮到它。
+    # 例：LLM_FALLBACK_MODELS=qwen3.5-plus,qwen-max
+    #
+    # 为什么用逗号而不是斜杠：主流平台的模型名**本身带斜杠**
+    # （OpenRouter 是 `qwen/qwen3.6-plus`、硅基流动是 `Qwen/Qwen3-...`），
+    # 用斜杠当分隔符将来必然歧义到没法解析。
+    llm_fallback_models: str = ""
+
     # ---- 本地嵌入 / 重排模型 ----
     bge_m3_model_path: str = "BAAI/bge-m3"
     bge_reranker_path: str = "BAAI/bge-reranker-v2-m3"

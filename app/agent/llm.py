@@ -112,34 +112,71 @@ def _make_client(api_key: str, base_url: str, model: str,
     )
 
 
-def _build_fallback(temperature: float, part: str) -> ChatOpenAI | None:
-    """构建备用客户端。三项未配全 → None（不启用备用）。"""
-    if not (settings.llm_fallback_api_key
-            and settings.llm_fallback_base_url
-            and settings.llm_fallback_model):
-        return None
-    return _make_client(
-        settings.llm_fallback_api_key,
-        settings.llm_fallback_base_url,
-        settings.llm_fallback_model,
-        temperature,
-        part,
-    )
+def fallback_models() -> list[str]:
+    """按顺序返回**去重后**的备用模型名。
+
+    顺序 = `LLM_FALLBACK_MODEL` 在前，`LLM_FALLBACK_MODELS` 里逗号分隔的依次跟上 ——
+    也就是说前一个失败才会轮到后一个。
+
+    去重是必要的：重复的模型名会让同一个请求白打一遍（换谁都失败）。
+    空串与纯空白项一律丢弃。
+    """
+    raw = [settings.llm_fallback_model]
+    raw += settings.llm_fallback_models.split(",")
+    out: list[str] = []
+    for m in raw:
+        m = (m or "").strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _build_fallbacks(temperature: float, part: str,
+                     api_key: str, base_url: str, model: str) -> list[ChatOpenAI]:
+    """构建备用客户端列表。
+
+    三项（key / base_url / 至少一个模型名）未配齐 → 空列表（不启用备用）。
+
+    与**主模型三项全同**的备用会被剔除 —— 换谁都一样，多打一次没有意义。
+    全部被剔除时返回空列表，`get_llm` 据此退回"不启用"，行为与改动前一致。
+    """
+    if not (settings.llm_fallback_api_key and settings.llm_fallback_base_url):
+        return []
+    out = []
+    for name in fallback_models():
+        if (settings.llm_fallback_api_key == api_key
+                and settings.llm_fallback_base_url == base_url
+                and name == model):
+            continue
+        out.append(_make_client(
+            settings.llm_fallback_api_key,
+            settings.llm_fallback_base_url,
+            name,
+            temperature,
+            part,
+        ))
+    return out
 
 
 def fallback_enabled() -> bool:
-    """备用模型是否已配齐。"""
+    """备用模型是否已配齐（key / base_url / 至少一个模型名）。"""
     return bool(settings.llm_fallback_api_key
                 and settings.llm_fallback_base_url
-                and settings.llm_fallback_model)
+                and fallback_models())
 
 
 def llm_retry_times() -> int:
     """LLM 调用点该用几次重试。
 
-    启用备用时降为 1（不重试）：外层 `app.retry` 的重试与 fallback 切换会叠加，
-    主备都失败时一次调用会打 **6 次**请求（3 轮 × 主备各 1 次）。
-    降为 1 后总请求数回到 2 次（主 1 + 备 1），与未配备用时的 3 次相当。
+    启用备用时降为 1（不重试）：外层 `app.retry` 的重试与 fallback 切换会叠加。
+    设 N = 备用模型个数：
+
+        降为 1 时，一次调用最坏打 **N+1** 次请求（主 1 + 备用 N，各试一次）
+        不降（3）时，最坏会变成 3×(N+1) 次 —— 所以才要降
+
+    未配备用时是 3 次，配备用且 N=1 时是 2 次，都还在同一量级。
+    **N 不要配太多**：每个失败的备用都要先等满 `llm_timeout`（默认 120 秒），
+    日报有约 20 次 LLM 调用，N 大了最坏耗时会成倍放大。
     """
     return 1 if fallback_enabled() else 3
 
@@ -159,16 +196,13 @@ def get_llm(temperature: float = 0.0, *, part: str):
     api_key, base_url, model = resolve(part)
     primary = _make_client(api_key, base_url, model, temperature, part)
 
-    fallback = _build_fallback(temperature, part)
-    if fallback is None:
-        return primary
-    # 备用与主模型三项全同 → 没有意义，不必多打一次
-    if (settings.llm_fallback_api_key == api_key
-            and settings.llm_fallback_base_url == base_url
-            and settings.llm_fallback_model == model):
+    # 备用的顺序即尝试顺序（见 _build_fallbacks）；
+    # 与主模型三项全同的备用已在里面剔除，全被剔除就退回"不启用"
+    fallbacks = _build_fallbacks(temperature, part, api_key, base_url, model)
+    if not fallbacks:
         return primary
     return primary.with_fallbacks(
-        [fallback], exceptions_to_handle=_FALLBACK_EXCEPTIONS
+        fallbacks, exceptions_to_handle=_FALLBACK_EXCEPTIONS
     ).with_config(callbacks=[_ModelRecorder(part)])
 
 
