@@ -191,7 +191,14 @@ def get_llm(temperature: float = 0.0, *, part: str):
 
     **未配备用模型时返回 `ChatOpenAI`**（类型与行为同改动前）；
     配了备用才返回 `RunnableWithFallbacks`，主模型在
-    `_FALLBACK_EXCEPTIONS` 命中的错误上失败时自动切备用再试一次。
+    `_FALLBACK_EXCEPTIONS` 命中的错误上失败时，**按配置顺序逐个尝试备用**
+    （顺序见 `_build_fallbacks`），直到有一个成功。
+
+    ⚠️ **已知局限**：`with_fallbacks` 的异常捕获对**每一个** runnable 都生效，
+    所以若**中间某个备用**抛的是**未列入 `_FALLBACK_EXCEPTIONS`** 的异常
+    （主要是 400），整条链会**当场中断**，排在它后面的备用**拿不到机会**。
+    2026-09-21 实测确认。要让链路更耐断，得把 400 也纳入切换集（但那会让主模型的
+    400 也去白打每一个备用），或自行实现逐级尝试。
     """
     api_key, base_url, model = resolve(part)
     primary = _make_client(api_key, base_url, model, temperature, part)
