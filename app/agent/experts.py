@@ -311,8 +311,9 @@ def _invoke_expert(llm, name: str, prompt: str) -> ExpertOpinion:
             raise ValueError(f"{name}分析师输出无法解析为 JSON")
         return _to_opinion(name, data)
 
+    # 这四位分析师由调用方用 part="expert" 的客户端驱动（见 graph.py 的 aggregate）
     op = call_with_retry(_attempt, retry_label=f"{name}分析师",
-                         retry_times=llm_retry_times())
+                         retry_times=llm_retry_times(part="expert"))
     logger.info(f"[{name}] {op.stance} score={op.score:.2f} conf={op.confidence}")
     return op
 
@@ -373,7 +374,7 @@ def run_risk_officer(llm, ctx: dict) -> RiskOpinion:
         return _to_risk_opinion(data)
 
     risk = call_with_retry(_attempt, retry_label="风险官",
-                           retry_times=llm_retry_times())
+                           retry_times=llm_retry_times(part="expert"))
     logger.info(f"[风险官] 风险等级={risk.risk_level} 风险点={len(risk.risks)}")
     return risk
 
@@ -488,7 +489,7 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
     data = call_with_retry(
         lambda: _require_dict(llm.invoke(prompt).content, "首席策略师"),
         retry_label="首席策略师",
-        retry_times=llm_retry_times(),
+        retry_times=llm_retry_times(part="expert"),
     )
 
     # 强制并入风险官的全部风险点（不得被 LLM 过滤）

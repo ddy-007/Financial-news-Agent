@@ -131,54 +131,70 @@ def fallback_models() -> list[str]:
     return out
 
 
-def _build_fallbacks(temperature: float, part: str,
-                     api_key: str, base_url: str, model: str) -> list[ChatOpenAI]:
-    """构建备用客户端列表。
+def effective_fallback_models(part: str) -> list[str]:
+    """`part` 这个分组**实际**会挂上的备用模型名。
 
-    三项（key / base_url / 至少一个模型名）未配齐 → 空列表（不启用备用）。
+    与 `fallback_models()` 的区别：这里**剔除了与主模型三项（key/base_url/model）全同的项**
+    —— 换谁都一样，多打一次没有意义。
 
-    与**主模型三项全同**的备用会被剔除 —— 换谁都一样，多打一次没有意义。
-    全部被剔除时返回空列表，`get_llm` 据此退回"不启用"，行为与改动前一致。
+    **这个区别一定要保留**：2026-09-21 就出现过「主模型与备用同名、key/url 也相同」
+    的配置 —— 配置里看着有备用，实际一个都挂不上。谁按"配置非空"去判断
+    「有没有备用」，谁就会在那种配置下做出错误决定（见 `llm_retry_times`）。
     """
     if not (settings.llm_fallback_api_key and settings.llm_fallback_base_url):
         return []
-    out = []
-    for name in fallback_models():
-        if (settings.llm_fallback_api_key == api_key
+    key, base_url, model = resolve(part)
+    return [
+        name for name in fallback_models()
+        if not (settings.llm_fallback_api_key == key
                 and settings.llm_fallback_base_url == base_url
-                and name == model):
-            continue
-        out.append(_make_client(
-            settings.llm_fallback_api_key,
-            settings.llm_fallback_base_url,
-            name,
-            temperature,
-            part,
-        ))
-    return out
+                and name == model)
+    ]
 
 
-def fallback_enabled() -> bool:
-    """备用模型是否已配齐（key / base_url / 至少一个模型名）。"""
-    return bool(settings.llm_fallback_api_key
-                and settings.llm_fallback_base_url
-                and fallback_models())
+def _build_fallbacks(temperature: float, part: str) -> list[ChatOpenAI]:
+    """构建该分组的备用客户端列表。
+
+    **名字来自 `effective_fallback_models(part)`，剔除规则只写那一处** ——
+    绝不能在这里再复制一遍。一旦两处规则漂移，"判断有没有备用"与
+    "实际挂几个"就会重新不一致，而本次改动的全部意义就是消灭这个不一致。
+    """
+    return [
+        _make_client(settings.llm_fallback_api_key,
+                     settings.llm_fallback_base_url,
+                     name, temperature, part)
+        for name in effective_fallback_models(part)
+    ]
 
 
-def llm_retry_times() -> int:
-    """LLM 调用点该用几次重试。
+def fallback_enabled(part: str) -> bool:
+    """`part` 这个分组**是否真的**挂上了备用。
 
-    启用备用时降为 1（不重试）：外层 `app.retry` 的重试与 fallback 切换会叠加。
-    设 N = 备用模型个数：
+    判据是「剔除之后还剩不剩」，不是「配置里填没填」。
+    `part` 必填（同 `get_llm` 的理由）：备用是逐分组挂的，问"全局有没有备用"没有意义。
+    """
+    return bool(effective_fallback_models(part))
+
+
+def llm_retry_times(*, part: str) -> int:
+    """`part` 这个分组的 LLM 调用点该用几次重试。
+
+    **按分组算，不按全局开关算。** 备用是逐分组挂的，"配了备用"不等于
+    "这个分组真的挂上了"（与主模型三项全同的会被剔除）。
+
+    若用全局开关，那种分组会落入最差组合：**实际没有备用，重试却被降成 1 次**
+    —— 既没有兜底又少了重试，比不配备用还差。2026-09-21 在真实配置里发生过。
+
+    降为 1 的理由：外层 `app.retry` 的重试与 fallback 切换会叠加。设 N = 该分组
+    实际挂上的备用个数：
 
         降为 1 时，一次调用最坏打 **N+1** 次请求（主 1 + 备用 N，各试一次）
         不降（3）时，最坏会变成 3×(N+1) 次 —— 所以才要降
 
-    未配备用时是 3 次，配备用且 N=1 时是 2 次，都还在同一量级。
     **N 不要配太多**：每个失败的备用都要先等满 `llm_timeout`（默认 120 秒），
     日报有约 20 次 LLM 调用，N 大了最坏耗时会成倍放大。
     """
-    return 1 if fallback_enabled() else 3
+    return 1 if fallback_enabled(part) else 3
 
 
 def get_llm(temperature: float = 0.0, *, part: str):
@@ -203,9 +219,9 @@ def get_llm(temperature: float = 0.0, *, part: str):
     api_key, base_url, model = resolve(part)
     primary = _make_client(api_key, base_url, model, temperature, part)
 
-    # 备用的顺序即尝试顺序（见 _build_fallbacks）；
+    # 备用的顺序即尝试顺序（见 effective_fallback_models）；
     # 与主模型三项全同的备用已在里面剔除，全被剔除就退回"不启用"
-    fallbacks = _build_fallbacks(temperature, part, api_key, base_url, model)
+    fallbacks = _build_fallbacks(temperature, part)
     if not fallbacks:
         return primary
     return primary.with_fallbacks(

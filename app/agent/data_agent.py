@@ -102,7 +102,7 @@ def classify_news(items: list[NewsItem]) -> list[dict]:
 
         try:
             data = call_with_retry(_classify, prompt, retry_label="新闻分类",
-                                   retry_times=llm_retry_times())
+                                   retry_times=llm_retry_times(part="news"))
             for entry in data:
                 if not isinstance(entry, dict):
                     continue

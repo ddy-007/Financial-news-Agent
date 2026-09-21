@@ -585,7 +585,7 @@ def score_news_sentiment(db: Session, limit: int = 400) -> int:
             data = call_with_retry(
                 _score, SENTIMENT_BATCH_PROMPT.format(news_list=news_list),
                 retry_label="情绪打分",
-                retry_times=llm_retry_times(),
+                retry_times=llm_retry_times(part="news"),
             )
             for entry in data:
                 if not isinstance(entry, dict):
