@@ -295,11 +295,15 @@ RISK_PROMPT = """你是一位专职风险官。{intensity_instruction}
 
 
 # ================= 专家调用 =================
-def _invoke_expert(llm, name: str, prompt: str) -> ExpertOpinion:
+def _invoke_expert(llm, name: str, prompt: str, *, part: str) -> ExpertOpinion:
     """调用一位分析师，返回结构化观点。
 
     **重试覆盖网络与解析两步**——LLM 输出不稳时重试往往能拿到合规结果，
     这样「专家缺席」这个降级点基本不会触发。
+
+    `part` 必填：重试次数**按分组**算（备用是逐分组挂的），而 `llm` 是注入的，
+    两者必须来自同一个来源。写死在函数里的话，将来有人传入别组的客户端时
+    **不会报错**，只会静默用错那个分组的重试次数。
     """
     from app.agent.llm import llm_retry_times
     from app.retry import call_with_retry
@@ -311,52 +315,51 @@ def _invoke_expert(llm, name: str, prompt: str) -> ExpertOpinion:
             raise ValueError(f"{name}分析师输出无法解析为 JSON")
         return _to_opinion(name, data)
 
-    # 这四位分析师由调用方用 part="expert" 的客户端驱动（见 graph.py 的 aggregate）
     op = call_with_retry(_attempt, retry_label=f"{name}分析师",
-                         retry_times=llm_retry_times(part="expert"))
+                         retry_times=llm_retry_times(part=part))
     logger.info(f"[{name}] {op.stance} score={op.score:.2f} conf={op.confidence}")
     return op
 
 
-def run_macro_expert(llm, ctx: dict) -> ExpertOpinion:
+def run_macro_expert(llm, ctx: dict, *, part: str) -> ExpertOpinion:
     return _invoke_expert(llm, "宏观", MACRO_PROMPT.format(
         macro_news=ctx.get("macro_news", "无"),
         comprehensive_news=ctx.get("comprehensive_news", "无"),
         market_snapshot=ctx.get("market_snapshot", "无"),
         us_market=ctx.get("us_market", "无"),
         common_rules=_COMMON_RULES, json_spec=_JSON_SPEC,
-    ))
+    ), part=part)
 
 
-def run_industry_expert(llm, ctx: dict) -> ExpertOpinion:
+def run_industry_expert(llm, ctx: dict, *, part: str) -> ExpertOpinion:
     return _invoke_expert(llm, "行业", INDUSTRY_PROMPT.format(
         industry_news=ctx.get("industry_news", "无"),
         sector_summary=ctx.get("sector_summary", "无"),
         comprehensive_news=ctx.get("comprehensive_news", "无"),
         market_snapshot=ctx.get("market_snapshot", "无"),
         common_rules=_COMMON_RULES, json_spec=_JSON_SPEC,
-    ))
+    ), part=part)
 
 
-def run_capital_expert(llm, ctx: dict) -> ExpertOpinion:
+def run_capital_expert(llm, ctx: dict, *, part: str) -> ExpertOpinion:
     return _invoke_expert(llm, "资金面", CAPITAL_PROMPT.format(
         capital_news=ctx.get("capital_news", "无"),
         comprehensive_news=ctx.get("comprehensive_news", "无"),
         market_snapshot=ctx.get("market_snapshot", "无"),
         common_rules=_COMMON_RULES, json_spec=_JSON_SPEC,
-    ))
+    ), part=part)
 
 
-def run_technical_expert(llm, ctx: dict) -> ExpertOpinion:
+def run_technical_expert(llm, ctx: dict, *, part: str) -> ExpertOpinion:
     return _invoke_expert(llm, "技术面", TECHNICAL_PROMPT.format(
         indicators=ctx.get("indicators", "无"),
         market_snapshot=ctx.get("market_snapshot", "无"),
         comprehensive_news=ctx.get("comprehensive_news", "无"),
         common_rules=_COMMON_RULES, json_spec=_JSON_SPEC,
-    ))
+    ), part=part)
 
 
-def run_risk_officer(llm, ctx: dict) -> RiskOpinion:
+def run_risk_officer(llm, ctx: dict, *, part: str) -> RiskOpinion:
     """风险官：唯一能看到其他专家结论的角色。"""
     prompt = RISK_PROMPT.format(
         intensity_instruction=get_intensity_instruction(),
@@ -374,7 +377,7 @@ def run_risk_officer(llm, ctx: dict) -> RiskOpinion:
         return _to_risk_opinion(data)
 
     risk = call_with_retry(_attempt, retry_label="风险官",
-                           retry_times=llm_retry_times(part="expert"))
+                           retry_times=llm_retry_times(part=part))
     logger.info(f"[风险官] 风险等级={risk.risk_level} 风险点={len(risk.risks)}")
     return risk
 
@@ -419,7 +422,7 @@ CHIEF_PROMPT = """你是一位首席策略师，负责汇总多位分析师的�
 
 
 def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
-              risk: RiskOpinion, quant: dict) -> dict:
+              risk: RiskOpinion, quant: dict, *, part: str) -> dict:
     """首席策略师：撰写叙述性内容；定量结论由 quant 提供。"""
     expert_text = "\n".join(
         f"【{o.expert}】{o.stance}（score={o.score:+.2f}，置信度={o.confidence}）\n"
@@ -489,7 +492,7 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
     data = call_with_retry(
         lambda: _require_dict(llm.invoke(prompt).content, "首席策略师"),
         retry_label="首席策略师",
-        retry_times=llm_retry_times(part="expert"),
+        retry_times=llm_retry_times(part=part),
     )
 
     # 强制并入风险官的全部风险点（不得被 LLM 过滤）

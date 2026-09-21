@@ -214,7 +214,7 @@ def check_sensitivity(db: Session | None = None, expert: str = "行业",
         scores, stance = [], None
         for _ in range(n):
             try:
-                op = fn(llm, ctx)
+                op = fn(llm, ctx, part="expert")
                 scores.append(op.score)
                 stance = op.stance          # 保留最后一次的立场（兼容原输出字段）
             except Exception as e:  # noqa: BLE001
@@ -291,7 +291,7 @@ def check_reproducibility(db: Session, runs: int = 3, expert: str = "行业") ->
     scores, stances = [], []
     for _ in range(max(2, runs)):
         try:
-            op = fn(llm, ctx)
+            op = fn(llm, ctx, part="expert")
             scores.append(round(op.score, 3))
             stances.append(op.stance)
         except Exception as e:  # noqa: BLE001

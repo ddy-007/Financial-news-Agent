@@ -265,7 +265,7 @@ def _expert_node(name: str, fn) -> callable:
     def node(state: AnalystState) -> dict:
         ctx = state.get("ctx", {})
         try:
-            opinion = fn(get_llm(temperature=0.2, part="expert"), ctx)
+            opinion = fn(get_llm(temperature=0.2, part="expert"), ctx, part="expert")
             return {"opinions": [opinion.model_dump()]}
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{name}] 分析失败，跳过：{e}")
@@ -285,7 +285,8 @@ def risk_node(state: AnalystState) -> dict:
         for o in opinions
     ) or "无（其他专家分析均失败）"
     try:
-        risk = run_risk_officer(get_llm(temperature=0.3, part="expert"), ctx)
+        risk = run_risk_officer(get_llm(temperature=0.3, part="expert"), ctx,
+                                part="expert")
         return {"risk_opinion": risk.model_dump()}
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[风险官] 分析失败，跳过：{e}")
@@ -371,7 +372,8 @@ def chief_node(state: AnalystState) -> dict:
     risk = RiskOpinion(**state["risk_opinion"]) if state.get("risk_opinion") else RiskOpinion()
 
     try:
-        narrative = run_chief(get_llm(temperature=0.2, part="expert"), ctx, opinions, risk, quant)
+        narrative = run_chief(get_llm(temperature=0.2, part="expert"), ctx, opinions,
+                              risk, quant, part="expert")
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[首席] 汇总失败，使用降级结构：{e}")
         narrative = {
