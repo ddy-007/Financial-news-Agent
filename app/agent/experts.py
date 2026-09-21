@@ -51,7 +51,16 @@ def _clamp(v, lo=-1.0, hi=1.0) -> float:
         return 0.0
 
 
-STANCE_NEUTRAL_EDGE = 0.15   # 与 _JSON_SPEC 的中性带一致
+# 「单个分析师」层级的中性带边界，与 `_JSON_SPEC` 锚点里的 ±0.15 一致。
+#
+# ⚠️ 这是**分析师层级**的刻度，与 config 的 `score_neutral_band`（**综合分层级**）
+# 不是同一个东西 —— 两者数值恰好都是 0.15（锚点当初就是对着定调阈值定的），
+# 但项目 2026-09-20 明确裁定过**要分层独立**，别把它们合并成一个配置项。
+#
+# **唯一定义处**：`evaluation.STANCE_NEUTRAL_EDGE` 从这里 import。
+# 别在别处再写一遍 0.15 —— 两处漂移会让「写入侧当场告警」与「评估侧 S8 统计」
+# 静默地不一致（2026-09-21 巡检标过「中」）。
+STANCE_NEUTRAL_EDGE = 0.15
 
 
 def _warn_if_stance_conflicts(name: str, stance: str, score) -> None:

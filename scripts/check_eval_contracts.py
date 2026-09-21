@@ -24,6 +24,7 @@ from pathlib import Path
 # 确保项目根目录在 sys.path，使 `from app...` 可导入（同 verify.py）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.agent import experts as ex  # noqa: E402
 from app.services import evaluation as ev  # noqa: E402
 
 # **必须在任何 _patch 之前**抓住真实函数的引用。
@@ -280,6 +281,25 @@ def _s8():
     check("矛盾 ≥5 条 → 出 flag", r.get("flag"),
           "立场与分值频繁矛盾 —— 考虑改为「由 score 反推 stance」",
           "样本够 5 条才提示；低于 5 只报数不报警")
+
+    # 这个常量曾在 experts.py 与 evaluation.py 各写一遍（巡检标「中」）。
+    # 现在 evaluation 从 experts import —— 牢牢钉住"只有一个来源"。
+    check("STANCE_NEUTRAL_EDGE 只有一个来源",
+          ev.STANCE_NEUTRAL_EDGE is ex.STANCE_NEUTRAL_EDGE, True,
+          "两处各写一遍 0.15，改一处会让写入侧告警与 S8 统计静默不一致")
+
+    # 脏数据：库里的 expert_opinions 是 JSON，元素可能不是 dict、score 可能是串或 null。
+    # 一条脏记录不该让整条 S8 变成 error（那样全部统计都丢了）。
+    _patch([_report(opinions=[
+        _opinion("宏观", "看多", 0.35),              # 有效
+        {"expert": "行业", "stance": "中性", "score": "abc"},   # 非数值
+        {"expert": "资金面", "stance": "中性", "score": None},  # 缺失
+        "not-a-dict",                                          # 元素不是 dict
+    ])])
+    r = ev.check_stance_consistency(None)
+    check("脏数据不崩，且只统计合法条目",
+          (r["status"], r["total"], r["mismatches"]), ("ok", 1, 0),
+          "逐条挡脏值；否则一条脏记录就让整条 S8 变 error，统计全丢")
 
 
 # ============ 结构哨兵 ============

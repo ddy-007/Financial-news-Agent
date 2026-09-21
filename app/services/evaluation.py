@@ -766,7 +766,9 @@ def check_risk_level_distribution(db: Session, limit: int = 180) -> dict:
     return result
 
 
-STANCE_NEUTRAL_EDGE = 0.15   # 与 _JSON_SPEC 的中性带一致
+# 从**唯一来源**取，不在本文件再写一遍 —— 两处各自硬编码 0.15 的话，
+# 改了其中一处会让「写入侧当场告警」与「本文件 S8 的统计」静默不一致。
+from app.agent.experts import STANCE_NEUTRAL_EDGE  # noqa: E402
 
 
 def _expected_stance(score: float) -> str | None:
@@ -802,17 +804,26 @@ def check_stance_consistency(db: Session, limit: int = 180) -> dict:
     total, mismatches, detail = 0, 0, []
     for r in reports:
         for o in r["expert_opinions"]:
+            # `expert_opinions` 是库里的 JSON，元素可能不是 dict、
+            # score 可能是字符串或 null —— 逐条挡住，别让一条脏记录
+            # 把整条 S8 变成 status=error（那样所有统计都丢了）。
+            if not isinstance(o, dict):
+                continue
             stance, score = o.get("stance"), o.get("score")
             if stance is None or score is None:
                 continue
+            try:
+                sc = float(score)
+            except (TypeError, ValueError):
+                continue
             total += 1
-            want = _expected_stance(float(score))
+            want = _expected_stance(sc)
             if want and stance != want:
                 mismatches += 1
                 detail.append({
                     "date": r["date"].date().isoformat(),
                     "expert": o.get("expert"),
-                    "stance": stance, "score": round(float(score), 3),
+                    "stance": stance, "score": round(sc, 3),
                     "expected": want,
                 })
 
