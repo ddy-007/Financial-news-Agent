@@ -37,13 +37,17 @@ _REAL_HAS_COLUMN = ev._has_column
 
 # ============ 假数据 ============
 # 与 _load_reports 返回的 dict 同构；结构由末尾的哨兵对真实函数核对
-def _report(level=None, *, veto=False, sentiment="偏多") -> dict:
+def _report(level=None, *, veto=False, sentiment="偏多", opinions=None) -> dict:
     content = {}
     if level is not None:
         content["risk_opinion"] = {"risk_level": level}
     return {"date": datetime(2026, 9, 1), "sentiment": sentiment,
             "confidence": "medium", "score": 0.2, "divergence": 0.1,
-            "risk_veto": veto, "expert_opinions": [], "content": content}
+            "risk_veto": veto, "expert_opinions": opinions or [], "content": content}
+
+
+def _opinion(expert: str, stance: str, score: float) -> dict:
+    return {"expert": expert, "stance": stance, "score": score}
 
 
 def _levels(*spec) -> list[dict]:
@@ -233,6 +237,51 @@ def _b2():
     # （「池子为空 → 带 reason 的 insufficient_data」已由本节第一条断言覆盖，不重复。）
 
 
+# ============ S8 check_stance_consistency ============
+def _s8():
+    print("\nS8 check_stance_consistency")
+
+    _patch([_report(opinions=[
+        _opinion("宏观", "看多", 0.35), _opinion("行业", "看空", -0.40),
+        _opinion("资金面", "中性", 0.00),
+    ])])
+    r = ev.check_stance_consistency(None)
+    check("全部自洽 → 0 条矛盾", (r["mismatches"], r["mismatch_rate"]), (0, 0.0),
+          "score 落在对应档内时不计矛盾")
+
+    _patch([_report(opinions=[
+        _opinion("行业", "中性", 0.32), _opinion("宏观", "看多", 0.35),
+    ])])
+    r = ev.check_stance_consistency(None)
+    check("明确偏多却写中性 → 记 1 条矛盾",
+          (r["total"], r["mismatches"], r["samples"][0]["expected"]),
+          (2, 1, "看多"),
+          "score 明确落在非中性档内部时，stance 必须对应")
+
+    # ★ 这条是踩过坑才加的：锚点里 ±0.15 被「中性」和「偏多/偏空」两个区间同时包含。
+    # 我第一次统计时把 3 条边界样本误算成矛盾（12.5%），排除后真矛盾只有 1/32。
+    _patch([_report(opinions=[
+        _opinion("资金面", "中性", 0.15), _opinion("资金面", "中性", -0.15),
+        _opinion("宏观", "看多", 0.15), _opinion("宏观", "看空", -0.15),
+    ])])
+    r = ev.check_stance_consistency(None)
+    check("±0.15 边界**不算**矛盾", (r["total"], r["mismatches"]), (4, 0),
+          "锚点的 ±0.15 被两个区间同时包含，两种写法都对 —— 这条若变红，"
+          "说明边界处理被改坏了，会把边界样本误报成矛盾")
+
+    _patch([_report()])           # expert_opinions 为空
+    r = ev.check_stance_consistency(None)
+    check("无 expert_opinions → skipped + reason",
+          (r["status"], "reason" in r), ("skipped", True),
+          "无观点可查时不下结论，也不除零")
+
+    _patch([_report(opinions=[_opinion("行业", "中性", 0.32)] * 5)])
+    r = ev.check_stance_consistency(None)
+    check("矛盾 ≥5 条 → 出 flag", r.get("flag"),
+          "立场与分值频繁矛盾 —— 考虑改为「由 score 反推 stance」",
+          "样本够 5 条才提示；低于 5 只报数不报警")
+
+
 # ============ 结构哨兵 ============
 def _sqlite_path(url: str) -> Path | None:
     """从 SQLAlchemy 的 sqlite URL 取出本地文件路径；不是 sqlite 就返回 None。"""
@@ -305,6 +354,7 @@ def _sentinel():
 def main() -> int:
     _a3()
     _b2()
+    _s8()
     _sentinel()
     failed = [name for ok, name in _RESULTS if not ok]
     # 跳过项**不计入分母**：把它混进「N/N 通过」会在无库环境下虚报全绿

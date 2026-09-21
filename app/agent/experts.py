@@ -51,6 +51,31 @@ def _clamp(v, lo=-1.0, hi=1.0) -> float:
         return 0.0
 
 
+STANCE_NEUTRAL_EDGE = 0.15   # 与 _JSON_SPEC 的中性带一致
+
+
+def _warn_if_stance_conflicts(name: str, stance: str, score) -> None:
+    """`stance` 与 `score` 明显矛盾时**记日志**，不修改任何值。
+
+    锚点要求两者一致，但这里**只检测不纠正** —— 成因有两种（模型把"中性"当默认值 /
+    stance 与锚点脱节），修法不同且需要样本分辨，评估层的 S8 在统计它。
+    这里做的是"当场可见"：跑一次就能在日志里看到，不必等评估层跑。
+
+    ⚠️ 边界不算矛盾：锚点里 **±0.15 被「中性」和「偏多/偏空」两个区间同时包含**，
+    恰好等于 ±0.15 时两种写法都对。见 `evaluation._expected_stance` 的同样处理。
+    """
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return
+    if s > STANCE_NEUTRAL_EDGE and stance != "看多":
+        logger.warning(f"[{name}] stance 与 score 矛盾：stance={stance} score={s:+.2f}"
+                       f"（按锚点应为「看多」）—— 已如实保留，未改写")
+    elif s < -STANCE_NEUTRAL_EDGE and stance != "看空":
+        logger.warning(f"[{name}] stance 与 score 矛盾：stance={stance} score={s:+.2f}"
+                       f"（按锚点应为「看空」）—— 已如实保留，未改写")
+
+
 def _to_opinion(name: str, data: dict) -> ExpertOpinion:
     """安全构造 ExpertOpinion（容错 LLM 输出的非法值）。"""
     stance = str(data.get("stance", "中性")).strip()
@@ -59,6 +84,7 @@ def _to_opinion(name: str, data: dict) -> ExpertOpinion:
     conf = str(data.get("confidence", "medium")).strip().lower()
     if conf not in ("high", "medium", "low"):
         conf = "medium"
+    _warn_if_stance_conflicts(name, stance, data.get("score"))
     return ExpertOpinion(
         expert=name,
         stance=stance,

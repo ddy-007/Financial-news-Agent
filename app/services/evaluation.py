@@ -766,6 +766,71 @@ def check_risk_level_distribution(db: Session, limit: int = 180) -> dict:
     return result
 
 
+STANCE_NEUTRAL_EDGE = 0.15   # 与 _JSON_SPEC 的中性带一致
+
+
+def _expected_stance(score: float) -> str | None:
+    """score 明确落在某个非中性档内部时，返回它**必须**对应的 stance；否则 None。
+
+    ⚠️ 为什么只在「明确内部」才判：锚点里 **±0.15 被两个区间同时包含** ——
+    「-0.15 ~ +0.15 中性」与「+0.15 ~ +0.5 偏多」都含 +0.15。所以恰好等于
+    ±0.15 时，写「中性」或写「偏多/偏空」**都对**，不能算矛盾。
+    2026-09-21 我第一次统计时忽略了这点，把 3 条边界样本误算成矛盾（12.5%），
+    排除后真矛盾只有 1/32。
+    """
+    if score > STANCE_NEUTRAL_EDGE:
+        return "看多"
+    if score < -STANCE_NEUTRAL_EDGE:
+        return "看空"
+    return None
+
+
+@_safe("stance_consistency")
+def check_stance_consistency(db: Session, limit: int = 180) -> dict:
+    """S8 立场与分值是否自洽。
+
+    `_JSON_SPEC` 要求 `score` 落在 `stance` 对应的档位内，但**代码里从来没有校验过**
+    —— `_to_opinion` 把两者各读各的，矛盾了也照收。本检查**只统计不改值**。
+
+    为什么先只统计：成因有两种，且**要样本才能分辨** ——
+    (a) 模型把「中性」当"不表态"的默认值，`score` 才是它真正的判断；
+    (b) `stance` 与锚点脱节，该以 `score` 为准。
+    两者对应的修法不同（前者该由 score 反推 stance，后者要改锚点措辞），
+    所以在有足够样本前不下结论。**这就是「让时间给出依据」的载体。**
+    """
+    reports = _load_reports(db, limit)
+    total, mismatches, detail = 0, 0, []
+    for r in reports:
+        for o in r["expert_opinions"]:
+            stance, score = o.get("stance"), o.get("score")
+            if stance is None or score is None:
+                continue
+            total += 1
+            want = _expected_stance(float(score))
+            if want and stance != want:
+                mismatches += 1
+                detail.append({
+                    "date": r["date"].date().isoformat(),
+                    "expert": o.get("expert"),
+                    "stance": stance, "score": round(float(score), 3),
+                    "expected": want,
+                })
+
+    if total == 0:
+        return {"check": "stance_consistency", "status": "skipped",
+                "reason": "无报告包含 expert_opinions"}
+
+    rate = round(mismatches / total, 3)
+    result = {"check": "stance_consistency", "status": "ok",
+              "total": total, "mismatches": mismatches, "mismatch_rate": rate,
+              "samples": detail[:5]}
+    # 只报数、不设"超标线"：样本还太小（当前 32 条），任何阈值都是拍脑袋。
+    # 攒到 5 条以上才给 flag，表示"值得看一眼"。
+    if mismatches >= 5:
+        result["flag"] = "立场与分值频繁矛盾 —— 考虑改为「由 score 反推 stance」"
+    return result
+
+
 # =====================================================================
 # 阶段 Q —— 数据质量
 # =====================================================================
@@ -959,6 +1024,7 @@ def run_all_checks(db: Session, limit: int = 90,
         check_reference_traceability(db, limit),
         check_fact_consistency(db, limit),
         check_risk_level_distribution(db),
+        check_stance_consistency(db),
         check_category_coverage(db),
         check_retrieval_health(db),
         check_risk_officer_calibration(db),
