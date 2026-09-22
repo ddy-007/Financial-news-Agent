@@ -389,6 +389,21 @@ def _mutex():
     import app.agent.data_agent as DA
     import app.services.news_service as NS
 
+    # ⚠️ 必须给**真的内存库**，不能像以前那样传 `db=None`：
+    # P3（2026-09-22）起 `collect_and_store_news` 末尾会做源健康巡检，
+    # 那条路径真的读 `collector_state` —— 传 None 会 AttributeError。
+    # 空表时 `evaluate` 判为健康、不打日志，对本用例无副作用。
+    #
+    # ⚠️ 必须用 StaticPool：`sqlite:///:memory:` 默认是 **每线程一个独立库**，
+    # 子线程里建的表另一个线程看不见（实测报 `no such table: collector_state`）。
+    # StaticPool 让所有线程共用一个连接，内存库才真的共享。
+    from sqlalchemy.pool import StaticPool
+    engine = create_engine("sqlite://",
+                           connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Sess = sessionmaker(bind=engine)
+
     orig = (NS.run_collection, NS.save_states, DA.run_data_agent)
     started, release = threading.Event(), threading.Event()
     try:
@@ -401,10 +416,11 @@ def _mutex():
         DA.run_data_agent = lambda db, raw=None: {"new": 7, "classify_failed": 0}
 
         out = {}
-        t = threading.Thread(target=lambda: out.__setitem__("A", NS.collect_and_store_news(None)))
+        t = threading.Thread(
+            target=lambda: out.__setitem__("A", NS.collect_and_store_news(Sess())))
         t.start()
         started.wait(timeout=5)          # 等 A 真的进到采集里
-        out["B"] = NS.collect_and_store_news(None)   # 并发再调一次 → 应被跳过
+        out["B"] = NS.collect_and_store_news(Sess())   # 并发再调一次 → 应被跳过
         release.set()
         t.join(timeout=5)
     finally:

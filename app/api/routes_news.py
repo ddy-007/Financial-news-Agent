@@ -31,6 +31,22 @@ def _news_dict(n: News) -> dict:
     }
 
 
+@router.get("/sources/health")
+def news_sources_health(db: Session = Depends(get_db)):
+    """采集源健康快照（P3 监控）。
+
+    只读，**不触发任何采集**。给人工排查用：哪个源多久没成功了、连续空轮几轮、
+    有没有被页上限截断。
+
+    ⚠️ 这里的 `reason` 只能给出「原因需看日志」—— 因为它没有**本轮采集上下文**，
+    区分不了「源失效」与「上游 LLM 故障导致水位线不推进」。**准确原因在采集轮末尾
+    的 `[源健康]` 告警里**（`app/services/collector_health.py`）。
+    """
+    from app.services.collector_health import evaluate
+
+    return evaluate(db)
+
+
 @router.get("/dates")
 def news_dates(db: Session = Depends(get_db)):
     """库中有新闻的日期清单（含每天条数）。

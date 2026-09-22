@@ -228,6 +228,12 @@ def collect_and_store_news(db: Session) -> int:
         items, results = run_collection(db)
         res = run_data_agent(db, raw=items)
         save_states(db, results, res.get("classify_failed", 0))
+        # P3 源健康巡检。**必须带本轮上下文**（results / classify_failed）——
+        # 只看 collector_state 的话，「LLM 故障导致水位线不推进」会被误报成
+        # 「源失效」，把排查引向错误方向（见 collector_health 的模块 docstring）。
+        from app.services.collector_health import evaluate, log_health
+        log_health(evaluate(db, results=results,
+                            classify_failed=res.get("classify_failed", 0)))
         return res["new"]
     finally:
         _COLLECT_LOCK.release()
