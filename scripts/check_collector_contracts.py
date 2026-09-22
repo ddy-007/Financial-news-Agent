@@ -342,6 +342,46 @@ def _classify_fallback():
           "§17：条目必须交回上层，才谈得上「水位线不推进、下轮重取」")
 
 
+# ============ G. 采集互斥 ============
+def _mutex():
+    """锁定「同一时刻只允许一次采集」。
+
+    2026-09-22 实机撞上过两轮重叠：手动端点 `POST /news/collect` 绕过 APScheduler 的
+    `max_instances=1`，手动触发的那轮还没跑完，定时的那轮又起来了 ——
+    LLM 调用翻倍、并发写同一个 SQLite、竞争同一份水位线。
+    """
+    print("\nG. 采集互斥（定时任务 vs 手动端点）")
+    import threading
+
+    import app.agent.data_agent as DA
+    import app.services.news_service as NS
+
+    orig = (NS.run_collection, NS.save_states, DA.run_data_agent)
+    started, release = threading.Event(), threading.Event()
+    try:
+        def slow_collect(db):
+            started.set()
+            release.wait(timeout=5)      # 卡住，模拟"一轮要跑几十分钟"
+            return [], []
+        NS.run_collection = slow_collect
+        NS.save_states = lambda *a, **k: None
+        DA.run_data_agent = lambda db, raw=None: {"new": 7, "classify_failed": 0}
+
+        out = {}
+        t = threading.Thread(target=lambda: out.__setitem__("A", NS.collect_and_store_news(None)))
+        t.start()
+        started.wait(timeout=5)          # 等 A 真的进到采集里
+        out["B"] = NS.collect_and_store_news(None)   # 并发再调一次 → 应被跳过
+        release.set()
+        t.join(timeout=5)
+    finally:
+        NS.run_collection, NS.save_states, DA.run_data_agent = orig
+
+    check("并发时先到的正常跑完", out.get("A"), 7, "第一个拿锁的照常执行")
+    check("后到的被跳过（返回 0，不排队）", out.get("B"), 0,
+          "非阻塞获取：一轮几十分钟，等它对调用方毫无意义")
+
+
 def main() -> int:
     _guards()
     _page_tolerance()
@@ -349,6 +389,7 @@ def main() -> int:
     _cutoff_contract()
     _state_rules()
     _classify_fallback()
+    _mutex()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:

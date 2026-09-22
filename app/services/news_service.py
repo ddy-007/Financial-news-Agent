@@ -1,6 +1,7 @@
 """新闻业务：采集 + 去重入库 + 向量索引。"""
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta
 
 from loguru import logger
@@ -171,6 +172,21 @@ def rebuild_bm25_index(db: Session, days: int = 7) -> None:
     get_retriever().build_bm25_index(chunks)
 
 
+# 采集互斥锁（**进程级**）。
+#
+# **为什么需要**：采集有两个触发方 —— APScheduler 的定时 job（每 30 分钟），
+# 以及 `POST /api/v1/news/collect` 的手动端点。定时 job 有 APScheduler 的
+# `max_instances=1` 兜着，**手动端点完全没有保护**。
+#
+# 2026-09-22 实机撞上：手动触发的一轮（21:33 起）要跑 45 分钟，而定时的那轮
+# 22:00 照常起来 —— **两轮重叠**：LLM 调用数翻倍（220 批）、两轮并发写同一个
+# SQLite、还会竞争同一份水位线。当天没出事（第二轮 1120 条分类失败，
+# `save_states` 规则 2 挡住了水位线推进），但那是运气。
+#
+# 注意它只挡**同一进程内**的并发；多进程部署需要换成文件锁或 DB 锁。
+_COLLECT_LOCK = threading.Lock()
+
+
 def run_collection(db: Session) -> tuple[list[NewsItem], list[SourceResult]]:
     """读取水位线 → 采集全部源 → 返回 (全部条目, 各源结果)。
 
@@ -192,10 +208,24 @@ def collect_and_store_news(db: Session) -> int:
     「采集 → 分类 → 入库 → 才推进水印」，任何一环不完整都不推进。
     这个顺序是整条链路里最要紧的一处：提前推进 = 那批新闻还没入库就把
     水位线划过去，下一轮不会再取，**永久丢失**。
+
+    **同一时刻只允许一次采集**（见 `_COLLECT_LOCK`）。拿不到锁就跳过并返回 0 ——
+    调用方靠日志区分"跳过了"与"真的没新增"。
     """
     from app.agent.data_agent import run_data_agent
 
-    items, results = run_collection(db)
-    res = run_data_agent(db, raw=items)
-    save_states(db, results, res.get("classify_failed", 0))
-    return res["new"]
+    # 非阻塞：拿不到说明已有一次采集在跑，直接跳过。
+    # 不用阻塞等待 —— 一轮要几十分钟，等它对调用方毫无意义。
+    if not _COLLECT_LOCK.acquire(blocking=False):
+        logger.warning(
+            "[采集] 已有一次采集在进行中，本次**跳过**（不排队）。"
+            "定时任务每 30 分钟触发，而一轮可能跑更久，两者会撞上"
+        )
+        return 0
+    try:
+        items, results = run_collection(db)
+        res = run_data_agent(db, raw=items)
+        save_states(db, results, res.get("classify_failed", 0))
+        return res["new"]
+    finally:
+        _COLLECT_LOCK.release()
