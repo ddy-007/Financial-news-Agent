@@ -29,7 +29,7 @@ class MarketReport(Base):
     expert_opinions: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: 5位专家观点
     divergence: Mapped[float | None] = mapped_column(Float, nullable=True)  # 分歧度 0~2
     risk_veto: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # 风险官是否触发降档
-    # 信息量标记：True 表示当天四个信号均未触发（市场平静），报告仍生成但内容精简
+    # 信息量标记：True 表示当天三个信号均未触发（市场平静），报告仍生成但内容精简
     low_info: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # 数据时效标记：True 表示近期新闻不足、本次研判基于陈旧数据（非当日）
     data_stale: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

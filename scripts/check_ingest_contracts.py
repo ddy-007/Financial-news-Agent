@@ -149,6 +149,22 @@ class FakeStore:
         return self._coll
 
 
+class FakeUpsertStore:
+    """只实现 `upsert_documents`，并在收到重复 id 时**像真实 Chroma 一样报错**。
+
+    真实行为见 `chromadb/api/types.py` 的 `validate_ids`：重复 id 抛
+    `DuplicateIDError`。这里复刻它，否则「去重」这件事测不出来。
+    """
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def upsert_documents(self, ids, documents, embeddings, metadatas):
+        if len(ids) != len(set(ids)):
+            raise AssertionError("upsert 收到重复 id（真实 Chroma 会抛 DuplicateIDError）")
+        self.calls.append(list(ids))
+
+
 # ============ 测试替身 ============
 @contextmanager
 def patched(**kw):
@@ -498,6 +514,52 @@ def _within_round_in_pipeline():
     check("本轮内两条同事件 → 只送 1 条进分类", calls, [["同事件A"]])
 
 
+def _duplicate_merge_target():
+    print("\n[10] 同一行被多个候选合并（Chroma 重复 id）")
+
+    reset_vectors()
+    now = datetime.now()
+    # ⚠️ 两个候选的向量**必须彼此不像**（cos 0.6 < 0.85），否则会先被本轮内聚类
+    # 并成一个候选、根本走不到「两个候选并进同一行」那条路径。
+    # 但两者都要像库内那一行（cos ≈ 0.894 ≥ 0.85）。
+    vec = unit(1, 0)
+    register("同事件A", "长" * 80, unit(1, 0.5))
+    register("同事件B", "长" * 90, unit(1, -0.5))
+
+    # ① `_upsert_index` 自己对重复 id 兜底
+    db = fresh_db()
+    a = add_news(db, "A", "a")
+    b = add_news(db, "B", "b")
+    store = FakeUpsertStore()
+    # ⚠️ 必须接住异常：断言不过时 `FakeUpsertStore` 会抛，不接的话整个脚本当场崩掉、
+    # 后面几组都跑不到 —— 看到的是一条 traceback 而不是一条 FAIL。
+    try:
+        with patched(embed_documents=fake_embed, vector_store=store):
+            DA._upsert_index([a, a, b])
+        got: object = store.calls
+    except Exception as e:  # noqa: BLE001
+        print(f"        · _upsert_index 抛 {type(e).__name__}: {e}")
+        got = None
+    check("_upsert_index 对重复 id 去重", got, [[a.id, b.id]],
+          "真实 Chroma 对重复 id 抛 DuplicateIDError，而这个异常在 db.commit() **之后** —— "
+          "整轮会以「数据已提交、索引没更新」的半完成状态收场")
+
+    # ② 主流程：两个候选的最近邻都指向同一行 → changed 不该有重复
+    db = fresh_db()
+    old = add_news(db, "同一事件", "短", pt=now - timedelta(hours=1))
+    coll = FakeCollection([(old.id, vec)])
+    indexed: list[list[str]] = []
+    classify, _ = make_classifier()
+    with patched(embed_documents=fake_embed, vector_store=FakeStore(coll),
+                 classify_news=classify, _llm_is_duplicate=lambda *a: False,
+                 _rebuild_bm25=lambda *a, **k: None,
+                 _upsert_index=lambda rows: indexed.append([r.id for r in rows])):
+        res = DA.run_data_agent(db, raw=[item("同事件A", "长" * 80, pt=now),
+                                         item("同事件B", "长" * 90, pt=now)])
+    check("两个候选并进同一行 → upsert 列表里该 id 只出现一次", indexed, [[old.id]])
+    check("两个候选并进同一行 → merged = 2", res["merged"], 2)
+
+
 def _result_shape():
     print("\n[8] 返回值契约")
     db = fresh_db()
@@ -521,6 +583,7 @@ def main() -> int:
     _pipeline_order()
     _p2_p3_failopen()
     _within_round_in_pipeline()
+    _duplicate_merge_target()
     _result_shape()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")

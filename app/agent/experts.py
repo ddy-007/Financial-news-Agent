@@ -477,7 +477,7 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
     info = quant.get("info_level") or {}
     if info.get("low_info"):
         info_hint = (
-            f"\n【今日信息量提示】当日四个信号均未触发（{info.get('reason', '')}），"
+            f"\n【今日信息量提示】当日三个信号均未触发（{info.get('reason', '')}），"
             "市场信息量较低。请在 market_summary 中如实说明「今日无重大消息」，"
             "**篇幅可以精简，不要为凑字数而堆砌内容**；风险提示仍须完整保留。"
         )

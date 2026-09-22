@@ -480,7 +480,9 @@ def _insert_new(db: Session, cand: Candidate, cls: dict) -> News:
         title=item.title,
         content=item.content or "",
         source=item.source,
-        url=item.url or None,
+        # 代表条目未必带 url（同指纹里正文最长的那个可能是无 url 的），
+        # 从候选的来源对里取第一个有 url 的，别让前端的「原文」链接凭空消失
+        url=next((u for _s, u in pairs if u), None),
         publish_time=item.publish_time or datetime.now(),
         category=cls["category"],
         market=cls["market"],
@@ -505,6 +507,18 @@ def _upsert_index(news_list: list[News]) -> None:
     """
     if not news_list:
         return
+    # 再兜一层去重：调用方已按 id 去重过 `changed`，但 `new_news` 内部理论上
+    # 仍可能重复（`classify_news` 不去重 LLM 返回的重复 id，是历史遗留路径）。
+    # Chroma 对重复 id 抛 DuplicateIDError，而这个异常在 db.commit() 之后 ——
+    # 与其让整轮崩在半完成状态，不如在这里无声收敛。
+    uniq: list[News] = []
+    _seen: set[str] = set()
+    for n in news_list:
+        if n.id in _seen:
+            continue
+        _seen.add(n.id)
+        uniq.append(n)
+    news_list = uniq
     ids = [n.id for n in news_list]
     texts = [_doc_text(n.title, n.content) for n in news_list]
     embeddings = embed_documents(texts)
@@ -578,6 +592,11 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     logger.info(f"[去重] 确定性去重：{len(raw)} 条 → {len(cands)} 个候选")
     _t_embed = time.time()
     vecs = _embed_candidates(cands)
+    if len(vecs) != len(cands):
+        logger.warning(
+            f"[去重] 嵌入返回 {len(vecs)} 条，与候选数 {len(cands)} 不一致 —— "
+            f"多出的候选拿不到近邻，会**一律按新条目处理**（宁可多存，不误合）"
+        )
     clusters = _cluster_by_similarity(vecs)
     within_round = 0
     if len(clusters) != len(cands):
@@ -634,10 +653,14 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     logger.info(f"[入库] 开始：{len(to_merge)} 个并入已有 + "
                 f"{len(relevant)} 条新增（含 bge-m3 向量化 + 索引，请勿当作卡死）")
     _t_ingest = time.time()
-    changed: list[News] = []          # 正文被改写的旧条目 —— 末尾要重索引（P2）
+    # 用 dict 按 id 去重：**两个候选可能并进同一条已有新闻**（它们的最近邻都指向它），
+    # 而两次 `_merge_into` 都可能返回 True（第二次的正文更长）。
+    # 重复 id 会让 Chroma 抛 DuplicateIDError，且**异常发生在 db.commit() 之后** ——
+    # 整轮会以「数据已提交、索引没更新」的半完成状态收场。
+    changed: dict[str, News] = {}
     for news_row, cand in to_merge:
         if _merge_into(db, news_row, cand):
-            changed.append(news_row)
+            changed[news_row.id] = news_row
 
     new_news: list[News] = []
     for r in relevant:
@@ -650,7 +673,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     db.commit()
 
     # 6. ⑤ 索引：整轮末尾一次性 upsert（新增的 + 被改写的）
-    _upsert_index(new_news + changed)
+    _upsert_index(new_news + list(changed.values()))
     # P3：只在**确有新增或被改写的条目**时重建 BM25。
     # 普通合并（只涨 source_count / source_urls）不影响 BM25 —— 它的 metadata
     # 只存 news_id，正文没变就没必要重建（全量重建实测 2.2s / 3400 条，

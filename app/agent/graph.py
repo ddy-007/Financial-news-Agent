@@ -28,11 +28,10 @@ from app.agent.experts import (
     run_technical_expert,
 )
 from app.agent.indicators import compute_indicators, format_indicators
-from app.agent.llm import get_llm, get_llm_model_name, llm_retry_times
+from app.agent.llm import get_llm, get_llm_model_name
 from app.agent.prompts import REPORT_PROMPT_TEMPLATE
 from app.agent.schemas import ExpertOpinion, RiskOpinion
 from app.config import settings
-from app.retry import call_with_retry
 from app.db import SessionLocal
 from app.models.market import MarketData
 from app.models.news import News

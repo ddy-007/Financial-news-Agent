@@ -89,7 +89,7 @@ def page_dashboard():
     # 信息量标记：当天市场平静时如实说明，而不是硬凑内容
     if data.get("low_info"):
         info = c.get("info_level") or {}
-        st.info(f"💤 **今日无重大消息**　（{info.get('reason', '四个信号均未触发')}）")
+        st.info(f"💤 **今日无重大消息**　（{info.get('reason', '三个信号均未触发')}）")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("市场情绪", data.get("sentiment", "中性"))
