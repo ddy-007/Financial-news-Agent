@@ -24,7 +24,9 @@ def _news_dict(n: News) -> dict:
         "market": n.market,
         "themes": n.themes,
         "source_count": n.source_count,
-        "sentiment": n.sentiment,
+        # 2026-09-22 起新闻级情绪分不再产生新值（历史值仍在库里，但不再对外暴露）。
+        # 字段**保留**以免破坏接口契约，恒为 None —— 前端已同步删除该列。
+        "sentiment": None,
         "summary": n.summary,
     }
 

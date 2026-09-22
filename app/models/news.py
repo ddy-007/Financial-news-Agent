@@ -29,7 +29,11 @@ class News(Base):
     # 多源佐证（仅展示，不参与加权）
     source_count: Mapped[int] = mapped_column(Integer, default=1)
     source_urls: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
-    # 情绪分：-1(极空) ~ 1(极多)，0 中性；由 LLM 打分
+    # 【已废弃】新闻级情绪分：-1(极空) ~ 1(极多)，0 中性。
+    # 2026-09-22 起**不再产生新值**（打分环节已整体删除），但**字段与历史值保留**
+    # 以便回溯 —— 当年打过的 2800 条仍在库里。`summary` 是同期产出的「理由」，一并停写。
+    # 消费方已全部摘除：`assess_info_level` 的信号②b 已删、`routes_news` 恒返回 None。
+    # 将来若要彻底清理，需连同 config.py 的两个废弃字段与 .env 一起动。
     sentiment: Mapped[float | None] = mapped_column(Float, nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     collected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

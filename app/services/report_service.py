@@ -6,19 +6,18 @@ import json
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from app.agent.graph import generate_daily_report, score_news_sentiment
+from app.agent.graph import generate_daily_report
 from app.config import settings
 from app.models.market import MarketData
 from app.models.report import MarketReport
 
 
 def run_daily_pipeline(db: Session) -> MarketReport:
-    """每日主流程：新闻情绪打分 → 生成研判报告 → 追加评估日志。
+    """每日主流程：生成研判报告 → 追加评估日志。
 
     注：末尾会向 data/eval_log.jsonl 追加一行评估结果（副作用）。
     评估失败不影响主流程。
     """
-    score_news_sentiment(db)
     report = generate_daily_report(db)
     try:
         from app.services.evaluation import append_eval_log

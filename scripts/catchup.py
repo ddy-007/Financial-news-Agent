@@ -159,13 +159,13 @@ def main() -> int:
         n_market = collect_and_store_market(db)
         print(f"  新增 {n_market} 条，耗时 {time.time() - t:.1f}s", flush=True)
 
-        _sep("第三步：补新闻（去重 + 分类 + 情绪打分前置，幂等）")
+        _sep("第三步：补新闻（去重 + 分类 + 入库索引，幂等）")
         print("  [!] 这一步要调 LLM，通常 10~20 分钟（取决于新闻量）", flush=True)
         t = time.time()
         # ⚠️ **刻意不走 `collect_and_store_news`**（2026-09-22 修正）：
-        # 那是**增量**入口，cutoff = 该源水位线 − 30 分钟。而 catchup 的用途恰恰是
-        # **回补历史缺口**（比如某轮撞页上限被截断掉的那一段）—— 走增量只能取到
-        # 最近 30 分钟，**什么也补不回来**，等于这一步白跑。
+        # 那是**增量**入口，cutoff = 该源水位线 − `news_overlap_minutes`（当前 15 分钟）。
+        # 而 catchup 的用途恰恰是**回补历史缺口**（比如某轮撞页上限被截断掉的那一段）
+        # —— 走增量只能取到最近 75 分钟（间隔 60 + 重叠 15），**什么也补不回来**。
         #
         # 这里让 `run_data_agent` 自采（`raw=None` → 按 `news_lookback_days` 全量抓）。
         # 它**不碰水位线**，这正是 catchup 该有的行为：只补数据，不改"我采到哪了"。

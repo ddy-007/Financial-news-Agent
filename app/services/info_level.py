@@ -1,11 +1,13 @@
 """信息量评估：判断"今天有没有料"。
 
-四个信号，**任一满足即视为有料**；全不满足则 low_info=True。
+三个信号，**任一满足即视为有料**；全不满足则 low_info=True。
 
-    ① 新颖度    —— 今日新增入库的新闻数（补跑时改按「今日发布」，见 use_publish_time）
-    ②a 事件强度 —— 今日新闻中存在多源佐证（source_count 高）
-    ②b 情绪强度 —— 今日新闻中存在明确多空倾向（|sentiment| 大）※依赖情绪分覆盖
-    ③ 市场异动  —— 任一主要指数涨跌幅超阈值
+    ① 新颖度   —— 今日新增入库的新闻数（补跑时改按「今日发布」，见 use_publish_time）
+    ② 事件强度 —— 今日新闻中存在多源佐证（source_count 高）
+    ③ 市场异动 —— 任一主要指数涨跌幅超阈值
+
+2026-09-22：原「②b 情绪强度」随新闻级情绪分一并删除。依据是实测近 5 天该信号
+只触发 1 次，且情绪分覆盖率仅 13.6% —— 一个既不常触发、数据又残缺的信号。
 
 设计立场：**low_info 只作标记，不阻止报告生成**。
 "今天很平静"本身就是一条信息；且跳过会在时间序列上开洞，破坏回测与评估。
@@ -14,7 +16,6 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -56,18 +57,6 @@ def assess_info_level(db: Session, target_date: date | None = None,
         .count()
     )
 
-    # ②b 情绪强度：今日新闻中情绪倾向明确的（依赖情绪分覆盖）
-    strong_sentiment = (
-        db.query(News)
-        .filter(
-            News.publish_time >= day_start,
-            News.publish_time <= day_end,
-            News.sentiment.isnot(None),
-            func.abs(News.sentiment) >= settings.info_sentiment_threshold,
-        )
-        .count()
-    )
-
     # ③ 市场异动：任一主要指数涨跌幅绝对值
     rows = (
         db.query(MarketData)
@@ -92,11 +81,6 @@ def assess_info_level(db: Session, target_date: date | None = None,
             "pass": multi_source >= 1,
             "desc": f"多源佐证新闻数（source_count≥{settings.info_source_threshold}）",
         },
-        "strong_sentiment": {
-            "value": strong_sentiment, "threshold": 1,
-            "pass": strong_sentiment >= 1,
-            "desc": f"强情绪新闻数（|sentiment|≥{settings.info_sentiment_threshold}）",
-        },
         "market_move": {
             "value": max_change, "threshold": settings.info_market_threshold,
             "pass": max_change >= settings.info_market_threshold,
@@ -108,8 +92,8 @@ def assess_info_level(db: Session, target_date: date | None = None,
     low_info = len(passed) == 0
     if low_info:
         reason = (
-            f"四信号均未触发（{new_short}{new_count}条、多源{multi_source}条、"
-            f"强情绪{strong_sentiment}条、最大波动{max_change}%）"
+            f"三信号均未触发（{new_short}{new_count}条、多源{multi_source}条、"
+            f"最大波动{max_change}%）"
         )
     else:
         reason = "触发信号：" + "、".join(passed)

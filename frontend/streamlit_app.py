@@ -235,16 +235,6 @@ def page_weekly():
 
 
 # ================= 页面：新闻流 =================
-def _fmt_sentiment(v):
-    if v is None or pd.isna(v):
-        return ""
-    if v > 0:
-        return f"🟥 {v:+.1f}"
-    if v < 0:
-        return f"🟩 {v:+.1f}"
-    return f"⬜ {v:+.1f}"
-
-
 def _fmt_themes(v):
     if not v:
         return ""
@@ -342,14 +332,13 @@ def page_news():
     df["源数"] = df["source_count"].apply(
         lambda x: f"🔥 {int(x)}源" if x and x >= 2 else "1源"
     )
-    df["情绪分"] = df["sentiment"].apply(_fmt_sentiment)
     df["题材"] = df["themes"].apply(_fmt_themes)
     df["时间"] = pd.to_datetime(df["publish_time"]).dt.strftime("%m-%d %H:%M")
 
     display = df[
-        ["title", "category", "market", "源数", "情绪分", "题材", "时间", "url"]
+        ["title", "category", "market", "源数", "题材", "时间", "url"]
     ].copy()
-    display.columns = ["标题", "分类", "市场", "源数", "情绪分", "题材", "时间", "原文"]
+    display.columns = ["标题", "分类", "市场", "源数", "题材", "时间", "原文"]
     # 重置索引并生成从 1 开始的序号（筛选后重新编号）
     display = display.reset_index(drop=True)
     display.insert(0, "序号", range(1, len(display) + 1))
@@ -365,12 +354,6 @@ def page_news():
     )
     st.caption(f"共 {len(display)} 条新闻")
 
-    s = df["sentiment"].dropna()
-    if len(s):
-        pos = int((s > 0).sum())
-        neg = int((s < 0).sum())
-        neu = int((s == 0).sum())
-        st.markdown(f"情绪分布：🟥 偏多 {pos} ｜ 🟩 偏空 {neg} ｜ ⬜ 中性 {neu}")
 
 
 # ================= 页面：行情 =================

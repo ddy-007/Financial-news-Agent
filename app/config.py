@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # 每个分组的三个字段都可留空；留空的字段回落到上面的 DEEPSEEK_*。
     # 用途：给不同环节接不同的服务商 / 模型（例如把新闻采集换成便宜或本地的模型），
     #       而研判仍用主力模型。分组对应关系见 app/agent/llm.py 的 _GROUPS。
-    #   news   ：每日新闻采集（新闻分类 / 语义判重 / 情绪打分）
+    #   news   ：每日新闻采集（相关性分类 / 语义判重）
     #   expert ：多专家研判（4 位分析师 / 风险官 / 首席 / 兜底 / 评估层）
     #   chat   ：前端问答 Agent
     #   weekly ：周报
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     weekly_model: str = ""
 
     # ---- 关闭「思考模式」（按环节，可选）----
-    # 只对**不需要推理**的环节开：新闻分类 / 判重 / 情绪打分这类任务，
+    # 只对**不需要推理**的环节开：相关性分类 / 判重这类任务，
     # 模型花在思考上的时间纯属浪费（实测单批 29.7s -> 8.0s）。
     # ⚠️ 该参数（enable_thinking）是百炼 / qwen 系模型特有的；
     #    分组指向其它服务商时**不要开**，否则请求里会多出对方不认识的参数。
@@ -111,13 +111,17 @@ class Settings(BaseSettings):
     score_strong_band: float = 0.5     # |综合分| > 此值 → 强多 / 强空
 
     # ---- 信息量门槛（任一满足即视为「有料」）----
-    # 四个信号全不满足 → low_info=True（仍生成报告，仅标记 + 精简）
+    # **三个**信号全不满足 → low_info=True（仍生成报告，仅标记 + 精简）
     info_new_threshold: int = 15          # ① 今日新增新闻数
-    info_source_threshold: int = 2        # ②a 多源佐证的 source_count 门槛
-    info_sentiment_threshold: float = 0.3  # ②b 情绪强度门槛 |sentiment|
+    info_source_threshold: int = 2        # ② 多源佐证的 source_count 门槛
     info_market_threshold: float = 1.0    # ③ 市场异动 |涨跌幅| 门槛（%）
-    # 情绪打分只覆盖近 N 天（老新闻不参与研判，无需打分）
-    sentiment_score_days: int = 3
+
+    # ⚠️ **以下两项已废弃**（2026-09-22，随新闻级情绪分一并停用）：
+    # `News.sentiment` 不再产生新值，`assess_info_level` 的信号②b 也已删除
+    # → 这两个字段**已无人读取**。按 R7「既有配置只报告不删」保留，
+    # 这样旧的 .env 里留着它们也不会报错。将来清理时连同 .env / .env.example 一起删。
+    info_sentiment_threshold: float = 0.3  # 【废弃】原 ②b 情绪强度门槛
+    sentiment_score_days: int = 3          # 【废弃】原情绪打分覆盖天数
 
     # ---- 采集调度 ----
     # 新闻采集的**回看天数**：采集器翻页到此天数之前的新闻就停（`news_collector.py`
