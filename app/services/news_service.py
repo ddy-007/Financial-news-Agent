@@ -231,9 +231,16 @@ def collect_and_store_news(db: Session) -> int:
         # P3 源健康巡检。**必须带本轮上下文**（results / classify_failed）——
         # 只看 collector_state 的话，「LLM 故障导致水位线不推进」会被误报成
         # 「源失效」，把排查引向错误方向（见 collector_health 的模块 docstring）。
-        from app.services.collector_health import evaluate, log_health
-        log_health(evaluate(db, results=results,
-                            classify_failed=res.get("classify_failed", 0)))
+        #
+        # ⚠️ 自己接住异常：此刻新闻**已经入库、水位线已经推进**，巡检抛错会让
+        # 整轮对外表现为失败（定时任务记异常、手动端点返 500），与事实不符。
+        # 巡检是观测手段，不该有推翻主流程的权限。
+        try:
+            from app.services.collector_health import evaluate, log_health
+            log_health(evaluate(db, results=results,
+                                classify_failed=res.get("classify_failed", 0)))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[源健康] 巡检失败（不影响本轮采集结果）: {e}")
         return res["new"]
     finally:
         _COLLECT_LOCK.release()

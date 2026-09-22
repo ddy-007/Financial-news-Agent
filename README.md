@@ -104,6 +104,7 @@ curl -X POST http://localhost:8000/api/v1/reports/generate
 | GET | `/api/v1/news` | 新闻列表（可选 `days` / `start`+`end` / `keyword` / `limit`） |
 | GET | `/api/v1/news/dates` | 有新闻的日期清单（含每天条数，供日期筛选用） |
 | POST | `/api/v1/news/collect` | 采集新闻 |
+| GET | `/api/v1/news/sources/health` | **采集源健康**（哪个源多久没成功、连续空轮、是否被截断）|
 | GET | `/api/v1/market` | 行情列表 |
 | POST | `/api/v1/market/collect` | 采集行情 |
 | GET | `/api/v1/sectors` | 板块涨跌排行（可选 `?target_date=YYYY-MM-DD`） |

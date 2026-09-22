@@ -10,7 +10,14 @@
     ② 连续空轮  —— `empty_streak ≥ news_empty_streak_alert`
                    （源**还活着但已经取不到东西**的征兆：改版、参数失效、被限流）
     ③ 被截断    —— `truncated_at` 非空
-                   （更旧的新闻本轮没取到，且**不会自动回补**）
+                   （更旧的新闻没取到，且**不会自动回补**）
+
+⚠️ `truncated_at` 的语义是「**最近一次成功推进水位线的那一轮**是否被截断」，
+**不是「本轮」** —— `save_states` 只在规则 3/4（推进）时更新它，规则 1/2 与
+「成功但 0 条」三个分支都 `continue`，旧值会原样留着。这是**有意**的：
+那三个分支没有提供关于截断的新信息，而「上次成功那轮留下的缺口」在下一轮
+干净地跑完之前**始终存在**，所以继续报它是如实的、不是假告警。
+（设计文档 §11 把它登记为「做 P3 时一并明确语义」—— 就是这里。）
 
 ⚠️ **陈旧告警必须能区分「源的问题」与「上游的问题」** —— 这是本模块设计上最要紧的
 一点。`news_service.save_states` 里 `last_ok_at` **只在规则 3/4（推进水位线）时更新**；
@@ -69,6 +76,9 @@ def _reason_for(source: str, *, results, classify_failed: int) -> str:
         return f"该源本轮采集**不完整**（失败 {r.failed_pages} 页），水位线不推进"
     if not r.items:
         return "该源本轮**成功但 0 条** —— 通常是源改版或参数失效的前兆"
+    if r.truncated:
+        return ("该源**上次成功推进的那一轮**被页上限截断 —— 更旧的新闻没取到、"
+                "且不会自动回补。跑 scripts/catchup.py 可补回约 8~10 小时以内")
     return "该源本轮正常推进了水位线"
 
 
@@ -81,7 +91,9 @@ def evaluate(db: Session, *, results=None, classify_failed: int = 0,
     """
     now = now or datetime.now()
     interval = max(1, settings.news_interval_minutes)
-    stale_after = timedelta(minutes=interval * settings.news_stale_factor)
+    # factor 也兜一下：设成 0 或负数会让所有源**立刻**判 stale（恒真告警）
+    factor = max(1.0, settings.news_stale_factor)
+    stale_after = timedelta(minutes=interval * factor)
 
     out: list[SourceHealth] = []
     for st in db.query(CollectorState).order_by(CollectorState.source).all():

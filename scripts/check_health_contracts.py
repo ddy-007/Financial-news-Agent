@@ -240,12 +240,78 @@ def _summary():
     check("一条源都没有时不打日志（避免空跑噪音）", sink2.lines, [])
 
 
+def _truncated_reason():
+    print("\n[6] 截断的语义与原因文案")
+
+    db = fresh_db()
+    state(db, last_ok_at=NOW, truncated_at=NOW - timedelta(minutes=5))
+    h = evaluate(db, results=[sr(truncated=True)], classify_failed=0, now=NOW)["sources"][0]
+    check("命中截断时原因写明「被页上限截断」", "截断" in h["reason"], True,
+          "否则会落到「本轮正常推进了水位线」，与日志前缀「异常（truncated）」自相矛盾")
+    check("且点明是「上次成功推进的那一轮」，不是本轮",
+          "上次成功推进的那一轮" in h["reason"], True,
+          "save_states 只在推进时更新 truncated_at —— 规则 1/2 与 0 条分支都不碰它，"
+          "旧值会一直留到下一轮干净地跑完")
+
+
+def _factor_guard():
+    print("\n[7] 阈值倍数的兜底")
+
+    db = fresh_db()
+    state(db, last_ok_at=NOW - timedelta(minutes=1))
+    old = settings.news_stale_factor
+    try:
+        settings.news_stale_factor = 0.0
+        with interval(60):
+            r = evaluate(db, now=NOW)
+        check("NEWS_STALE_FACTOR=0 → 阈值仍不低于一个采集间隔",
+              r["stale_after_minutes"] >= 60, True,
+              "否则所有源每轮都判 stale —— 等于把告警彻底关掉")
+    finally:
+        settings.news_stale_factor = old
+
+
+def _never_breaks_collection():
+    print("\n[8] 巡检失败绝不能拖垮采集")
+
+    import app.agent.data_agent as DA
+    import app.services.collector_health as CH
+    import app.services.news_service as NS
+
+    orig = (NS.run_collection, NS.save_states, DA.run_data_agent, CH.evaluate, CH.log_health)
+    try:
+        NS.run_collection = lambda db: ([], [])
+        NS.save_states = lambda *a, **k: None
+        DA.run_data_agent = lambda db, raw=None: {"new": 7, "classify_failed": 0}
+
+        def boom(*a, **k):
+            raise RuntimeError("模拟巡检时数据库出错")
+
+        CH.evaluate = boom
+        CH.log_health = lambda *a, **k: None
+
+        got = None
+        try:
+            got = NS.collect_and_store_news(None)   # 上面全是 stub，db 不会被真正用到
+        except Exception as e:  # noqa: BLE001
+            print(f"        · 巡检异常穿透到了采集流程：{type(e).__name__}: {e}")
+        check("巡检抛错时采集仍返回正常结果", got, 7,
+              "此刻新闻**已经入库、水位线已经推进** —— 巡检是观测手段，"
+              "抛错会让整轮对外表现为失败，与事实不符")
+    finally:
+        (NS.run_collection, NS.save_states, DA.run_data_agent,
+         CH.evaluate, CH.log_health) = orig
+
+
 def main() -> int:
     _judgements()
     _severity()
     _reason()
     _threshold_scaling()
     _summary()
+    _truncated_reason()
+    _factor_guard()
+    _never_breaks_collection()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:
