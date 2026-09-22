@@ -8,7 +8,7 @@
 所以默认不跑，要显式加参数。
 
 **报告怎么补**（`--reports`）：流程已支持 `as_of` 截止时点——
-`generate_daily_report(db, date=X)` 会以 X 日 `REPORT_TIME`（默认 18:00）
+`generate_daily_report(db, date=X)` 会以 X 日 `REPORT_TIME`（默认 18:15）
 为截止取**历史**数据，与当天实时生成的口径一致，两份报告可直接对比。
 
 **只在「当天有新闻 且 有行情」时才补报告**：缺新闻的日子补出来的报告
@@ -128,7 +128,7 @@ def backfill_reports(db, diag: dict) -> dict:
         t = time.time()
         try:
             # 用当天的 REPORT_TIME 作时间戳——与流程内部算出的 as_of 同源，
-            # 改了 REPORT_TIME 也不会出现"标签 18:00、截止却是别的点"
+            # 改了 REPORT_TIME 也不会出现"标签与截止时点对不上"
             rep = generate_daily_report(
                 db, date=_report_time_on(datetime(d.year, d.month, d.day))
             )

@@ -174,8 +174,9 @@ def rebuild_bm25_index(db: Session, days: int = 7) -> None:
 
 # 采集互斥锁（**进程级**）。
 #
-# **为什么需要**：采集有两个触发方 —— APScheduler 的定时 job（每 30 分钟），
-# 以及 `POST /api/v1/news/collect` 的手动端点。定时 job 有 APScheduler 的
+# **为什么需要**：采集有两个触发方 —— APScheduler 的定时 job（间隔见
+# `NEWS_INTERVAL_MINUTES`，2026-09-22 起为 60 分钟整点），以及
+# `POST /api/v1/news/collect` 的手动端点。定时 job 有 APScheduler 的
 # `max_instances=1` 兜着，**手动端点完全没有保护**。
 #
 # 2026-09-22 实机撞上：手动触发的一轮（21:33 起）要跑 45 分钟，而定时的那轮
@@ -219,7 +220,8 @@ def collect_and_store_news(db: Session) -> int:
     if not _COLLECT_LOCK.acquire(blocking=False):
         logger.warning(
             "[采集] 已有一次采集在进行中，本次**跳过**（不排队）。"
-            "定时任务每 30 分钟触发，而一轮可能跑更久，两者会撞上"
+            "定时任务按 NEWS_INTERVAL_MINUTES 触发（默认 60 分钟），"
+            "而一轮可能跑更久，两者会撞上"
         )
         return 0
     try:

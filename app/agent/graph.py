@@ -466,7 +466,7 @@ def get_app():
 
 # ================= 对外入口 =================
 def _report_time_on(day: datetime) -> datetime:
-    """某天的「报告生成时点」——取 config 的 `REPORT_TIME`（默认 18:00）。
+    """某天的「报告生成时点」——取 config 的 `REPORT_TIME`（默认 18:15）。
 
     补跑以这个时点为截止，与当天实时生成的口径一致，两份报告可直接对比。
     """
@@ -478,8 +478,8 @@ def _report_time_on(day: datetime) -> datetime:
         # 放在外面会漏网
         return datetime(day.year, day.month, day.day, hh, mm)
     except (ValueError, AttributeError, TypeError):
-        logger.warning(f"REPORT_TIME 配置不可用（{settings.report_time!r}），按 18:00 处理")
-        return datetime(day.year, day.month, day.day, 18, 0)
+        logger.warning(f"REPORT_TIME 配置不可用（{settings.report_time!r}），按 18:15 处理")
+        return datetime(day.year, day.month, day.day, 18, 15)
 
 
 def generate_daily_report(db: Session, date: datetime | None = None) -> MarketReport:

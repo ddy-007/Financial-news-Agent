@@ -231,7 +231,9 @@ def generate_weekly_report(db: Session,
         "risk_veto": risk_veto,
     }
 
-    report_date = datetime.combine(end.date(), time(23, 59, 59))  # 与日报 18:00 不冲突
+    # 落 23:59:59：日报落在当天 REPORT_TIME（更早），错开时刻以便按 date 区分两份报告。
+    # 这里**不写死具体时刻** —— 日报时间是可配的，写死必然过期。
+    report_date = datetime.combine(end.date(), time(23, 59, 59))
 
     # 同一周已有周报则**覆盖更新**：避免 date 唯一约束冲突，也允许调度器刷新
     existing = (
