@@ -1,6 +1,7 @@
 """FastAPI 入口：注册路由、初始化数据库、启动调度器。"""
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +14,32 @@ from app.api import (
     routes_reports,
     routes_sectors,
 )
+from app.collectors.http_client import close_client
 from app.collectors.scheduler import start_scheduler, stop_scheduler
 from app.db import init_db
+
+# 日志文件 sink 是否已挂。见 `_setup_file_logging` 的说明。
+_LOG_SINK_ADDED = False
+
+
+def _setup_file_logging() -> None:
+    """把日志同时写一份到 `logs/app.log`。**幂等**。
+
+    采集层从 2026-09-22 起把「脏记录」与「截断告警」**只记日志、不建表**
+    （设计 §4.2），所以日志必须落盘 —— 在此之前全项目的 `logger` 只输出到控制台，
+    进程一退就什么都没有。
+
+    ⚠️ **为什么必须幂等**：loguru 的 `logger.add()` 每次调用都**真的新增一个 sink**，
+    不是"有就跳过"。而 lifespan 在 `uvicorn --reload`、多次 startup、测试里会**反复执行**
+    —— 不设防的话同一行日志会被写 N 次，而且很难察觉。
+    """
+    global _LOG_SINK_ADDED
+    if _LOG_SINK_ADDED:
+        return
+    Path("logs").mkdir(exist_ok=True)
+    logger.add("logs/app.log", rotation="10 MB", retention="14 days",
+               encoding="utf-8", enqueue=True)
+    _LOG_SINK_ADDED = True
 
 
 def _warm_up() -> None:
@@ -48,6 +73,7 @@ def _warm_up() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _setup_file_logging()
     init_db()
     logger.info("数据库初始化完成")
     # 后台线程预热：akshare 联网无超时，放启动路径可能拖慢甚至卡住启动
@@ -55,6 +81,7 @@ async def lifespan(app: FastAPI):
     start_scheduler()  # 如需关闭自动定时采集，注释本行
     yield
     stop_scheduler()
+    close_client()  # 关闭采集层共享的 httpx 连接池
 
 
 app = FastAPI(title="金融新闻情报简报 Agent", version="0.1.0", lifespan=lifespan)

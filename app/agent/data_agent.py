@@ -249,7 +249,10 @@ def _dedup_by_url(items: list[NewsItem]) -> list[NewsItem]:
 def run_data_agent(db: Session) -> dict:
     """数据采集 Agent 主流程，返回统计 dict。"""
     # 1. 采集 + 按 url 去重（翻页会产生重复 url）
-    raw = _dedup_by_url(collect_all_news())
+    # collect_all_news 现在按源分组返回（SourceResult），这里取全部条目。
+    # 顺序与改动前一致：仍是 新浪 → 东财 → 财联社 依次拼接。
+    results = collect_all_news()
+    raw = _dedup_by_url([it for r in results for it in r.items])
     # 2. 相关性过滤
     classified = classify_news(raw)
     relevant = [c for c in classified if c["relevant"]]

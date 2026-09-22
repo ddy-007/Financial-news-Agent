@@ -47,10 +47,14 @@ def check_models():
 def check_news():
     from app.collectors.news_collector import collect_all_news
 
-    items = collect_all_news()
-    print(f"  采集到 {len(items)} 条新闻")
+    results = collect_all_news()
+    items = [it for r in results for it in r.items]
+    print(f"  采集到 {len(items)} 条新闻（按源）")
+    for r in results:
+        flag = "" if r.ok else "  ❌ 采集失败"
+        print(f"    - {r.source}: {len(r.items)} 条{flag}")
     for i in items[:3]:
-        print(f"    - [{i.source}] {i.title[:50]}")
+        print(f"        {i.title[:50]}")
 
 
 def check_market():
