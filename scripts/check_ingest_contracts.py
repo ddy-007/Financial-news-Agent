@@ -364,7 +364,35 @@ def _merge_and_insert():
                                  ("财联社", "https://c/9")])
     n = DA._insert_new(db2, cand, {"category": "综合", "market": "无", "themes": []})
     db2.commit()
-    check("多源候选插入后 source_count = 带 url 的来源数", n.source_count, 3)
+    check("3 个源各 1 个 url → source_count = 3", n.source_count, 3)
+
+    # ---- source_count 数**去重源数**，不是 (源, url) 对数（2026-09-22 用户拍板） ----
+    db3 = fresh_db()
+    same_src = DA.Candidate(
+        item=item("同源双链", "正文", source="新浪财经", url="https://a/1"),
+        sources=[("新浪财经", "https://a/1"), ("新浪财经", "https://a/2")])
+    n3 = DA._insert_new(db3, same_src, {"category": "综合", "market": "无", "themes": []})
+    db3.commit()
+    check("同一源的 2 个 url → source_count = 1（不是 2）", n3.source_count, 1,
+          "实测库里有 332 行标着「2源」其实只有 1 个源 —— 会虚高触发 info_level 信号②，"
+          "并在专家 prompt 里显示成失真的「（2源）」")
+
+    db4 = fresh_db()
+    mixed = DA.Candidate(
+        item=item("混合", "正文", source="新浪财经", url="https://a/3"),
+        sources=[("新浪财经", "https://a/3"), ("新浪财经", "https://a/4"),
+                 ("东方财富", "https://b/3")])
+    n4 = DA._insert_new(db4, mixed, {"category": "综合", "market": "无", "themes": []})
+    db4.commit()
+    check("2 个源、3 个 url → source_count = 2", n4.source_count, 2)
+
+    db5 = fresh_db()
+    row = add_news(db5, "T", "正文", source="新浪财经", url="https://a/1")
+    DA._merge_into(db5, row, DA.Candidate(
+        item=item("T", "更长的正文" + "啊" * 50, source="新浪财经", url="https://a/9"),
+        sources=[("新浪财经", "https://a/9")]))
+    check("合并「同源的另一个 url」→ source_count 仍是 1", row.source_count, 1,
+          "_merge_into 与 _insert_new 必须用同一个口径，否则同一个概念两个算法")
 
 
 # ============ ④ 主流程顺序 ============

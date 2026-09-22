@@ -266,6 +266,19 @@ def _group_by_fingerprint(items: list[NewsItem]) -> list[Candidate]:
     return list(groups.values())
 
 
+def _distinct_sources(pairs) -> int:
+    """`source_count` = **去重后的源数**（不是「(源, url) 对数」）。
+
+    2026-09-22 修正（用户拍板）：原先数的是「来源对」，于是一篇稿子在同一家
+    挂了两个 url 就变成「2源」。**实测库里有 332 行标着「2源」其实只有 1 个源** ——
+    而 `source_count` 会喂给 `assess_info_level` 的信号②（门槛 ≥2），
+    并在专家 prompt 里显示成「（N源）」，虚高会同时误导这两处。
+    字段名与 `AGENTS_DESIGN.md` §2.6（「几个源报道」）本来指的就是源数，
+    这里让实现向文档靠拢。
+    """
+    return len({s for s, _ in pairs if s}) or 1
+
+
 def _dedup_sources(sources: list[tuple[str, str | None]]
                    ) -> list[tuple[str, str | None]]:
     """同一候选内按 (source, url) 去重，保持出现顺序。
@@ -463,7 +476,8 @@ def _merge_into(db: Session, existing: News, cand: Candidate) -> bool:
         [{"source": s, "url": u} for s, u in all_sources if s],
         ensure_ascii=False,
     )
-    existing.source_count = len(all_sources)
+    # ⚠️ 数**去重源数**，不是 len(all_sources)（那是「来源对」数，会虚高）
+    existing.source_count = _distinct_sources(all_sources)
     # 信息更全（正文更长）则更新主内容
     if len(cand.item.content or "") > len(existing.content or ""):
         existing.title = cand.item.title
@@ -487,9 +501,9 @@ def _insert_new(db: Session, cand: Candidate, cls: dict) -> News:
         category=cls["category"],
         market=cls["market"],
         themes=json.dumps(cls["themes"], ensure_ascii=False),
-        # 口径与 _merge_into 一致：只数带 url 的来源对；一个都没有时记 1
-        # （与改动前 `source_count=1` 的默认一致，不凭空抬高源数）。
-        source_count=len(pairs) or 1,
+        # 口径与 _merge_into 一致：**去重后的源数**。代表条目自己的来源也算，
+        # 这样无 url 的单源条目仍然是 1（不凭空抬高）。
+        source_count=_distinct_sources([(item.source, item.url), *pairs]),
         source_urls=json.dumps(
             [{"source": src, "url": u} for src, u in pairs], ensure_ascii=False
         ),

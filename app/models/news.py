@@ -26,7 +26,9 @@ class News(Base):
     category: Mapped[str | None] = mapped_column(String(50), index=True, nullable=True)
     market: Mapped[str | None] = mapped_column(String(20), index=True, nullable=True)
     themes: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON 数组
-    # 多源佐证（仅展示，不参与加权）
+    # 多源佐证（专家研判不据此加权，但 `assess_info_level` 的信号②用它）。
+    # ⚠️ 口径 = **去重后的源数**（不是「(源, url) 对数」）—— 2026-09-22 修正：
+    # 原先数来源对，导致同一家挂两个 url 就成了「2源」（实测库里 332 行如此）。
     source_count: Mapped[int] = mapped_column(Integer, default=1)
     source_urls: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON
     # 【已废弃】新闻级情绪分：-1(极空) ~ 1(极多)，0 中性。
