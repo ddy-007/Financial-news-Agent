@@ -90,16 +90,20 @@ def report_hhmm() -> set[str]:
 def trigger_gaps(value: int):
     """构造 `value` 对应的新闻触发器并返回间隔集合；**构造本身抛异常则返回 None**。
 
-    必须包 try —— 若守卫失效，`NEWS_INTERVAL_MINUTES=1440` 会让
+    try 只包住**构造**那一小段：测量（`fire_times` / `gaps_minutes`）若抛异常，
+    那是脚本自己的 bug，不该被伪装成"构造失败"。
+
+    必须接住构造异常：若守卫失效，`NEWS_INTERVAL_MINUTES=1440` 会让
     `CronTrigger(hour="*/24")` 抛 `ValueError`。不接住的话脚本当场崩掉，
     后面的 [4]/[5] 一组都跑不到，看到的是一条 traceback 而不是一条 FAIL。
     """
-    try:
-        with interval(value):
-            return gaps_minutes(fire_times(S._news_trigger()))
-    except Exception as e:  # noqa: BLE001
-        print(f"        · 构造 {value} 的触发器时抛 {type(e).__name__}: {e}")
-        return None
+    with interval(value):
+        try:
+            trig = S._news_trigger()
+        except Exception as e:  # noqa: BLE001
+            print(f"        · 构造 {value} 的触发器时抛 {type(e).__name__}: {e}")
+            return None
+    return gaps_minutes(fire_times(trig))
 
 
 class interval:
@@ -132,7 +136,20 @@ def main() -> int:
         not hit,
         f"撞上 {hit}",
     )
-    check("触发次数符合预期（7 天 × 每天 24 次）", len(fires) == 7 * 24, f"实际 {len(fires)}")
+    # 节奏必须等于**配置的间隔**。真值取 `_interval_ok` 判定后的结果 ——
+    # 不能写死 24 次/天（那是 60 分钟的数，换个间隔这条就误报），
+    # 也不能直接信 `settings` 里的值（非法值会被回退成 60，得跟着回退）。
+    effective = (
+        settings.news_interval_minutes
+        if S._interval_ok(settings.news_interval_minutes)
+        else 60
+    )
+    g = gaps_minutes(fires)
+    check(
+        f"触发节奏恒为 {effective} 分钟（配置 {settings.news_interval_minutes}）",
+        g == {float(effective)},
+        f"实测 {sorted(g)}",
+    )
 
     # ---- ② 合法间隔：节奏必须恒定 ----
     print("\n[2] 合法间隔的节奏（必须恒定，不能时快时慢）")
@@ -140,7 +157,7 @@ def main() -> int:
         g = trigger_gaps(v)
         check(
             f"NEWS_INTERVAL_MINUTES={v} → 间隔恒为 {v} 分钟"
-            f"（实测 {sorted(g) if g else '构造失败'}）",
+            f"（实测 {sorted(g) if g is not None else '构造失败'}）",
             g == {float(v)},
         )
 
@@ -151,11 +168,11 @@ def main() -> int:
     # 1440 更狠：`hour="*/24"` 直接抛 ValueError，会把后端启动掀翻。
     # 这三个值必须被这条断言挡在"合法"之外。
     print("\n[3] 非法间隔的回退（含 300/420/1440 —— 60 的倍数但铺不满一天）")
-    for v in (45, 90, 300, 420, 1440, 0, -5, 7):
+    for v in (45, 90, 300, 420, 1440, 0, -5, 7, 1, 2, 5, 10, 12):
         g = trigger_gaps(v)
         check(
             f"NEWS_INTERVAL_MINUTES={v} → 回退为 60 分钟整点"
-            f"（实测 {sorted(g) if g else '构造失败'}）",
+            f"（实测 {sorted(g) if g is not None else '构造失败'}）",
             g == {60.0},
         )
 
@@ -182,6 +199,9 @@ def main() -> int:
     # 运行，`news_collect` 会立即触发去连库、抓取、调 LLM —— 一个检查脚本
     # 不该有这个副作用。装配动作（add_job）照跑，那才是要验的东西。
     print("\n[5] 调度器装配")
+    # 若调度器已在运行，`start_scheduler()` 会提前 return、news_collect 根本不会
+    # 被注册，下面两条就会**误报** FAIL。先把这个前提本身说清楚。
+    check("装配检查的前提：调度器未处于运行态", not S.scheduler.running)
     real_start = S.scheduler.start
     S.scheduler.start = lambda *a, **k: None  # 拦住真正的 start()
     try:
