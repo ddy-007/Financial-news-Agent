@@ -49,10 +49,10 @@ class SourceResult:
     """
     source: str
     items: list[NewsItem]
-    rejected: list[RejectedItem]   # P0 恒为空，P1 起填充
-    ok: bool                       # 该源本轮是否成功（fetch 未抛异常）
-    failed_pages: int = 0          # P0 恒为 0，P1 起填充
-    truncated: bool = False        # P0 恒为 False，P1 起填充
+    rejected: list[RejectedItem]   # 边界校验不合格的条目（只用于记日志）
+    ok: bool                       # **本轮是否完整取到**：无失败页才算 True（见 fetch 内注释）
+    failed_pages: int = 0          # 本轮失败的页数（逐页容错，已得的页保留）
+    truncated: bool = False        # 是否撞页上限（true 时更旧的新闻本轮没取到）
 
 
 def _ts_to_dt(ts) -> datetime | None:
@@ -85,11 +85,61 @@ def _parse_dt(v) -> datetime | None:
     return None
 
 
+# 页面型源（新浪）连续失败多少页就放弃本轮。
+#
+# 实测（2026-09-22）：源整体挂掉时，「逐页容错 + 继续下一页」会让 20 页各重试 3 次
+# = **57 次请求 / 55 秒**，纯属白跑。3 页足够区分「偶发单页抖动」（重试后多半就成功了）
+# 与「源整体不可用」。
+MAX_CONSECUTIVE_PAGE_FAILS = 3
+
+
+def _validate(source: str, item: NewsItem, payload: dict) -> RejectedItem | None:
+    """边界校验。合格返回 None，不合格返回 `RejectedItem`（**不进 items，只记日志**）。
+
+    三条规则（设计 §9.4）：
+
+    1. `title` 去空白后**非空** —— 空标题会一路进 LLM 分类 prompt，是纯噪音；
+    2. `publish_time` **可解析** —— 不可解析时**不回退为 `now()`**。
+       回退看似"更宽容"，实则会把一条来历不明的时间当成真实发布时间写进库，
+       再被水位线、时效判断当成事实依据 —— 错得比丢弃更隐蔽；
+    3. `url` 去空白，空串归一为 `None`（下游 `_item_to_news` 靠 None 避开唯一约束冲突）。
+    """
+    if not (item.title or "").strip():
+        return RejectedItem(source=source, reason="empty_title", payload=payload,
+                            title=item.title, url=item.url)
+    if item.publish_time is None:
+        return RejectedItem(source=source, reason="bad_publish_time", payload=payload,
+                            title=item.title, url=item.url)
+    item.title = item.title.strip()
+    if item.url is not None and not item.url.strip():
+        item.url = None
+    return None
+
+
+def _log_rejected(r: RejectedItem) -> None:
+    """脏记录落点：**一行一条 WARNING，不建表**（设计 §4.2 / R-2）。
+
+    只记 title / url / reason 与原始记录摘要 —— 原始 payload 通常含完整的
+    `title/content/brief`，全量打出来会把日志淹掉，摘 120 字足够定位。
+    """
+    logger.warning(
+        f"[{r.source}] 丢弃记录 reason={r.reason} "
+        f"title={str(r.title)[:40]!r} url={r.url!r} "
+        f"payload={str(r.payload)[:120]}"
+    )
+
+
 class BaseCollector(ABC):
     source_name: str = ""
 
     @abstractmethod
-    def fetch(self, client: httpx.Client | None = None) -> list[NewsItem]:
+    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
+        """采集本源的条目。
+
+        **返回 `SourceResult` 而不是裸列表**（2026-09-22 P1 起）：调用方需要知道
+        「这个源成功了吗 / 失败了几页 / 有没有撞页上限 / 丢了哪些脏记录」——
+        裸列表这些都无从表达，源级信息会在 `collect_all_news` 处被抹平。
+        """
         ...
 
     @with_retry(retry_times=3, retry_label="新闻接口")
@@ -112,76 +162,169 @@ class SinaCollector(BaseCollector):
     API = ("https://zhibo.sina.com.cn/api/zhibo/feed"
            "?page={page}&page_size=50&zhibo_id=152&tag_id=0")
 
-    def fetch(self, client: httpx.Client | None = None) -> list[NewsItem]:
+    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
         from app.config import settings
 
         cutoff = datetime.now() - timedelta(days=settings.news_lookback_days)
-        items = []
-        for page in range(1, 21):  # 最多翻 20 页
-            data = self._get_json(self.API.format(page=page), client=client)
+        max_pages = max(1, int(settings.news_max_pages))
+        items: list[NewsItem] = []
+        rejected: list[RejectedItem] = []
+        seen: set[str] = set()
+        failed_pages = 0
+        truncated = False
+        consecutive_fails = 0
+
+        for page in range(1, max_pages + 1):
+            try:
+                data = self._get_json(self.API.format(page=page), client=client)
+            except Exception as e:  # noqa: BLE001
+                # 逐页容错：本页失败**不丢已得的页**，继续下一页（设计 §9.2）
+                failed_pages += 1
+                consecutive_fails += 1
+                logger.warning(f"[{self.source_name}] 第 {page} 页失败，跳过：{e}")
+                if consecutive_fails >= MAX_CONSECUTIVE_PAGE_FAILS:
+                    logger.error(
+                        f"[{self.source_name}] 连续 {consecutive_fails} 页失败，"
+                        f"判定本源整体不可用，提前停止（已得的 {len(items)} 条保留）"
+                    )
+                    break
+                continue
+            consecutive_fails = 0
+
             feed = (data.get("result") or {}).get("data") or {}
             lst = (feed.get("feed") or {}).get("list") or []
-            if not lst:
+            if not lst:                          # guard ① 空页 → 正常结束
                 break
+
             for row in lst:
                 rich = row.get("rich_text") or ""
                 title = rich
                 m = re.match(r"【(.+?)】", rich)  # 【标题】正文 格式
                 if m:
                     title = m.group(1)
-                items.append(NewsItem(
+                # 新浪无稳定 id 字段，用 docurl 作键；没有 docurl 时退化为「时间+正文前缀」。
+                key = str(row.get("docurl") or "") or f"{row.get('create_time')}|{rich[:60]}"
+                if key in seen:                  # guard ② 稳定 id 去重
+                    continue
+                seen.add(key)
+                item = NewsItem(
                     title=title,
                     content=rich,
                     source=self.source_name,
                     url=row.get("docurl"),
                     publish_time=_parse_dt(row.get("create_time")),
                     category="快讯",
-                ))
+                )
+                bad = _validate(self.source_name, item, row)
+                if bad:
+                    rejected.append(bad)
+                else:
+                    items.append(item)
+
             last_dt = _parse_dt(lst[-1].get("create_time"))
             if last_dt and last_dt < cutoff:
                 break
-        logger.info(f"[{self.source_name}] 采集 {len(items)} 条")
-        return items
+            if page == max_pages:                # guard ④ 跑满上限 → 截断（不抛错）
+                truncated = True
+
+        for r in rejected:
+            _log_rejected(r)
+        # ok 的判据是「**没有任何一页失败**」，不是"跑完了就算成功"：
+        # 页是新→旧顺序的，中间某页失败会在水位线里留一个**中段空洞**，
+        # 而水印一旦推进，下一轮只会取最新那一段 —— 空洞永不回补。
+        ok = failed_pages == 0
+        logger.info(f"[{self.source_name}] 采集 {len(items)} 条"
+                    f"{f'（失败 {failed_pages} 页）' if failed_pages else ''}"
+                    f"{'（⚠️ 触页上限，已截断）' if truncated else ''}")
+        return SourceResult(source=self.source_name, items=items, rejected=rejected,
+                            ok=ok, failed_pages=failed_pages, truncated=truncated)
 
 
 class EastmoneyCollector(BaseCollector):
     source_name = "东方财富"
     COLUMN = 102  # 全球财经快讯栏目
 
-    def fetch(self, client: httpx.Client | None = None) -> list[NewsItem]:
+    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
         from app.config import settings
 
         cutoff = datetime.now() - timedelta(days=settings.news_lookback_days)
-        items = []
+        max_pages = max(1, int(settings.news_max_pages))
+        items: list[NewsItem] = []
+        rejected: list[RejectedItem] = []
+        seen: set[str] = set()
+        failed_pages = 0
+        truncated = False
         sort_end = ""
-        for _ in range(20):  # 最多翻 20 页
+
+        for page in range(1, max_pages + 1):
             ts = int(time.time() * 1000)
             url = (
                 "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
                 f"?client=web&biz=web_724&fastColumn={self.COLUMN}"
                 f"&sortEnd={sort_end}&pageSize=50&req_trace={ts}"
             )
-            data = self._get_json(url, client=client)
+            try:
+                data = self._get_json(url, client=client)
+            except Exception as e:  # noqa: BLE001
+                # ⚠️ 游标型分页**不能**「继续下一页」：本页失败 ⇒ 游标没推进，
+                # 下一次请求会拿**同一个游标**再打一遍 —— 那不是翻页，是空转。
+                # （设计 §9.2 的「继续下一页」只对页面型（新浪 `page=N`）成立，
+                #  2026-09-22 实测发现并写回文档。）
+                failed_pages += 1
+                logger.warning(
+                    f"[{self.source_name}] 第 {page} 页失败：{e}；"
+                    f"游标型分页跳不过本页（游标未推进），在此停止"
+                    f"（已得的 {len(items)} 条保留）"
+                )
+                break
+
             d = data.get("data") or {}
             rows = d.get("fastNewsList") or []
-            if not rows:
+            if not rows:                          # guard ① 空页 → 正常结束
                 break
+
             for row in rows:
                 code = row.get("code")
-                items.append(NewsItem(
+                if code and str(code) in seen:    # guard ② 稳定 id（code）去重
+                    continue
+                if code:
+                    seen.add(str(code))
+                item = NewsItem(
                     title=row.get("title") or row.get("summary") or "",
                     content=row.get("summary") or "",
                     source=self.source_name,
                     url=f"https://finance.eastmoney.com/a/{code}.html" if code else None,
                     publish_time=_parse_dt(row.get("showTime")),
                     category="财经",
-                ))
-            sort_end = d.get("sortEnd") or ""
+                )
+                bad = _validate(self.source_name, item, row)
+                if bad:
+                    rejected.append(bad)
+                else:
+                    items.append(item)
+
+            new_cursor = d.get("sortEnd") or ""
+            if new_cursor == sort_end:            # guard ③ 游标没前进 → 再翻也是同一批
+                logger.warning(f"[{self.source_name}] 游标未前进（{sort_end!r}），"
+                               f"第 {page} 页后停止翻页")
+                break
+            sort_end = new_cursor
+
             last_dt = _parse_dt(rows[-1].get("showTime"))
             if last_dt and last_dt < cutoff:
                 break
-        logger.info(f"[{self.source_name}] 采集 {len(items)} 条")
-        return items
+            if page == max_pages:                 # guard ④ 跑满上限 → 截断（不抛错）
+                truncated = True
+
+        for r in rejected:
+            _log_rejected(r)
+        # 同新浪：任何一页失败 → ok=False（中间空洞不可回补，见 SinaCollector.fetch）
+        ok = failed_pages == 0
+        logger.info(f"[{self.source_name}] 采集 {len(items)} 条"
+                    f"{f'（失败 {failed_pages} 页）' if failed_pages else ''}"
+                    f"{'（⚠️ 触页上限，已截断）' if truncated else ''}")
+        return SourceResult(source=self.source_name, items=items, rejected=rejected,
+                            ok=ok, failed_pages=failed_pages, truncated=truncated)
 
 
 class ClsCollector(BaseCollector):
@@ -201,38 +344,83 @@ class ClsCollector(BaseCollector):
         sha1 = hashlib.sha1(query.encode()).hexdigest()
         return hashlib.md5(sha1.encode()).hexdigest()
 
-    def fetch(self, client: httpx.Client | None = None) -> list[NewsItem]:
+    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
         from app.config import settings
 
         cutoff = datetime.now() - timedelta(days=settings.news_lookback_days)
-        items = []
+        max_pages = max(1, int(settings.news_max_pages))
+        items: list[NewsItem] = []
+        rejected: list[RejectedItem] = []
+        seen: set[str] = set()
+        failed_pages = 0
+        truncated = False
         last_time = 0
-        for _ in range(20):  # 最多翻 20 页
+
+        for page in range(1, max_pages + 1):
             params = {
                 "app": "CailianpressWeb", "os": "web", "sv": "8.7.9",
                 "name": "telegraph", "refresh_type": "1", "rn": "20",
                 "last_time": str(last_time),
             }
             params["sign"] = self._sign(params)
-            data = self._get_json(self.BASE, client=client, params=params)
-            rows = (data.get("data") or {}).get("roll_data") or []
-            if not rows:
+            try:
+                data = self._get_json(self.BASE, client=client, params=params)
+            except Exception as e:  # noqa: BLE001
+                # 同东财：游标型分页跳不过失败页（游标未推进），在此停止。
+                failed_pages += 1
+                logger.warning(
+                    f"[{self.source_name}] 第 {page} 页失败：{e}；"
+                    f"游标型分页跳不过本页（游标未推进），在此停止"
+                    f"（已得的 {len(items)} 条保留）"
+                )
                 break
+
+            rows = (data.get("data") or {}).get("roll_data") or []
+            if not rows:                          # guard ① 空页 → 正常结束
+                break
+
             for row in rows:
-                items.append(NewsItem(
+                rid = row.get("id")
+                if rid is not None and str(rid) in seen:   # guard ② 稳定 id（id）去重
+                    continue
+                if rid is not None:
+                    seen.add(str(rid))
+                item = NewsItem(
                     title=row.get("title") or row.get("brief") or "",
                     content=row.get("brief") or row.get("content") or "",
                     source=self.source_name,
-                    url=f"https://www.cls.cn/detail/{row.get('id')}" if row.get("id") else None,
+                    url=f"https://www.cls.cn/detail/{rid}" if rid else None,
                     publish_time=_ts_to_dt(row.get("ctime")),
                     category="快讯",
-                ))
-            last_time = rows[-1].get("ctime") or 0
+                )
+                bad = _validate(self.source_name, item, row)
+                if bad:
+                    rejected.append(bad)
+                else:
+                    items.append(item)
+
+            new_last = rows[-1].get("ctime") or 0
+            if new_last == last_time:             # guard ③ 游标没前进 → 再翻也是同一批
+                logger.warning(f"[{self.source_name}] 游标未前进（{last_time}），"
+                               f"第 {page} 页后停止翻页")
+                break
+            last_time = new_last
+
             last_dt = _ts_to_dt(last_time)
             if last_dt and last_dt < cutoff:
                 break
-        logger.info(f"[{self.source_name}] 采集 {len(items)} 条")
-        return items
+            if page == max_pages:                 # guard ④ 跑满上限 → 截断（不抛错）
+                truncated = True
+
+        for r in rejected:
+            _log_rejected(r)
+        # 同新浪：任何一页失败 → ok=False（中间空洞不可回补，见 SinaCollector.fetch）
+        ok = failed_pages == 0
+        logger.info(f"[{self.source_name}] 采集 {len(items)} 条"
+                    f"{f'（失败 {failed_pages} 页）' if failed_pages else ''}"
+                    f"{'（⚠️ 触页上限，已截断）' if truncated else ''}")
+        return SourceResult(source=self.source_name, items=items, rejected=rejected,
+                            ok=ok, failed_pages=failed_pages, truncated=truncated)
 
 
 _COLLECTORS: list[BaseCollector] = [
@@ -256,10 +444,10 @@ def collect_all_news() -> list[SourceResult]:
     results: list[SourceResult] = []
     for col in _COLLECTORS:
         try:
-            items = col.fetch()
-            results.append(SourceResult(source=col.source_name, items=items,
-                                        rejected=[], ok=True))
+            results.append(col.fetch())
         except Exception as e:  # noqa: BLE001
+            # P1 起 fetch 内部已逐页容错，能走到这里的都是**帧级**异常
+            # （比如解析逻辑本身出错）。仍然不让它拖垮其他源。
             logger.warning(f"[{col.source_name}] 采集失败: {e}")
             results.append(SourceResult(source=col.source_name, items=[],
                                         rejected=[], ok=False))

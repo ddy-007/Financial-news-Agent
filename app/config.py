@@ -127,6 +127,13 @@ class Settings(BaseSettings):
     # 研判时喂给分析师的新闻窗口是另一回事（`graph.py` 里写死的近 1 天），
     # 与这里无关。默认值与 `.env.example`、`EXPERTS_DESIGN.md`（「近 1 天」）保持一致。
     news_lookback_days: int = 1
+
+    # 单源单轮最多翻多少页（2026-09-22 新增，原为写死的 20）。
+    # 它是**防死循环的上限**，不是正常结束条件 —— 撞到它说明该源有积压，
+    # 采集层会置 `SourceResult.truncated=True` 并记告警（见设计 §9.1-④）。
+    # 注意各源每页条数不同（新浪/东财 50、财联社 20），所以同一个数字对应的容量不同。
+    news_max_pages: int = 20
+
     market_collect_time: str = "17:30"
     sector_collect_time: str = "17:40"   # 板块数据（在行情之后）
     report_time: str = "18:00"
