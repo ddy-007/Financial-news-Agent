@@ -162,9 +162,21 @@ def main() -> int:
         _sep("第三步：补新闻（去重 + 分类 + 情绪打分前置，幂等）")
         print("  [!] 这一步要调 LLM，通常 10~20 分钟（取决于新闻量）", flush=True)
         t = time.time()
-        from app.services.news_service import collect_and_store_news
+        # ⚠️ **刻意不走 `collect_and_store_news`**（2026-09-22 修正）：
+        # 那是**增量**入口，cutoff = 该源水位线 − 30 分钟。而 catchup 的用途恰恰是
+        # **回补历史缺口**（比如某轮撞页上限被截断掉的那一段）—— 走增量只能取到
+        # 最近 30 分钟，**什么也补不回来**，等于这一步白跑。
+        #
+        # 这里让 `run_data_agent` 自采（`raw=None` → 按 `news_lookback_days` 全量抓）。
+        # 它**不碰水位线**，这正是 catchup 该有的行为：只补数据，不改"我采到哪了"。
+        # 下一轮增量照旧从旧水印往回重叠一点抓，不会因此漏掉东西。
+        from app.agent.data_agent import run_data_agent
 
-        n_news = collect_and_store_news(db)
+        res = run_data_agent(db)
+        n_news = res["new"]
+        if res.get("classify_failed"):
+            print(f"  [!] 本轮有 {res['classify_failed']} 条未分类（LLM 失败），"
+                  f"未入库；可稍后重跑本脚本", flush=True)
         print(f"  新增 {n_news} 条，耗时 {time.time() - t:.1f}s", flush=True)
 
         _sep("第四步：跑完之后的现状")

@@ -54,7 +54,11 @@ def _cutoff(anchor: Anchor | None) -> datetime:
     from app.config import settings
 
     if anchor is not None and anchor.last_ts is not None:
-        return anchor.last_ts - timedelta(minutes=settings.news_overlap_minutes)
+        # 兜底：`_validate` 已经拒收未来时间，正常不会出现 last_ts > now；
+        # 但历史脏数据可能已经写进水位线了 —— 取 min 防止它把 cutoff 推到未来
+        # （那会让每轮只抓 1 页，且水位线被钉死）。
+        base = min(anchor.last_ts, datetime.now())
+        return base - timedelta(minutes=settings.news_overlap_minutes)
     return datetime.now() - timedelta(days=settings.news_lookback_days)
 
 
@@ -131,7 +135,13 @@ def _validate(source: str, item: NewsItem, payload: dict) -> RejectedItem | None
     2. `publish_time` **可解析** —— 不可解析时**不回退为 `now()`**。
        回退看似"更宽容"，实则会把一条来历不明的时间当成真实发布时间写进库，
        再被水位线、时效判断当成事实依据 —— 错得比丢弃更隐蔽；
-    3. `url` 去空白，空串归一为 `None`（下游 `_item_to_news` 靠 None 避开唯一约束冲突）。
+    3. `url` 去空白，空串归一为 `None`（下游 `_item_to_news` 靠 None 避开唯一约束冲突）；
+    4. `publish_time` **不得明显来自未来** —— 源站偶有时间戳异常（如误写 2030 年）。
+       放它进去会把水位线推到未来：之后每轮第 1 页就满足 `cutoff`，**每轮只抓 1 页**，
+       而且水位线被钉死在那个未来值上，再也回不来。
+
+    未来容差取 **1 天**：足够宽松（源站与本地时钟差几分钟很正常，不会误伤），
+    又能挡住明显异常。
     """
     if not (item.title or "").strip():
         return RejectedItem(source=source, reason="empty_title", payload=payload,
@@ -139,6 +149,10 @@ def _validate(source: str, item: NewsItem, payload: dict) -> RejectedItem | None
     if item.publish_time is None:
         return RejectedItem(source=source, reason="bad_publish_time", payload=payload,
                             title=item.title, url=item.url)
+    if item.publish_time > datetime.now() + timedelta(days=1):
+        return RejectedItem(source=source, reason="future_publish_time", payload=payload,
+                            title=item.title, url=item.url,
+                            publish_time=item.publish_time)
     item.title = item.title.strip()
     if item.url is not None and not item.url.strip():
         item.url = None

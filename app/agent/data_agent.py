@@ -112,21 +112,37 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
         try:
             data = call_with_retry(_classify, prompt, retry_label="新闻分类",
                                    retry_times=llm_retry_times(part="news"))
+            # 先攒在 batch_ok 里，成功走完才并入 results ——
+            # 否则「循环中途抛异常」时，已 append 进 results 的条目会在 except 里
+            # 被整批再算一次 failed，同一条既算成功又算失败。
+            batch_ok: list[dict] = []
+            covered: set[int] = set()
             for entry in data:
                 if not isinstance(entry, dict):
                     continue
                 idx = int(entry.get("id", -1)) - 1
                 if 0 <= idx < len(batch):
+                    covered.add(idx)
                     themes = entry.get("themes") or []
                     if isinstance(themes, str):
                         themes = [themes]
-                    results.append({
+                    batch_ok.append({
                         "item": batch[idx],
                         "relevant": bool(entry.get("relevant", False)),
                         "category": _normalize_category(entry.get("category")),
                         "market": _normalize_market(entry.get("market")),
                         "themes": [str(t) for t in themes],
                     })
+            results.extend(batch_ok)
+            # ⚠️ **只堵「整批异常」是不够的**（2026-09-22 巡检发现）：
+            # LLM 完全可能返回一个**合法但条目变少**的列表（漏项、id 越界、id 重复），
+            # 那些没被覆盖到的条目若不在这里交出来，就既不进 results 也不进 failed
+            # → `classify_failed` 仍是 0 → 水位线照常推进 → **永久丢失**。
+            missed = [it for i, it in enumerate(batch) if i not in covered]
+            if missed:
+                failed.extend(missed)
+                logger.warning(f"LLM 分类**漏项** {len(missed)}/{len(batch)} 条"
+                               f"（输出条目不全，非异常）—— 已计入分类失败")
         except Exception as e:  # noqa: BLE001
             # 交出来而不是丢掉 —— 上层要据此拒绝推进水位线（详见函数 docstring）
             failed.extend(batch)
