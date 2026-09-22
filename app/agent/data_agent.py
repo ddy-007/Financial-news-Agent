@@ -76,15 +76,24 @@ def _extract_json(text: str):
 
 
 # ================= 步骤①：LLM 相关性分类 =================
-def classify_news(items: list[NewsItem]) -> list[dict]:
-    """LLM 批量分类。返回 [{item, relevant, category, market, themes}]。"""
+def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
+    """LLM 批量分类。返回 `(成功分类的结果, 失败批次的原始条目)`。
+
+    **第二个返回值是 2026-09-22 加的，它修的是一个会丢数据的洞**：
+    在此之前，某批分类失败后那些条目**既不入库、也不计入 `dropped`** ——
+    日志会显示「丢弃 0」，而实际上整批没了。2026-09-21 实机发生过一次
+    （百炼额度耗尽，一轮 1820 条新闻全部未入库，日志却写「丢弃 0」）。
+
+    交出失败条目之后，上游才能①如实计数、②**拒绝推进水位线**（下一轮重取同一窗口）。
+    """
     if not items:
-        return []
+        return [], []
     llm = get_llm(temperature=0.0, part="news")
     # 逐批打印进度：分类整批可能跑十几分钟，不打日志的话外部完全看不到进展
     total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
     logger.info(f"[分类] 共 {len(items)} 条，分 {total_batches} 批")
     results: list[dict] = []
+    failed: list[NewsItem] = []
     for batch_idx, i in enumerate(range(0, len(items), BATCH_SIZE), start=1):
         logger.info(f"[分类] 第 {batch_idx}/{total_batches} 批")
         batch = items[i:i + BATCH_SIZE]
@@ -119,8 +128,10 @@ def classify_news(items: list[NewsItem]) -> list[dict]:
                         "themes": [str(t) for t in themes],
                     })
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"LLM 分类失败: {e}")
-    return results
+            # 交出来而不是丢掉 —— 上层要据此拒绝推进水位线（详见函数 docstring）
+            failed.extend(batch)
+            logger.warning(f"LLM 分类失败（本批 {len(batch)} 条未分类）: {e}")
+    return results, failed
 
 
 # ================= 步骤②：语义去重 =================
@@ -246,15 +257,21 @@ def _dedup_by_url(items: list[NewsItem]) -> list[NewsItem]:
     return result
 
 
-def run_data_agent(db: Session) -> dict:
-    """数据采集 Agent 主流程，返回统计 dict。"""
-    # 1. 采集 + 按 url 去重（翻页会产生重复 url）
-    # collect_all_news 现在按源分组返回（SourceResult），这里取全部条目。
-    # 顺序与改动前一致：仍是 新浪 → 东财 → 财联社 依次拼接。
-    results = collect_all_news()
-    raw = _dedup_by_url([it for r in results for it in r.items])
+def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
+    """数据采集 Agent 主流程，返回统计 dict。
+
+    `raw` 不为 None 时**不再自行采集**，直接用调用方给的条目 ——
+    2026-09-22 起采集由 `news_service.run_collection` 负责，这样水位线才能
+    「采集 → 分类 → 入库全部成功后才推进」。传 None 时保持旧行为（自采），
+    供 `scripts/` 里的独立脚本使用。
+    """
+    # 1. 采集（或接收调用方已采的数据）+ 按 url 去重（翻页会产生重复 url）
+    if raw is None:
+        # 顺序与改动前一致：仍是 新浪 → 东财 → 财联社 依次拼接
+        raw = [it for r in collect_all_news() for it in r.items]
+    raw = _dedup_by_url(raw)
     # 2. 相关性过滤
-    classified = classify_news(raw)
+    classified, classify_failed = classify_news(raw)
     relevant = [c for c in classified if c["relevant"]]
     dropped = len(classified) - len(relevant)
     # 3. 去重 + 合并 + 入库
@@ -293,12 +310,22 @@ def run_data_agent(db: Session) -> dict:
         "collected": len(raw),
         "classified": len(classified),
         "relevant": len(relevant),
+        # `dropped` **只表示「判为不相关」**，不含分类失败的条目 ——
+        # 后者是 `classify_failed`。两者混在一起过，正是 2026-09-21 那次
+        # 「丢了 1820 条却在日志里显示『丢弃 0』」的成因。
         "dropped": dropped,
+        "classify_failed": len(classify_failed),
         "new": total_new,
         "merged": merged,
     }
     logger.info(
-        f"数据采集Agent: 采集{result['collected']} 相关{result['relevant']} "
-        f"丢弃{dropped} 新增{result['new']} 合并{merged}"
+        f"数据采集Agent: 采集{result['collected']} 分类成功{result['classified']}"
+        f" 相关{result['relevant']} 丢弃{dropped}(判为不相关)"
+        f" 分类失败{result['classify_failed']} 新增{result['new']} 合并{merged}"
     )
+    if result["classify_failed"]:
+        logger.warning(
+            f"⚠️ 本轮有 {result['classify_failed']} 条**未分类**（LLM 分类失败），"
+            f"这批条目未入库；水位线将不推进，下一轮重取同一窗口"
+        )
     return result

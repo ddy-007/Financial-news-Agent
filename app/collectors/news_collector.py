@@ -30,6 +30,35 @@ class NewsItem:
 
 
 @dataclass
+class Anchor:
+    """某源上一轮的水位线（`collector_state` 表的一行）。"""
+    last_ts: datetime | None = None
+    last_id: str | None = None
+
+
+def _cutoff(anchor: Anchor | None) -> datetime:
+    """本轮的停止条件 —— **增量规则唯一的落地处**。
+
+    > 有水位线：`last_ts - news_overlap_minutes`
+    > 无水位线（首次运行 / 水位线丢失）：`now - news_lookback_days`
+
+    两个要点：
+
+    1. **留重叠窗口是故意的**：防「上一轮采集结束」到「这一轮开始」之间因调度抖动、
+       时钟偏差、源站补录而漏掉一小段。冗余一点，代价只是多抓几分钟的量。
+    2. **锚点一律用源站发布时间**，不用本地 `now()` —— 否则源站时间与本地时钟
+       有偏差时，水位线会系统性偏移。
+
+    只写这一处：三个源若各算各的，迟早会漂移成三套规则。
+    """
+    from app.config import settings
+
+    if anchor is not None and anchor.last_ts is not None:
+        return anchor.last_ts - timedelta(minutes=settings.news_overlap_minutes)
+    return datetime.now() - timedelta(days=settings.news_lookback_days)
+
+
+@dataclass
 class RejectedItem:
     """边界校验不合格的记录。**只用于记日志**，不建表（见设计 §4.2）。"""
     source: str
@@ -133,7 +162,8 @@ class BaseCollector(ABC):
     source_name: str = ""
 
     @abstractmethod
-    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
+    def fetch(self, client: httpx.Client | None = None,
+              anchor: Anchor | None = None) -> SourceResult:
         """采集本源的条目。
 
         **返回 `SourceResult` 而不是裸列表**（2026-09-22 P1 起）：调用方需要知道
@@ -162,10 +192,11 @@ class SinaCollector(BaseCollector):
     API = ("https://zhibo.sina.com.cn/api/zhibo/feed"
            "?page={page}&page_size=50&zhibo_id=152&tag_id=0")
 
-    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
+    def fetch(self, client: httpx.Client | None = None,
+              anchor: Anchor | None = None) -> SourceResult:
         from app.config import settings
 
-        cutoff = datetime.now() - timedelta(days=settings.news_lookback_days)
+        cutoff = _cutoff(anchor)
         max_pages = max(1, int(settings.news_max_pages))
         items: list[NewsItem] = []
         rejected: list[RejectedItem] = []
@@ -244,10 +275,11 @@ class EastmoneyCollector(BaseCollector):
     source_name = "东方财富"
     COLUMN = 102  # 全球财经快讯栏目
 
-    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
+    def fetch(self, client: httpx.Client | None = None,
+              anchor: Anchor | None = None) -> SourceResult:
         from app.config import settings
 
-        cutoff = datetime.now() - timedelta(days=settings.news_lookback_days)
+        cutoff = _cutoff(anchor)
         max_pages = max(1, int(settings.news_max_pages))
         items: list[NewsItem] = []
         rejected: list[RejectedItem] = []
@@ -344,10 +376,11 @@ class ClsCollector(BaseCollector):
         sha1 = hashlib.sha1(query.encode()).hexdigest()
         return hashlib.md5(sha1.encode()).hexdigest()
 
-    def fetch(self, client: httpx.Client | None = None) -> SourceResult:
+    def fetch(self, client: httpx.Client | None = None,
+              anchor: Anchor | None = None) -> SourceResult:
         from app.config import settings
 
-        cutoff = datetime.now() - timedelta(days=settings.news_lookback_days)
+        cutoff = _cutoff(anchor)
         max_pages = max(1, int(settings.news_max_pages))
         items: list[NewsItem] = []
         rejected: list[RejectedItem] = []
@@ -430,8 +463,13 @@ _COLLECTORS: list[BaseCollector] = [
 ]
 
 
-def collect_all_news() -> list[SourceResult]:
+def collect_all_news(anchors: dict[str, Anchor] | None = None
+                     ) -> list[SourceResult]:
     """采集全部源，单源异常不影响其他源。
+
+    `anchors`：`{源名: Anchor}`，即各源上一轮的水位线。**为 None 或某源缺锚点时，
+    该源退化为「距现在 `news_lookback_days` 天」** —— 首次运行、水位线丢失、
+    或新增源都会走这条回退路径，所以它必须一直可用。
 
     ⚠️ **返回结构 2026-09-22 变了**：原为 `list[NewsItem]`（三源条目混在一个列表里），
     现按源分组返回 —— 下游要**按源**推进水位线、按源报告失败与截断，
@@ -441,10 +479,11 @@ def collect_all_news() -> list[SourceResult]:
     某个源失败时**仍返回该源的 `SourceResult`**（`ok=False`、`items=[]`），
     而不是把它从列表里省掉 —— 省掉的话下游无法区分「这个源没配」与「这个源本轮挂了」。
     """
+    anchors = anchors or {}
     results: list[SourceResult] = []
     for col in _COLLECTORS:
         try:
-            results.append(col.fetch())
+            results.append(col.fetch(anchor=anchors.get(col.source_name)))
         except Exception as e:  # noqa: BLE001
             # P1 起 fetch 内部已逐页容错，能走到这里的都是**帧级**异常
             # （比如解析逻辑本身出错）。仍然不让它拖垮其他源。
