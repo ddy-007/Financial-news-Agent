@@ -174,8 +174,10 @@ news 新闻表
   url           TEXT UNIQUE  原文链接（去重键）
   publish_time  DATETIME     发布时间
   category      TEXT         分类(宏观/行业/公司/政策/国际)
-  sentiment     FLOAT        情绪分（可选，Agent 或规则打）
-  summary       TEXT         摘要（LLM 生成）
+  sentiment     FLOAT        【已废弃 2026-09-22】新闻级情绪分：-1~1，由 LLM 打分。
+                             **不再产生新值**，字段与历史值保留可回溯。
+                             ⚠️ 与报告级的 `report.sentiment`（偏多/中性/偏空）不是一回事
+  summary       TEXT         【已废弃】当年与情绪分同批产出的「理由」，一并停写
   collected_at  DATETIME     采集时间
 
 market_data 行情表
@@ -207,7 +209,7 @@ report 研判报告表
   expert_opinions TEXT       JSON：5 位专家原始观点
   divergence    FLOAT        专家分歧度 0~2
   risk_veto     BOOLEAN      风险官是否触发置信度降档
-  low_info      BOOLEAN      当日四信号均未触发（市场平静）
+  low_info      BOOLEAN      当日三信号均未触发（市场平静）
   data_stale    BOOLEAN      近期新闻不足、基于陈旧数据生成
   model         TEXT         模型名
   created_at    DATETIME
@@ -227,7 +229,12 @@ report 研判报告表
   - **交易日守卫**：行情采集 / 每日研判 / 周报均先查 A 股交易日历
     （`app/collectors/trading_calendar.py`），非交易日自动跳过；
     新闻采集为 7×24，不受影响。
-- 去重：新闻以 `url` 或 `title+publish_time` 做唯一约束；行情以 `symbol+date` 唯一。
+- 去重：**新闻走三层** —— ①采集层按 `url`（空 url 不参与）②入库层确定性指纹
+  （归一化标题 + 正文前 200 字）③语义近邻 + **24 小时时间窗**；表上另有 `url`
+  唯一约束兜底。**行情**以 `symbol+date` 唯一。
+  ⚠️ 时间窗是 2026-09-22 补的：本系统只有 3 个源，`source_count > 3` 结构上不可能
+  是单一事件，而没有时间窗时「南向资金净买入额达30亿港元」这类跨天重发的行情快照
+  会被合并成一行（实测库里有 416 行 `source_count ≥ 4`，最高 33）。
 - 失败重试：统一由 `app/retry.py` 提供（指数退避，3 次），**覆盖采集与全部 LLM 调用**；
   按 HTTP 状态码/异常类型判定是否值得重试（不匹配错误消息文本）。
 
@@ -525,7 +532,8 @@ python-dotenv
 
 ### Phase 5 —— 打磨（可选）
 1. 预测回测 / 准确率统计。
-2. 情绪打分（可选微调小模型或 LLM 打分）。
+2. ~~情绪打分~~ —— **2026-09-22 已整体删除**（覆盖率实测仅 13.6%、对研判零贡献、
+   且 LLM 给的 −1~1 无 ground truth）。
 3. 多源新闻扩充、异常告警。
 4. 迁移 PostgreSQL、容器化部署（Docker）。
 
@@ -554,7 +562,8 @@ python-dotenv
 | 中文新闻源 | **新浪财经、东方财富、财联社** |
 | 数据库 | **SQLite**（SQLAlchemy，后续可平滑迁移 PostgreSQL） |
 | 嵌入/重排模型 | 本地 **bge-m3**（嵌入，dense+sparse）+ **bge-reranker-v2-m3**（精排） |
-| 情绪打分 + 回测 | **v1 都要做**：新闻 LLM 情绪打分（-1~1）、预测方向回测 |
+| 新闻情绪打分 | **2026-09-22 已删除** —— 覆盖率仅 13.6%、对研判零贡献（专家 prompt 读不到它） |
+| 预测方向回测 | **v1 要做**：`compute_backtest` 用报告级综合分比对次日涨跌 |
 
 ---
 
