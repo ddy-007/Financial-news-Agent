@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.collectors.news_collector import (
     Anchor, NewsItem, SourceResult, collect_all_news,
 )
+from app.config import settings
 from app.models.collector_state import CollectorState
 from app.models.news import News
 from app.rag import vector_store
@@ -102,7 +103,8 @@ def save_states(db: Session, results: list[SourceResult],
             logger.warning(
                 f"[采集] {r.source} 本轮被页上限截断：上一水印 {prev}，"
                 f"本轮取到的最旧一条 {oldest}，区间 [{oldest}, {prev}) 的新闻本轮"
-                f"**未取到且不会自动回补**（源站可回溯页数有限）。如需回补见 catchup.py"
+                f"**未取到**。跑 scripts/catchup.py 可补回约 8~10 小时以内的区段"
+                f"（它同样受 {settings.news_max_pages} 页上限）；更早的那段补不回来"
             )
     db.commit()
 
