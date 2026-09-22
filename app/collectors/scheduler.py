@@ -138,8 +138,9 @@ def _news_trigger() -> CronTrigger:
     n = settings.news_interval_minutes
     if not _interval_ok(n):
         logger.warning(
-            f"NEWS_INTERVAL_MINUTES={n} 不支持 —— 需能整除 60 或为 60 的倍数、"
-            f"且能整除 1440、并且小于 1440（合法值见 _interval_ok 的 docstring）。"
+            f"NEWS_INTERVAL_MINUTES={n} 不支持 —— 需**同时**满足：不小于 15、"
+            f"能整除 60 或为 60 的倍数、能整除 1440、并且小于 1440"
+            f"（合法值清单见 _interval_ok 的 docstring）。"
             f"回退为 60 分钟；否则会漂到报告时刻上与它们撞车"
         )
         n = 60
