@@ -341,6 +341,39 @@ def _classify_fallback():
           (len(ok_res), len(failed)), (0, 3),
           "§17：条目必须交回上层，才谈得上「水位线不推进、下轮重取」")
 
+    # 熔断：LLM 连续失败即中断本轮，**但剩余条目必须一并交出来**
+    # 2026-09-22 实测：连接中断后 0.43 秒刷出 110 条报错、55 批全废。
+    from app.agent.data_agent import BATCH_SIZE, MAX_CONSECUTIVE_BATCH_FAILS
+    n_batches = MAX_CONSECUTIVE_BATCH_FAILS + 2          # 故意多两批，验证"剩下的被中断"
+    big = [NewsItem(title=f"T{i}", source="新浪财经",
+                    publish_time=datetime(2026, 9, 22, 12, 0, 0)) for i in range(BATCH_SIZE * n_batches)]
+    orig_retry = DA.call_with_retry
+    calls: list[int] = []
+    try:
+        DA.get_llm = lambda **kw: None
+
+        def _fail(*a, **kw):
+            calls.append(1)
+            raise RuntimeError("Connection error.")
+        DA.call_with_retry = _fail
+        ok_res, failed = DA.classify_news(big)
+    finally:
+        DA.get_llm, DA.call_with_retry = orig_llm, orig_retry
+
+    # ⚠️ 这两条必须**分开**：只看 `failed` 的条数是测不出熔断的
+    # （跑满全部批次 vs 提前中断，最终 failed 都是全量）。
+    # 「有没有提前中断」只能靠**调用次数**看出来 —— 这是变异测试逼出来的。
+    check("连续失败即熔断：只打了 N 批就停下，没跑满",
+          len(calls), MAX_CONSECUTIVE_BATCH_FAILS,
+          f"共 {n_batches} 批，应在第 {MAX_CONSECUTIVE_BATCH_FAILS} 批后中断"
+          f"（2026-09-22 实测：不熔断时 0.43 秒刷出 110 条报错）")
+    check("熔断时**剩余条目也进 failed**（一条都不能漏）",
+          len(failed), len(big),
+          f"剩下 {n_batches - MAX_CONSECUTIVE_BATCH_FAILS} 批必须一并交出 ——"
+          f"否则 classify_failed 偏小、水位线照常推进、那批新闻永久丢失")
+    check("熔断时没有任何条目被当成分类成功", len(ok_res), 0,
+          "失败就是失败，不能混进 results")
+
 
 # ============ G. 采集互斥 ============
 def _mutex():

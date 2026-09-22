@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timedelta
 
 from loguru import logger
@@ -23,6 +24,16 @@ from app.rag.embeddings import embed_documents, embed_query
 from app.rag.retriever import get_retriever
 
 BATCH_SIZE = 20       # LLM 批量分类每批条数
+
+# 连续多少批分类失败就**熔断**（中断本轮剩余批次）。
+#
+# 连续失败通常意味着 LLM **不可用**（连接断了 / 额度耗尽 / key 失效），
+# 而不是"这一批运气不好"。此时把剩下的批次全打完只是白等 + 把日志刷爆：
+# 2026-09-22 实测连接中断后 **0.43 秒内刷出 110 条报错**，55 批（1120 条）全废。
+#
+# 3 批足够区分「偶发抖动」（重试后多半就成功了）与「整体不可用」。
+# 与采集层的 `MAX_CONSECUTIVE_PAGE_FAILS` 是同一个思路。
+MAX_CONSECUTIVE_BATCH_FAILS = 3
 DUP_THRESHOLD = 0.85  # 相似度 ≥ 此值判为重复
 GRAY_LOW = 0.70       # 相似度在此区间则交 LLM 复核
 BATCH_INDEX_SIZE = 50  # 每处理 N 条 commit+索引一次，使批次内跨源重复可被检出
@@ -94,6 +105,7 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
     logger.info(f"[分类] 共 {len(items)} 条，分 {total_batches} 批")
     results: list[dict] = []
     failed: list[NewsItem] = []
+    consecutive_fails = 0
     for batch_idx, i in enumerate(range(0, len(items), BATCH_SIZE), start=1):
         logger.info(f"[分类] 第 {batch_idx}/{total_batches} 批")
         batch = items[i:i + BATCH_SIZE]
@@ -146,7 +158,27 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
         except Exception as e:  # noqa: BLE001
             # 交出来而不是丢掉 —— 上层要据此拒绝推进水位线（详见函数 docstring）
             failed.extend(batch)
+            consecutive_fails += 1
             logger.warning(f"LLM 分类失败（本批 {len(batch)} 条未分类）: {e}")
+            if consecutive_fails >= MAX_CONSECUTIVE_BATCH_FAILS:
+                # **熔断**：LLM 连续失败通常意味着"不可用"（连接断了 / 额度耗尽 /
+                # key 失效），而不是"这一批运气不好"。此时把剩下的批次全打完，
+                # 只是白等 + 把日志刷爆（2026-09-22 实测：连接中断后 **0.43 秒内
+                # 刷出 110 条报错**，55 批全废）。
+                #
+                # ⚠️ 中断时**必须把剩余条目也交出来** —— 否则它们既不在 results
+                # 也不在 failed，`classify_failed` 会是 0，水位线照常推进，
+                # 那批新闻**永久丢失**。这就又回到了 §17 要堵的那个洞。
+                rest = items[i + BATCH_SIZE:]
+                failed.extend(rest)
+                logger.error(
+                    f"[分类] 连续 {consecutive_fails} 批失败，判定 LLM 不可用 —— "
+                    f"**中断本轮分类**，剩余 {len(rest)} 条一并计入分类失败"
+                    f"（水位线不推进，下轮重取）"
+                )
+                break
+        else:
+            consecutive_fails = 0
     return results, failed
 
 
@@ -291,6 +323,14 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     relevant = [c for c in classified if c["relevant"]]
     dropped = len(classified) - len(relevant)
     # 3. 去重 + 合并 + 入库
+    #
+    # 这一段是整轮里**最安静也最慢**的一步：写库 + 新建新闻的 bge-m3 向量化（CPU）
+    # + ChromaDB upsert + BM25 重建。2026-09-22 实测：分类打完 110 批之后，
+    # 这里又跑了 **约 9 分钟且一行日志都没有** —— 最容易被误判成"卡死了"。
+    # 所以补一对开始/结束日志（含条数与耗时）。
+    logger.info(f"[入库] 开始：{len(relevant)} 条待处理"
+                f"（含 bge-m3 向量化 + 索引，可能耗时数分钟，请勿当作卡死）")
+    _t_ingest = time.time()
     new_news: list[News] = []
     merged = 0
     total_new = 0  # 累计新增（不能用 len(new_news)：分批后会被清空）
@@ -321,6 +361,8 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     if new_news:
         _index_new(new_news)
     _rebuild_bm25(db)
+    logger.info(f"[入库] 完成：新增 {total_new}、合并 {merged}，"
+                f"耗时 {time.time() - _t_ingest:.0f}s")
 
     result = {
         "collected": len(raw),
