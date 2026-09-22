@@ -307,12 +307,48 @@ def _state_rules():
     db.close()
 
 
+# ============ F. 分类失败的兜底链路 ============
+def _classify_fallback():
+    """锁定「解析失败也能切备用」这条不变量。
+
+    **它今天刚被破坏过**：`llm_retry_times()` 把重试降为 1 的前提是
+    「失败时备用会顶上一次机会」。而 JSON 解析失败（`ValueError`）原先不在
+    `_FALLBACK_EXCEPTIONS` 里 → 备用不触发 + 重试又被降成 1 → **合计只有 1 次机会**，
+    比没配备用时的 3 次还少。**启用备用反而降低了这类失败的容错。**
+
+    2026-09-22 实机：一轮 110 批里有一批因此丢掉 20 条（好在 §11 规则 2 让水位线
+    不推进，下轮重取了回来）。
+    """
+    print("\nF. 分类失败的兜底链路")
+    from app.agent.llm import _FALLBACK_EXCEPTIONS
+    check("解析失败（ValueError）会触发切备用",
+          issubclass(ValueError, _FALLBACK_EXCEPTIONS), True,
+          "否则「重试降为 1」的前提不成立 —— 解析失败会零兜底直接放弃整批")
+
+    # 行为验证（不是查源码里有没有某个词）：让 LLM 抛解析异常，看条目去哪了
+    import app.agent.data_agent as DA
+    batch = [NewsItem(title=f"T{i}", source="新浪财经",
+                      publish_time=datetime(2026, 9, 22, 12, i)) for i in range(3)]
+    orig_llm, orig_retry = DA.get_llm, DA.call_with_retry
+    try:
+        DA.get_llm = lambda **kw: None
+        DA.call_with_retry = lambda *a, **kw: (_ for _ in ()).throw(
+            ValueError("LLM 分类输出非数组"))
+        ok_res, failed = DA.classify_news(batch)
+    finally:
+        DA.get_llm, DA.call_with_retry = orig_llm, orig_retry
+    check("解析失败 → 3 条全部进 failed（不静默消失）",
+          (len(ok_res), len(failed)), (0, 3),
+          "§17：条目必须交回上层，才谈得上「水位线不推进、下轮重取」")
+
+
 def main() -> int:
     _guards()
     _page_tolerance()
     _validation()
     _cutoff_contract()
     _state_rules()
+    _classify_fallback()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:
