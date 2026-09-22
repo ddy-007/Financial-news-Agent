@@ -95,11 +95,56 @@ def _parse_hhmm(s: str) -> tuple[int, int]:
     return int(h), int(m)
 
 
+def _interval_ok(n: int) -> bool:
+    """该间隔能否表达成**整点对齐、节奏恒定**的 cron。
+
+    两个条件缺一不可：
+
+    · `n % 60 == 0 or 60 % n == 0` —— 能表达成「每小时内的固定分钟点」
+      （15 / 20 / 30）或「每整数小时」（60 / 120 / 180 …）。
+    · `1440 % n == 0`             —— **一天能被铺满**，末尾不会短一截。
+
+    第二个条件不能省。反例：**300 分钟**看着像"每 5 小时"，但 24 % 5 != 0 ——
+    实测 `CronTrigger(hour="*/5")` 的间隔是 **{240, 300}**：一天最后一段只有 4 小时。
+    那正是这个配置要消除的"漂移"，迟早会漂到报告时刻上。
+
+    `n == 1440`（每天一次）也一并挡下：`hour="*/24"` 会**直接抛 `ValueError`**
+    （步长 24 超出 hour 的 0~23 范围），顺着 `start_scheduler()` 把**后端启动
+    一起掀翻** —— 这比漂移更糟，是启动失败。要"每天一次"请用 720（每 12 小时）。
+    """
+    return n > 0 and (n % 60 == 0 or 60 % n == 0) and 1440 % n == 0 and n < 1440
+
+
+def _news_trigger() -> CronTrigger:
+    """按 `NEWS_INTERVAL_MINUTES` 生成**整点对齐**的新闻采集触发器。
+
+    合法值：`15 / 20 / 30 / 60 / 120 / 180 / 240 / 360 / 480 / 720`（分钟），
+    判据见 `_interval_ok()`。其余值一律**回退为 60 并告警**，绝不静默降级成
+    另一个间隔 —— 那样用户以为设成了 X，实际跑的是 Y。
+
+    为什么必须整点对齐（详见 `app/config.py` 的 `news_interval_minutes`）：
+    四个报告任务挤在 17:30–19:30，新闻轮要跑 4~20 分钟且写未开 WAL 的 SQLite。
+    """
+    n = settings.news_interval_minutes
+    if not _interval_ok(n):
+        logger.warning(
+            f"NEWS_INTERVAL_MINUTES={n} 不支持 —— 需能整除 60 或为 60 的倍数、"
+            f"且能整除 1440、并且小于 1440（合法值见 _interval_ok 的 docstring）。"
+            f"回退为 60 分钟；否则会漂到报告时刻上与它们撞车"
+        )
+        n = 60
+    if n < 60:
+        return CronTrigger(minute=f"*/{n}")
+    if n == 60:
+        return CronTrigger(minute="0")
+    return CronTrigger(hour=f"*/{n // 60}", minute="0")
+
+
 def start_scheduler() -> None:
     if scheduler.running:
         return
-    # 新闻：每 30 分钟增量采集
-    scheduler.add_job(_job_news, CronTrigger(minute="*/30"), id="news_collect")
+    # 新闻：按 NEWS_INTERVAL_MINUTES 增量采集（默认 60 分钟整点）
+    scheduler.add_job(_job_news, _news_trigger(), id="news_collect")
     # 行情：收盘后（工作日）
     h, m = _parse_hhmm(settings.market_collect_time)
     scheduler.add_job(
