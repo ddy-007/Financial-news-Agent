@@ -62,11 +62,20 @@ def page_dashboard():
     # 数据时效：基于陈旧数据时必须明示，不能冒充"今日研判"
     fr = c.get("data_freshness") or {}
     if data.get("data_stale") or fr.get("stale"):
-        cats = "、".join(fr.get("stale_categories") or []) or "部分类目"
-        st.warning(
-            f"⚠️ **数据时效提醒**：{cats} 类近期新闻不足，"
-            f"本报告使用了**截至 {fr.get('stale_data_date') or '更早'}** 的数据（非当日）。"
-        )
+        cats = "、".join(fr.get("stale_categories") or [])
+        if cats:
+            st.warning(
+                f"⚠️ **数据时效提醒**：{cats} 类近期新闻不足，"
+                f"本报告使用了**截至 {fr.get('stale_data_date') or '更早'}** 的数据（非当日）。"
+            )
+        else:
+            # H2（2026-09-23）：当日 0 条也会让 stale 为真，此时既没有「哪些类目不足」
+            # 也没有「截至哪天」—— 直接说 0 条，别拼出「部分类目」这种话。
+            st.warning(
+                f"⚠️ **数据时效提醒**：**当日（{fr.get('today')}）新闻 0 条**。"
+                "快讯是 7×24 的，这通常不是「今天没消息」，而是**当日的新闻没有进来**。"
+                "本次研判使用的是更早的新闻，请勿把「未出现」读成「未发生」。"
+            )
 
     # 运行环境降级：交易日历失效时会按"工作日"猜测，节假日可能被误判
     env = c.get("env") or {}

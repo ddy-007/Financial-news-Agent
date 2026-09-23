@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import operator
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -208,9 +208,17 @@ def prepare_node(state: AnalystState) -> dict:
         # 原判据只看「近 1 天有没有新闻」→ 当天 0 条也判「新鲜」。
         # 详见 `classify_freshness` 的 docstring。
         _today = as_of.date() if as_of else date.today()
-        today_count = sum(
-            1 for n in used if n.publish_time and n.publish_time.date() == _today
+        # ⚠️ **按全表 count，不用 `used`** —— `used` 受每类目 limit 约束
+        # （上限 8+8+8+10 = 34），当日新闻若集中在单一类目会被截断，
+        # 于是「当天明明有 100 条」也会因为只看见 10 条而误报 warn。
+        # 口径与 `assess_info_level` 的信号①同源（都是按日期的全表 count）。
+        _q_today = db.query(News).filter(
+            News.publish_time >= datetime.combine(_today, time.min),
+            News.publish_time <= datetime.combine(_today, time.max),
         )
+        if as_of is not None:
+            _q_today = _q_today.filter(News.publish_time <= as_of)
+        today_count = _q_today.count()
         # ---- H1（2026-09-23）：采集轮是否还在跑 ----
         # 两者时间相近时，本轮日报**拿不到这一轮的新闻**（09-23 实测缺口 6 分 9 秒，
         # 日报据此写出「今日无重大消息」）。这里如实记录，让下游能区分

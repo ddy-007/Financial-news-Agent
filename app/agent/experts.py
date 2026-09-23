@@ -498,13 +498,26 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
     # 数据陈旧：不得把旧闻表述为"今日"消息
     fr = quant.get("data_freshness") or {}
     if fr.get("stale"):
-        cats = "、".join(fr.get("stale_categories") or []) or "部分类目"
-        data_hint = (
-            f"\n【数据时效提示】{cats} 类新闻不足，本次研判使用的是"
-            f"**截至 {fr.get('stale_data_date') or '更早'}** 的数据（非当日）。"
-            "请在 market_summary 中**明确说明数据时效**，"
-            "**不要表述为「今日」消息**。"
-        )
+        cats = "、".join(fr.get("stale_categories") or [])
+        if cats:
+            data_hint = (
+                f"\n【数据时效提示】{cats} 类新闻不足，本次研判使用的是"
+                f"**截至 {fr.get('stale_data_date') or '更早'}** 的数据（非当日）。"
+                "请在 market_summary 中**明确说明数据时效**，"
+                "**不要表述为「今日」消息**。"
+            )
+        else:
+            # H2（2026-09-23）：`stale` 现在也可能因为**当日 0 条**而为真
+            # （近 1 天有新闻、当天一条都没有）。此时 stale_categories 为空、
+            # stale_data_date 为 None —— 沿用上面那套措辞会拼出
+            # 「部分类目 类新闻不足…截至 更早 的数据」这种错乱的话。
+            data_hint = (
+                f"\n【数据时效提示】**当日（{fr.get('today')}）新闻 0 条** —— "
+                "快讯为 7×24 供应，这不是「今天没消息」，而是**当日的新闻没有进来**。"
+                "本次研判使用的是更早的新闻。请在 market_summary 中"
+                "**明确说明数据时效**，**不要表述为「今日」消息**，"
+                "也**不要据此做出「未出现某项政策/事件」这类否定性结论**。"
+            )
     else:
         data_hint = ""
 

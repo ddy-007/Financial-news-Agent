@@ -40,8 +40,10 @@ def classify_freshness(today_count: int, *, collecting: bool = False,
         warn  —— 低于门槛，或**采集轮仍在运行**（本轮新闻还没落地）
         ok    —— 其余
 
-    `collecting=True` 只降到 warn 而非 error：此刻数据可能只是**还没到**，
-    与「真的一条都没有」不是一回事，但也不能算 ok。
+    `collecting=True` **只在还有当日新闻时**把结果降到 warn（原为 ok）；
+    它**不会**把「0 条」的 error 改判 —— 0 条就是 0 条。
+    加这一档是因为：条数够但采集轮仍在跑时，数据可能只是**还没到齐**，
+    此时按 ok 陈述事实同样不牢靠。
     """
     th = settings.info_new_threshold if threshold is None else threshold
     if today_count <= 0:
