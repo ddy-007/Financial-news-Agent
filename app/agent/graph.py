@@ -248,10 +248,19 @@ def prepare_node(state: AnalystState) -> dict:
         f"；⚠️ 数据陈旧（最新新闻 {data_freshness['newest_news_date']}）"
         if data_freshness["stale"] else ""
     )
+    # 今日新增取不出来时给 '?'，**不要给 0** —— 0 会与「今天真的没有新消息」混淆，
+    # 而这正是本次要修的那个误读。
+    _signals = info_level.get("signals") or {}
+    _new_count = (_signals.get("new_count") or {}).get("value", "?")
     logger.info(
         f"prepare 完成：专家输入已就绪；信息量="
         f"{'低' if info_level.get('low_info') else '正常'}"
         f"（{info_level.get('reason', '')}）{stale_note}"
+        # 2026-09-23：**必须输出正向信息** —— 缺失信息无法证伪。
+        # 那天的日报只写了「新增 0 条」，读者与专家 prompt 都分不出
+        # 「今天真没消息」与「数据没进来」，于是把它解读成了前者。
+        # 而「最新新闻=2026-09-22 22:29」这一条就足以让人一眼看出问题。
+        f"｜最新新闻={newest or '无'}｜今日新增={_new_count}"
     )
     return {"ctx": ctx, "info_level": info_level,
             "data_freshness": data_freshness, "env": env}

@@ -103,7 +103,12 @@ def save_states(db: Session, results: list[SourceResult],
             # 缺口必须写清区间 —— 只记"被截断"看不出丢了哪一段，事后无从判断影响面。
             logger.warning(
                 f"[采集] {r.source} 本轮被页上限截断：上一水印 {prev}，"
-                f"本轮取到的最旧一条 {oldest}，区间 [{oldest}, {prev}) 的新闻本轮"
+                # ⚠️ 区间必须写 [{prev}, {oldest})：prev 是**较早**的水印、
+                # oldest 是**较晚**的「本轮取到的最旧一条」—— 缺口就夹在中间。
+                # 2026-09-23 修：原写作 [{oldest}, {prev})，起止颠倒，读者按字面
+                # 会得出「9/23 06:44 到 9/22 22:29 之间丢了新闻」这种矛盾区间。
+                # （首次运行时 prev=None，恰好落在右端，掩盖了这个 bug。）
+                f"本轮取到的最旧一条 {oldest}，区间 [{prev}, {oldest}) 的新闻本轮"
                 f"**未取到**。跑 scripts/catchup.py 可补回约 8~10 小时以内的区段"
                 f"（它同样受 {settings.news_max_pages} 页上限）；更早的那段补不回来"
             )

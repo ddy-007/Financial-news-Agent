@@ -30,7 +30,9 @@
     `source_count` 随天数累积，专家 prompt 里仍显示「（N源）」。
 """
 import hashlib
+import json
 import random
+import re
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -38,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import sqlalchemy
+from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -588,6 +591,91 @@ def _duplicate_merge_target():
     check("两个候选并进同一行 → merged = 2", res["merged"], 2)
 
 
+class _Sink:
+    """loguru 捕获器 —— 这些断言测的是**日志本身**，不抓就无从断言。"""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def write(self, msg):
+        self.lines.append(str(msg))
+
+    @property
+    def text(self) -> str:
+        return "".join(self.lines)
+
+
+def _log_contracts():
+    print("\n[11] 日志口径（第 1 批可观测性）")
+
+    # ---- ① [去重] 汇总口径：真实省下的量，而不是只报「库内已有」那一段 ----
+    reset_vectors()
+    now = datetime.now()
+    vec = unit(1, 0)
+    register("已在库", "正文", vec)
+    db = fresh_db()
+    old = add_news(db, "已在库", "正文", pt=now - timedelta(hours=1))
+    coll = FakeCollection([(old.id, vec)])
+    classify, _ = make_classifier()
+    sink = _Sink()
+    hid = logger.add(sink.write, level="INFO", format="{message}")
+    try:
+        with patched(embed_documents=fake_embed, vector_store=FakeStore(coll),
+                     classify_news=classify, _llm_is_duplicate=lambda *a: False,
+                     _rebuild_bm25=lambda *a, **k: None, _upsert_index=lambda *a, **k: None):
+            res = DA.run_data_agent(db, raw=[
+                item("已在库", "正文", pt=now),          # → 并入已有
+                item("全新", "全新正文", pt=now),         # → 分类
+                item("重复A", "重复内容", pt=now),        # ┐ 同指纹
+                item("重复A", "重复内容", pt=now),        # ┘ → 确定性去重 1 条
+            ])
+    finally:
+        logger.remove(hid)
+
+    saved = res["collected"] - res["classified"]
+    check("**[去重] 行报的是「共省下」，等于 采集数 − 待分类数**",
+          f"共省下 {saved} 个候选" in sink.text, True,
+          "改动前只印 len(to_merge)，**低估约 8 倍** —— 读日志的人得自己把三行相加")
+    check("且拆开列出三段贡献（确定性 / 本轮内 / 库内）",
+          all(k in sink.text for k in ("确定性去重", "本轮内语义合并", "库内已有")), True)
+    check("语义比对那 86 秒的黑盒已拆成三段耗时",
+          "Chroma 批查" in sink.text and "DB 取行" in sink.text, True)
+
+    # ---- ② [索引] Chroma 写入日志（改动前**完全无日志**）----
+    db2 = fresh_db()
+    a = add_news(db2, "A", "a")
+    store = FakeUpsertStore()
+    sink2 = _Sink()
+    hid = logger.add(sink2.write, level="INFO", format="{message}")
+    try:
+        with patched(embed_documents=fake_embed, vector_store=store):
+            DA._upsert_index([a])
+    finally:
+        logger.remove(hid)
+    check("Chroma upsert 有条数与耗时日志",
+          "Chroma upsert 1 条" in sink2.text and "向量化" in sink2.text, True,
+          "改动前这里一行日志都没有，P2 的修复效果只能靠 DB 反推")
+
+    # ---- ③ [分类] 每批带「成功 / 漏项 / 模型」----
+    class _FakeLLM:
+        def invoke(self, prompt):
+            ids = re.findall(r"^(\d+)\. ", prompt, re.M)
+            data = [{"id": int(i), "relevant": True, "category": "综合",
+                     "market": "无", "themes": []} for i in ids]
+            return type("R", (), {"content": json.dumps(data, ensure_ascii=False)})()
+
+    sink3 = _Sink()
+    hid = logger.add(sink3.write, level="INFO", format="{message}")
+    try:
+        with patched(get_llm=lambda **k: _FakeLLM()):
+            DA.classify_news([item(f"T{i}") for i in range(3)])
+    finally:
+        logger.remove(hid)
+    check("分类日志含条数与模型名（原先只有「第 N/M 批」，看不出走了没走备用）",
+          "第 1/1 批" in sink3.text and "成功 3" in sink3.text
+          and "漏项 0" in sink3.text and "模型" in sink3.text, True)
+
+
 def _result_shape():
     print("\n[8] 返回值契约")
     db = fresh_db()
@@ -612,6 +700,7 @@ def main() -> int:
     _p2_p3_failopen()
     _within_round_in_pipeline()
     _duplicate_merge_target()
+    _log_contracts()
     _result_shape()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")

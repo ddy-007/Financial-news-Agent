@@ -25,7 +25,7 @@ import numpy as np
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from app.agent.llm import get_llm, llm_retry_times
+from app.agent.llm import get_llm, get_llm_model_name, llm_retry_times
 from app.agent.prompts import CLASSIFY_PROMPT, DEDUP_PROMPT
 from app.collectors.news_collector import NewsItem, collect_all_news
 from app.models.news import News
@@ -134,7 +134,6 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
     failed: list[NewsItem] = []
     consecutive_fails = 0
     for batch_idx, i in enumerate(range(0, len(items), BATCH_SIZE), start=1):
-        logger.info(f"[分类] 第 {batch_idx}/{total_batches} 批")
         batch = items[i:i + BATCH_SIZE]
         news_list = "\n".join(
             f"{j + 1}. {it.title}｜{(it.content or '')[:100]}"
@@ -206,6 +205,15 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
                 break
         else:
             consecutive_fails = 0
+            # 日志 4/5：进度行补上「成功 / 漏项 / 模型」。
+            # 模型名是判断「这批是否悄悄走了备用」的唯一线索 ——
+            # `with_fallbacks` 默认静默切换，只在切走时打一条 WARNING，
+            # 而成功的批次原先完全看不出用的是谁。
+            logger.info(
+                f"[分类] 第 {batch_idx}/{total_batches} 批："
+                f"成功 {len(batch_ok)} / 漏项 {len(batch) - len(batch_ok)}"
+                f" / 模型 {get_llm_model_name(part='news')}"
+            )
     return results, failed
 
 
@@ -394,6 +402,9 @@ def _nearest_existing(db: Session, cands: list[Candidate],
         return [None] * n
 
     window = timedelta(hours=DEDUP_WINDOW_HOURS)
+    # 日志 3：这段改动前是一个 86 秒的黑盒（实测 18:00:43 → 18:02:09），
+    # 里面混着 Chroma 批查 / DB 取行 / 近邻筛选三件事，日志分不出占比。
+    t_chroma_start = time.time()
     id_lists: list[list[str]] = []
     dist_lists: list[list[float]] = []
     for st in range(0, n, QUERY_CHUNK):         # 分块查，控内存峰值
@@ -404,10 +415,13 @@ def _nearest_existing(db: Session, cands: list[Candidate],
         id_lists.extend(res.get("ids") or [])
         dist_lists.extend(res.get("distances") or [])
 
+    t_chroma = time.time() - t_chroma_start
     all_ids = {i for lst in id_lists for i in lst}
     rows: dict[str, News] = {}
+    t_db_start = time.time()
     if all_ids:
         rows = {r.id: r for r in db.query(News).filter(News.id.in_(all_ids)).all()}
+    t_db = time.time() - t_db_start
 
     out: list[tuple[News, float] | None] = []
     for idx, c in enumerate(cands):
@@ -425,6 +439,10 @@ def _nearest_existing(db: Session, cands: list[Candidate],
             if best is None or sim > best[1]:
                 best = (news, sim)
         out.append(best)
+    logger.info(f"[去重] 语义比对耗时：Chroma 批查 {t_chroma:.1f}s"
+                f" / DB 取行 {t_db:.1f}s"
+                f" / 近邻筛选 {time.time() - t_chroma_start - t_chroma - t_db:.1f}s"
+                f"（{n} 个候选，{len(all_ids)} 个邻居 id）")
     return out
 
 
@@ -535,7 +553,9 @@ def _upsert_index(news_list: list[News]) -> None:
     news_list = uniq
     ids = [n.id for n in news_list]
     texts = [_doc_text(n.title, n.content) for n in news_list]
+    t_embed = time.time()
     embeddings = embed_documents(texts)
+    t_embed = time.time() - t_embed
     metadatas = [
         {
             "news_id": n.id,
@@ -546,7 +566,12 @@ def _upsert_index(news_list: list[News]) -> None:
         }
         for n in news_list
     ]
+    t_write = time.time()
     vector_store.upsert_documents(ids, texts, embeddings, metadatas)
+    # 日志 1：改动前这里**一行日志都没有** —— Chroma 实际写了多少条、耗时多少、
+    # 有没有异常，全看不见。P2（合并后重索引）的修复效果只能靠 DB 反推。
+    logger.info(f"[索引] Chroma upsert {len(ids)} 条｜向量化 {t_embed:.1f}s"
+                f" + 写入 {time.time() - t_write:.1f}s")
 
 
 def _rebuild_bm25(db: Session, days: int = 7) -> None:
@@ -626,13 +651,18 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     to_merge: list[tuple[News, Candidate]] = []
     to_classify: list[Candidate] = []
     gray_failed = 0
+    gray_calls = 0
+    gray_secs = 0.0
     for cand, m in zip(cands, matches):
         if m is None or m[1] < GRAY_LOW:
             to_classify.append(cand)
         elif m[1] >= DUP_THRESHOLD:
             to_merge.append((m[0], cand))      # 高置信重复：**不过 LLM**
         else:
+            gray_calls += 1
+            _t_gray = time.time()
             verdict = _llm_is_duplicate(m[0], cand.text, cand.item.source)  # 灰区
+            gray_secs += time.time() - _t_gray
             if verdict is None:
                 gray_failed += 1
             if verdict:
@@ -640,10 +670,18 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
             else:
                 to_classify.append(cand)
 
+    # L3：真实省下的分类量 = 「不去重会分类的量」−「实际分类的量」。
+    # 三段贡献相加恰好等于它（2026-09-23 那轮实测：52 + 727 + 106 = 885）。
+    # ⚠️ 改动前这里只印 `len(to_merge)`（106），**低估约 8 倍** ——
+    # 读日志的人得自己把三行进度日志相加才知道真实收益。
+    saved = len(raw) - len(to_classify)
     logger.info(
         f"[去重] 语义比对后：{len(to_merge)} 个候选并入库内已有新闻、"
-        f"{len(to_classify)} 个待分类 —— **省下 {len(to_merge)} 个候选的 LLM 分类**"
-        + (f"（另有 {gray_failed} 个灰区判重调用失败，已按新条目处理）"
+        f"{len(to_classify)} 个待分类 —— **共省下 {saved} 个候选的 LLM 分类**"
+        f"（确定性去重 {exact_deduped} + 本轮内语义合并 {within_round}"
+        f" + 库内已有 {len(to_merge)}）"
+        f"｜灰区 LLM 调用 {gray_calls} 次、耗时 {gray_secs:.1f}s"
+        + (f"（其中 {gray_failed} 个调用失败，已按新条目处理）"
            if gray_failed else "")
     )
 
