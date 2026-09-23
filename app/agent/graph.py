@@ -170,7 +170,7 @@ def prepare_node(state: AnalystState) -> dict:
             )
         a_share, us = _market_snapshot(db, as_of)
         # 三项增量数据均加保护：任一失败只按缺省处理，不拖垮核心研判
-        from app.services.info_level import assess_info_level
+        from app.services.info_level import assess_info_level, classify_freshness
         from app.services.sector_service import format_sector_summary
 
         indicators = _safe_extra(
@@ -202,6 +202,21 @@ def prepare_node(state: AnalystState) -> dict:
         used = [r for rows, _ in groups.values() for r in rows]
         newest = max((n.publish_time for n in used if n.publish_time), default=None)
 
+        # ---- H2（2026-09-23）：当日条数判据 ----
+        # 原判据只看「近 1 天有没有新闻」→ 当天 0 条也判「新鲜」。
+        # 详见 `classify_freshness` 的 docstring。
+        _today = as_of.date() if as_of else date.today()
+        today_count = sum(
+            1 for n in used if n.publish_time and n.publish_time.date() == _today
+        )
+        # ---- H1（2026-09-23）：采集轮是否还在跑 ----
+        # 两者时间相近时，本轮日报**拿不到这一轮的新闻**（09-23 实测缺口 6 分 9 秒，
+        # 日报据此写出「今日无重大消息」）。这里如实记录，让下游能区分
+        # 「今天真没消息」与「今天的新闻还没落地」。
+        from app.services.news_service import _COLLECT_LOCK
+        collecting = _COLLECT_LOCK.locked()
+        freshness = classify_freshness(today_count, collecting=collecting)
+
         stale_cats = [k for k, (_, st) in groups.items() if st]
         stale_dates = [
             r.publish_time
@@ -218,6 +233,10 @@ def prepare_node(state: AnalystState) -> dict:
             "newest_news_date": newest.date().isoformat() if newest else None,
             # 补跑时"今天"应指截止时点那一天，而不是真正的今天
             "today": (as_of.date() if as_of else date.today()).isoformat(),
+            # ---- H2 / H1（2026-09-23 新增）----
+            "today_count": today_count,
+            "freshness": freshness,        # ok / warn / error
+            "collecting": collecting,      # 采集轮是否仍在运行
         }
         if stale_cats:
             # 快讯是 7×24 的，出现"近 1 天无新闻"通常意味着**采集故障**，
@@ -226,6 +245,19 @@ def prepare_node(state: AnalystState) -> dict:
                 f"数据陈旧：{'、'.join(stale_cats)} 类目近 1 天无新闻，"
                 f"使用截至 {data_freshness['stale_data_date']} 的数据。"
                 "快讯为 7×24 供应，出现此情况通常意味着采集链路有问题。"
+            )
+        if freshness == "error":
+            logger.error(
+                f"当日（{_today}）新闻 **0 条** —— 快讯是 7×24 的，"
+                f"这不是「今天没消息」，而是**当日新闻没有进来**。"
+                f"本轮报告据此写出的「今日无重大消息」等结论**不可信**。"
+                + ("⚠️ 采集轮此刻仍在运行，本轮新闻尚未落地。"
+                   if collecting else "请检查采集链路与 reports/app.log。")
+            )
+        elif collecting:
+            logger.warning(
+                "新闻采集轮仍在运行 —— 本轮研判**不包含**这一轮的新闻。"
+                "若这是当日的主要新闻来源，报告的时效性会受影响。"
             )
 
         # 运行环境：交易日历降级（会按「工作日」猜测，节假日可能误判）
@@ -261,6 +293,9 @@ def prepare_node(state: AnalystState) -> dict:
         # 「今天真没消息」与「数据没进来」，于是把它解读成了前者。
         # 而「最新新闻=2026-09-22 22:29」这一条就足以让人一眼看出问题。
         f"｜最新新闻={newest or '无'}｜今日新增={_new_count}"
+        f"｜新鲜度={data_freshness.get('freshness', '?')}"
+        + ("｜**采集轮仍在运行，本轮新闻未纳入**"
+           if data_freshness.get("collecting") else "")
     )
     return {"ctx": ctx, "info_level": info_level,
             "data_freshness": data_freshness, "env": env}
@@ -474,7 +509,7 @@ def get_app():
 
 # ================= 对外入口 =================
 def _report_time_on(day: datetime) -> datetime:
-    """某天的「报告生成时点」——取 config 的 `REPORT_TIME`（默认 18:15）。
+    """某天的「报告生成时点」——取 config 的 `REPORT_TIME`（默认 18:30）。
 
     补跑以这个时点为截止，与当天实时生成的口径一致，两份报告可直接对比。
     """
@@ -486,8 +521,8 @@ def _report_time_on(day: datetime) -> datetime:
         # 放在外面会漏网
         return datetime(day.year, day.month, day.day, hh, mm)
     except (ValueError, AttributeError, TypeError):
-        logger.warning(f"REPORT_TIME 配置不可用（{settings.report_time!r}），按 18:15 处理")
-        return datetime(day.year, day.month, day.day, 18, 15)
+        logger.warning(f"REPORT_TIME 配置不可用（{settings.report_time!r}），按 18:30 处理")
+        return datetime(day.year, day.month, day.day, 18, 30)
 
 
 def generate_daily_report(db: Session, date: datetime | None = None) -> MarketReport:
@@ -547,6 +582,9 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         divergence=final.get("divergence"),
         risk_veto=final.get("risk_veto"),
         low_info=info_level.get("low_info"),
+        # ⚠️ 「当日 0 条」也算陈旧（H2）：它原先只反映「近 1 天无新闻」，
+        # 而 09-23 那种「当天 0 条、近 1 天有 1 条」的情形被判为**新鲜**，
+        # 于是数据缺失在报告里完全不可见。
         data_stale=data_freshness.get("stale"),
         model=get_llm_model_name(part="expert"),
     )

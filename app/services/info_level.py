@@ -23,6 +23,34 @@ from app.models.market import MarketData
 from app.models.news import News
 
 
+def classify_freshness(today_count: int, *, collecting: bool = False,
+                       threshold: int | None = None) -> str:
+    """当日新闻的新鲜度三档判定（H2，2026-09-23）。
+
+    **为什么不能只判「近 1 天有没有新闻」**：只要有 1 条 23 小时前的，就判「数据新鲜」。
+    实测 2026-09-23：断流 19.5 小时，近 1 天窗内仍有 09-22 22:29 的新闻 → `stale=0`；
+    **当天 0 条却被判新鲜**，日报据此写出「今日无重大消息」「未出现降准降息、LPR、
+    财政投放等直接流动性新闻」这类**否定性结论** —— 把「没看到」当成了「没发生」，
+    与 R22「结论强度不超过数据支持的强度」直接冲突。
+
+    三档（与 dbt 的 `warn_after` / `error_after` 同一思路 —— 单阈值分不出
+    「还能等」与「不能用」）：
+
+        error —— 当日 0 条。快讯是 7×24 的，**0 条本身就是异常信号**
+        warn  —— 低于门槛，或**采集轮仍在运行**（本轮新闻还没落地）
+        ok    —— 其余
+
+    `collecting=True` 只降到 warn 而非 error：此刻数据可能只是**还没到**，
+    与「真的一条都没有」不是一回事，但也不能算 ok。
+    """
+    th = settings.info_new_threshold if threshold is None else threshold
+    if today_count <= 0:
+        return "error"
+    if collecting or today_count < th:
+        return "warn"
+    return "ok"
+
+
 def assess_info_level(db: Session, target_date: date | None = None,
                       use_publish_time: bool = False) -> dict:
     """评估指定日期（默认今天）的信息量。
