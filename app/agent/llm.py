@@ -4,6 +4,8 @@
 每个分组的三项配置留空时，回落到 `DEEPSEEK_*`——所以**不配任何分组变量，
 行为与拆分前完全一致**。
 """
+from datetime import datetime, timedelta
+
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_openai import ChatOpenAI
 from loguru import logger
@@ -59,6 +61,40 @@ _FALLBACK_EXCEPTIONS = (
 )
 
 
+# 主模型「冷却到」的时刻（按分组）。非空且未到期 → `get_llm` 直接把主模型
+# 从链首摘掉。见 `settings.llm_primary_cooldown_minutes` 的注释。
+_PRIMARY_COOLDOWN: dict[str, datetime] = {}
+
+
+def _primary_cooling(part: str) -> datetime | None:
+    """主模型是否在冷却期；在则返回解冻时刻，否则 None（顺手清掉过期项）。"""
+    until = _PRIMARY_COOLDOWN.get(part)
+    if until is None:
+        return None
+    if until <= datetime.now():
+        # 到期 = 半开：让下一次 `get_llm` 重新把主模型放进链首试一次
+        del _PRIMARY_COOLDOWN[part]
+        return None
+    return until
+
+
+def note_primary_failed(part: str) -> datetime | None:
+    """主模型失败 → 开启冷却。
+
+    **只在「新开一次冷却」时返回解冻时刻**，调用方据此决定要不要打日志 ——
+    否则每一批都会重复打一遍（实测那 8 条重复 WARNING 就是这么来的）。
+    已在冷却期内则返回 None（**不续期**：冷却窗口从第一次失败起固定）。
+    """
+    if _primary_cooling(part) is not None:
+        return None
+    if settings.llm_primary_cooldown_minutes <= 0:
+        return None          # 配 0 = 关闭该行为
+    until = datetime.now() + timedelta(
+        minutes=settings.llm_primary_cooldown_minutes)
+    _PRIMARY_COOLDOWN[part] = until
+    return until
+
+
 # 每个分组「实际命中」的模型名（备用生效时会被覆盖成备用模型名）。
 # 由 _ModelRecorder 在每次调用开始时写入，供 get_llm_model_name 溯源。
 # 主备并存时，最后一次写入的就是真正产出结果的那个模型。
@@ -88,9 +124,17 @@ class _ModelRecorder(BaseCallbackHandler):
         # 收到「非主模型」的 start 事件 = 主模型已经失败并切走了。
         # 注意本回调在**发起时**触发（不保证成功），所以措辞是"尝试切到"。
         if name != self.primary_model:
+            # ⚠️ 只在**新开冷却**时打日志。冷却期内主模型根本不在链上，
+            # 每批都会走到这里 —— 不加这个判断就是每批一条重复 WARNING
+            # （实测 2026-09-23 那轮第 27–34 批打了 8 条）。
+            until = note_primary_failed(self.part)
+            if until is None:
+                return
             logger.warning(
                 f"[{self.part}] 主模型 {self.primary_model} 未成功，"
-                f"尝试切到备用 {name}"
+                f"尝试切到备用 {name}；**进入冷却**至 {until:%H:%M:%S}"
+                f"（{settings.llm_primary_cooldown_minutes:.0f} 分钟内不再尝试主模型，"
+                f"避免每批白打一次）"
             )
 
 
@@ -247,13 +291,29 @@ def get_llm(temperature: float = 0.0, *, part: str):
     400 也去白打每一个备用），或自行实现逐级尝试。
     """
     api_key, base_url, model = resolve(part)
-    primary = _make_client(api_key, base_url, model, temperature, part)
 
     # 备用的顺序即尝试顺序（见 effective_fallback_models）；
     # 与主模型三项全同的备用已在里面剔除，全被剔除就退回"不启用"
     fallbacks = _build_fallbacks(temperature, part)
     if not fallbacks:
-        return primary
+        return _make_client(api_key, base_url, model, temperature, part)
+
+    cooling = _primary_cooling(part)
+    if cooling is not None:
+        # 主模型在冷却期 → **从链首摘掉**，用第一个备用当主。
+        # 这样整轮都不再白打主模型（实测 2026-09-23 那轮白打了 8 次）。
+        head, rest = fallbacks[0], fallbacks[1:]
+        logger.warning(
+            f"[{part}] 主模型 {model} 仍在冷却期（至 {cooling:%H:%M:%S}）—— "
+            f"本轮**跳过主模型**，直接用 {effective_fallback_models(part)[0]}"
+        )
+        if not rest:
+            return head.with_config(callbacks=[_ModelRecorder(part, model)])
+        return head.with_fallbacks(
+            rest, exceptions_to_handle=_FALLBACK_EXCEPTIONS
+        ).with_config(callbacks=[_ModelRecorder(part, model)])
+
+    primary = _make_client(api_key, base_url, model, temperature, part)
     return primary.with_fallbacks(
         fallbacks, exceptions_to_handle=_FALLBACK_EXCEPTIONS
     ).with_config(callbacks=[_ModelRecorder(part, model)])
