@@ -451,8 +451,26 @@ def _nearest_existing(db: Session, cands: list[Candidate],
     return out
 
 
-def _llm_is_duplicate(a: News, b_text: str, b_source: str) -> bool | None:
-    """灰色区间复核：LLM 判断两条是否同一事件。
+def _fmt_for_dedup(title: str, content: str | None) -> str:
+    """判重时喂给 LLM 的单条文本 —— **两侧必须同形态**。
+
+    改动前是 A 只给 `title`、B 给 `_doc_text(...)[:150]`（即 `标题\n正文`），两个毛病：
+
+    ① **不对等**：一侧有正文、一侧没有，LLM 拿到的信息量差一个量级；
+    ② **换行撑破 prompt 结构**：`DEDUP_PROMPT` 是
+       `新闻A：[源] {title_a}` / `新闻B：[源] {title_b}` 两行，
+       把带 `\n` 的文本塞进 `{title_b}` 后，「新闻B：」那一行之后会多出
+       一整段**游离文本** —— 不在任何标签之下，LLM 很可能把它当成 prompt 的
+       额外指令或上下文，而不是新闻 B 的内容。
+
+    现在两侧都走这个函数：`标题｜正文前 120 字`（空白已折叠成单空格，不含换行）。
+    """
+    body = _norm(content or "")[:120]
+    return f"{title}｜{body}" if body else title
+
+
+def _llm_is_duplicate(a: News, cand: Candidate) -> bool | None:
+    """灰色区间复核：LLM 判断**库内已有那条**与**本轮候选**是否同一事件。
 
     返回三态：`True` 判为重复 / `False` 判为新 / **`None` 表示调用失败**。
 
@@ -462,9 +480,13 @@ def _llm_is_duplicate(a: News, b_text: str, b_source: str) -> bool | None:
     连一行日志都没有，LLM 一挂灰区条目就悄悄全变成新行、无人知晓。
     """
     llm = get_llm(temperature=0.0, part="news")
+    # ⚠️ 两侧同形态（见 `_fmt_for_dedup`）—— 改动前 A 只给标题、B 给「标题+正文」，
+    # 且 B 里的换行会把 prompt 结构撑开。那等于**拿不对等的输入让 LLM 做判断**。
     prompt = DEDUP_PROMPT.format(
-        source_a=a.source, title_a=a.title,
-        source_b=b_source, title_b=(b_text or "")[:150],
+        source_a=a.source,
+        title_a=_fmt_for_dedup(a.title, a.content),
+        source_b=cand.item.source,
+        title_b=_fmt_for_dedup(cand.item.title, cand.item.content),
     )
     try:
         resp = llm.invoke(prompt)
@@ -658,6 +680,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     gray_failed = 0
     gray_calls = 0
     gray_secs = 0.0
+    gray_merged = 0
     for cand, m in zip(cands, matches):
         if m is None or m[1] < GRAY_LOW:
             to_classify.append(cand)
@@ -666,11 +689,12 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
         else:
             gray_calls += 1
             _t_gray = time.time()
-            verdict = _llm_is_duplicate(m[0], cand.text, cand.item.source)  # 灰区
+            verdict = _llm_is_duplicate(m[0], cand)  # 灰区
             gray_secs += time.time() - _t_gray
             if verdict is None:
                 gray_failed += 1
             if verdict:
+                gray_merged += 1
                 to_merge.append((m[0], cand))
             else:
                 to_classify.append(cand)
@@ -685,7 +709,8 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
         f"{len(to_classify)} 个待分类 —— **共省下 {saved} 个候选的 LLM 分类**"
         f"（确定性去重 {exact_deduped} + 本轮内语义合并 {within_round}"
         f" + 库内已有 {len(to_merge)}）"
-        f"｜灰区 LLM 调用 {gray_calls} 次、耗时 {gray_secs:.1f}s"
+        f"｜灰区 LLM 调用 {gray_calls} 次（判定重复 {gray_merged} 次）"
+        f"、耗时 {gray_secs:.1f}s"
         + (f"（其中 {gray_failed} 个调用失败，已按新条目处理）"
            if gray_failed else "")
     )

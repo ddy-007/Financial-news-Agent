@@ -521,9 +521,37 @@ def _p2_p3_failopen():
             raise RuntimeError("模拟 LLM 挂掉")
 
     with patched(get_llm=lambda **k: _BoomLLM()):
-        got = DA._llm_is_duplicate(News(title="A", source="s"), "B", "s")
+        got = DA._llm_is_duplicate(News(title="A", source="s"),
+                                   DA.Candidate(item=item("B", "b")))
     check("真实 _llm_is_duplicate：LLM 抛异常 → 返回 None（而不是 False）", got, None,
           "三态是「失败」与「判为新」能被区分开的前提")
+
+    # 判重请求的**输入形态**（2026-09-23 实机发现）：改动前 A 只给标题、
+    # B 给「标题 + 换行 + 正文前 150 字」—— 两侧信息不对等，且 B 里的换行
+    # 会把 DEDUP_PROMPT 的结构撑开（「新闻B：」那行之后多出一段游离文本）。
+    captured: dict = {}
+
+    class _CaptureLLM:
+        def invoke(self, prompt):
+            captured["p"] = prompt
+            return type("R", (), {"content": "false"})()
+
+    # ⚠️ 正文里**必须带换行** —— 否则 `_fmt_for_dedup` 的空白折叠无从体现，
+    # 去掉它也不会有区别，下面那条断言就成了**假通过**（本脚本第一版就是这么错的）。
+    with patched(get_llm=lambda **k: _CaptureLLM()):
+        DA._llm_is_duplicate(
+            News(title="A标题", content="A的正文第一行\nA的正文第二行",
+                 source="新浪财经"),
+            DA.Candidate(item=item("B标题", "B的正文第一行\nB的正文第二行",
+                                   source="东方财富")))
+    _p = captured["p"]
+    check("判重 prompt 两侧**同形态**（都带正文摘要）",
+          "A标题｜" in _p and "B标题｜" in _p, True,
+          "一侧只有标题、一侧是标题+正文 → 拿不对等的输入让 LLM 做判断")
+    check("判重 prompt 的新闻行内**不含换行**（换行会撑破结构）",
+          len(_p.strip().splitlines()), 4,
+          "行数应为 4：说明行 / 空行 / 新闻A / 新闻B —— 多出来就是正文里的换行"
+          "把「新闻B：」那行撑成了两段游离文本")
 
 
 def _within_round_in_pipeline():
