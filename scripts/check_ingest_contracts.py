@@ -862,8 +862,11 @@ def _classification_failure():
           all(DA.BACKOFF_BASE <= s <= DA.BACKOFF_CAP for s in sleeps), True)
     check("全轮日志被压到 8 行以内（对照事故的 110 行）",
           len([ln for ln in lines if "[分类]" in ln or "[重试]" in ln]) <= 8, True,
-          "文档 §8.4 的验收标准；每批仍会有 1 行 `[重试] …` 来自 app/retry.py，"
-          "那里是共用的采集层代码，本次不动")
+          "文档 §8.4 的验收标准。⚠️ **该上限有前提**：本断言用 "
+          "`llm_retry_times=1`（= 配了备用模型时 `news` 分组的实际取值，也正是 "
+          "2026-09-22 那次事故的取值）。**未配备用时 `llm_retry_times=3`** → "
+          "`app/retry.py` 每失败批会吐 2 条 WARNING + 1 条 ERROR，3 批约 13 行，"
+          "会超过 10 行 —— 那里是采集层共用的代码，本次未动（巡检 2026-09-24 指出）")
 
     # ---- ④ terminal 错误：不退避（白等）----
     # 这一段只关心「睡没睡」，不关心日志文本 —— 整段静音，免得 8 行原始
