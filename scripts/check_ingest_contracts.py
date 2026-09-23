@@ -632,7 +632,10 @@ def _log_contracts():
     finally:
         logger.remove(hid)
 
-    saved = res["collected"] - res["classified"]
+    # 用「候选数 − 已并入数」求「送进分类的量」，**不要用 `res["classified"]`**：
+    # 后者是**分类成功**的条数，一旦出现分类失败/漏项就小于实际送进去的量，
+    # 断言会假通过（当前 stub 分类器恒成功，二者恰好相等，掩盖了这个差别）。
+    saved = res["collected"] - (res["candidates"] - res["merged"])
     check("**[去重] 行报的是「共省下」，等于 采集数 − 待分类数**",
           f"共省下 {saved} 个候选" in sink.text, True,
           "改动前只印 len(to_merge)，**低估约 8 倍** —— 读日志的人得自己把三行相加")
@@ -674,6 +677,27 @@ def _log_contracts():
     check("分类日志含条数与模型名（原先只有「第 N/M 批」，看不出走了没走备用）",
           "第 1/1 批" in sink3.text and "成功 3" in sink3.text
           and "漏项 0" in sink3.text and "模型" in sink3.text, True)
+
+    # ---- ④ 重复 id 不能让「漏项」变成负数 ----
+    class _DupLLM:
+        """故意返回重复 id —— `batch_ok` 会照收多条，`covered` 才是去重集合。"""
+
+        def invoke(self, prompt):
+            one = {"id": 1, "relevant": True, "category": "综合",
+                   "market": "无", "themes": []}
+            return type("R", (), {"content": json.dumps([one] * 3, ensure_ascii=False)})()
+
+    sink4 = _Sink()
+    hid = logger.add(sink4.write, level="INFO", format="{message}")
+    try:
+        with patched(get_llm=lambda **k: _DupLLM()):
+            DA.classify_news([item("T0"), item("T1")])
+    finally:
+        logger.remove(hid)
+    check("LLM 返回重复 id → 「漏项」不为负，且与同批 warning 一致",
+          "漏项 1" in sink4.text and "漏项 -1" not in sink4.text, True,
+          "按 len(batch_ok) 算会得「成功 3 / 漏项 -1」（批只有 2 条）—— "
+          "巡检已复现；也与那条 len(missed)/len(batch) 的 warning 自相矛盾")
 
 
 def _result_shape():

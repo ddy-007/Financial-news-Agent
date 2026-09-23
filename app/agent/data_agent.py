@@ -209,9 +209,14 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
             # 模型名是判断「这批是否悄悄走了备用」的唯一线索 ——
             # `with_fallbacks` 默认静默切换，只在切走时打一条 WARNING，
             # 而成功的批次原先完全看不出用的是谁。
+            # ⚠️ 「成功 / 漏项」必须按 `covered` 计数，**不能用 `len(batch_ok)`** ——
+            # LLM 返回重复 id 时 `batch_ok` 会照收多条（同一 id 反复追加），
+            # 于是 `len(batch) - len(batch_ok)` 会少报甚至**为负**，还会与同一批
+            # 那条 `len(missed)/len(batch)` 的 warning 自相矛盾。
+            # 实测（巡检复现）：批 2 条、LLM 返回 3 条 `id=1` → 日志「成功 3 / 漏项 -1」。
             logger.info(
                 f"[分类] 第 {batch_idx}/{total_batches} 批："
-                f"成功 {len(batch_ok)} / 漏项 {len(batch) - len(batch_ok)}"
+                f"成功 {len(covered)} / 漏项 {len(missed)}"
                 f" / 模型 {get_llm_model_name(part='news')}"
             )
     return results, failed
