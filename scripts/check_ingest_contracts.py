@@ -801,6 +801,12 @@ class _FakeStatus(Exception):
 def _classification_failure():
     print("\n[12] B1：失败分类 / 抖动退避 / 熔断（2026-09-24）")
 
+    # 本节**故意制造大量失败**，默认 handler 会把它们原样打到 stderr，与断言输出
+    # 混在一起 —— 读的人会以为脚本自己报错了。先摘掉默认 handler，
+    # 本节各段自己按需加 sink。
+    # ⚠️ 本函数是 `main()` 的最后一步；若往后再加小节，记得各自加 sink。
+    logger.remove()
+
     # ---- ① 退避函数本身：下界固定、上界指数放大且被 cap 截断 ----
     seen: list[tuple[float, float]] = []
     orig_uniform = DA.random.uniform
@@ -869,11 +875,10 @@ def _classification_failure():
           "会超过 10 行 —— 那里是采集层共用的代码，本次未动（巡检 2026-09-24 指出）")
 
     # ---- ④ terminal 错误：不退避（白等）----
-    # 这一段只关心「睡没睡」，不关心日志文本 —— 整段静音，免得 8 行原始
-    # ERROR 混进断言输出里，让读的人以为脚本自己报错了。
     sleeps2: list[float] = []
+    sink2 = _Sink()
+    hid2 = logger.add(sink2.write, level="INFO", format="{message}")
     orig_sleep2 = DA.time.sleep
-    logger.disable("")
     try:
         DA.time.sleep = sleeps2.append
         try:
@@ -883,10 +888,36 @@ def _classification_failure():
         finally:
             DA.time.sleep = orig_sleep2
     finally:
-        logger.enable("")
+        logger.remove(hid2)
     check("401（terminal）→ **一次都没退避**", sleeps2, [],
           "对鉴权/参数类错误等待是纯白等；它们仍会按 3 批熔断，"
           "所以日志量并不因此变多")
+    check("terminal **到熔断阈值**时，那一行说清了「中断本轮」",
+          "，中断本轮" in sink2.text, True,
+          "否则读者看到「不退避」还得往下再读一行才知道整轮要停了 —— "
+          "日志要能单行读完（巡检 2026-09-24 指出）")
+
+    # ---- ④b 末批不退避（巡检 2026-09-24 指出）：30 条 = 2 批，够不到熔断阈值 ----
+    sleeps3: list[float] = []
+    sink4 = _Sink()
+    hid4 = logger.add(sink4.write, level="INFO", format="{message}")
+    orig_sleep3 = DA.time.sleep
+    try:
+        DA.time.sleep = sleeps3.append
+        try:
+            with patched(get_llm=lambda **kw: _BoomLLM(ConnectionError("Connection error")),
+                         llm_retry_times=lambda **kw: 1):
+                _res3, failed3 = DA.classify_news([item(f"w{i}") for i in range(30)])
+        finally:
+            DA.time.sleep = orig_sleep3
+    finally:
+        logger.remove(hid4)
+    check("两批都失败：只在第 1 批后退避（**末批不退避**）", len(sleeps3), 1,
+          "末批后面已无批可打，等下来的时间纯属浪费（最多可达 BACKOFF_CAP=8s）")
+    check("末批日志说清了原因是「已是最后一批」",
+          "已是最后一批" in sink4.text, True,
+          "否则读者看到「没退避」会以为是判据出错了")
+    check("没够到熔断阈值 → 两批都如实计入失败", len(failed3), 30)
 
 def main() -> int:
     _fingerprint()

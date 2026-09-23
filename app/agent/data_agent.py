@@ -228,11 +228,19 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
             # 单独打会显得零碎，读者要拼三行才知道发生了什么。
             retryable = is_retryable(e)
             breaking = consecutive_fails >= MAX_CONSECUTIVE_BATCH_FAILS
-            delay = _backoff_delay(consecutive_fails) if retryable else 0.0
+            # 末批不退避：后面已经无批可打，等下来的时间纯属浪费（巡检 2026-09-24 指出）。
+            last_batch = batch_idx >= total_batches
+            will_sleep = retryable and not breaking and not last_batch
+            delay = _backoff_delay(consecutive_fails) if will_sleep else 0.0
             if not retryable:
-                note = "**不可重试**（鉴权/参数/配额类），不退避"
+                # 到熔断阈值时要说清「下一步是中断」，否则读者看到「不退避」还得
+                # 往下读一行才知道整轮要停了
+                note = ("**不可重试**（鉴权/参数/配额类），不退避"
+                        + ("，中断本轮" if breaking else ""))
             elif breaking:
                 note = "**可重试**，但已连续失败到熔断阈值 —— 不再退避，直接中断"
+            elif last_batch:
+                note = "**可重试**，但已是最后一批 —— 不退避（后面无批可打）"
             else:
                 note = f"**可重试**，退避 {delay:.1f}s 后打下一批"
             logger.warning(
@@ -256,7 +264,7 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
                     f"（水位线不推进，下轮重取）"
                 )
                 break
-            if retryable:
+            if will_sleep:
                 # 只对 transient 退避：对 401/403/400 等待是纯白等
                 # （判据复用 `app.retry.is_retryable`，不在这里重写一份）。
                 time.sleep(delay)
