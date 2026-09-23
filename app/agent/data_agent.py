@@ -83,6 +83,18 @@ def _backoff_delay(attempt: int, *, base: float = BACKOFF_BASE,
     """
     return random.uniform(base, min(cap, base * (3 ** attempt)))
 DUP_THRESHOLD = 0.85  # 相似度 ≥ 此值判为重复（**直接合并，不过 LLM**）
+# 「近阈值」带的宽度（L1 标定观测，2026-09-24，应复核意见 §7.3 而加）。
+#
+# **为什么要观测它**：`DUP_THRESHOLD` 之上是**直接合并、不过 LLM** 的快路径，
+# 阈值本身安不安全，只看「灰区花了多少钱」（§13.3 记的那两个数）是答不出来的。
+# 复核方 2026-09-24 实测：本项目最容易误合并的模板化快讯（不同期货品种 / 不同 ETF /
+# 不同公司）相似度最高 **0.8450** —— 距阈值只有 **0.005**，而且它们的比对发生在
+# **本轮内聚簇**，不走「库内已有」那条路（详见复核意见 §7.3）。
+#
+# 宽度取 0.03：够窄，只捞得到真正贴脸的对；够宽，不至于常年为 0 而没有基线。
+# **跟着阈值走**（`NEAR_MISS_LOW = DUP_THRESHOLD - 宽度`），阈值若将来抬高，观测带自动跟随。
+NEAR_MISS_MARGIN = 0.03
+NEAR_MISS_LOW = DUP_THRESHOLD - NEAR_MISS_MARGIN
 # 语义聚簇的**规模上限**（L1，2026-09-24）。
 #
 # union-find 的传递闭包有个已知的**渗流相变**：只要 A–B 与 B–C 都超阈值，
@@ -388,9 +400,15 @@ def _embed_candidates(cands: list[Candidate]) -> np.ndarray:
     return vecs / norms
 
 
+def _peek(text: str, n: int = 20) -> str:
+    """日志里引用一段文本时的**唯一**写法：压掉换行、截断。"""
+    return _WS.sub(" ", (text or "")).strip()[:n]
+
+
 def _cluster_by_similarity(vecs: np.ndarray,
                            threshold: float = DUP_THRESHOLD,
-                           chunk: int = EMBED_CHUNK) -> list[list[int]]:
+                           chunk: int = EMBED_CHUNK,
+                           texts: list[str] | None = None) -> list[list[int]]:
     """按余弦相似度 ≥ threshold 把候选聚成簇（union-find），返回下标分组。
 
     为什么要自己做这一步：本轮新增的条目要等入库后才进 Chroma，所以**同轮内
@@ -404,6 +422,15 @@ def _cluster_by_similarity(vecs: np.ndarray,
     返回前做两件事（L1，2026-09-24）：**记录簇大小分布**（观测）与
     **拆掉超过 `MAX_CLUSTER_SIZE` 的簇**（保护）。后者会让返回值比「纯 union-find
     的结果」更碎 —— 这是刻意的：漏合并只多花分类的钱，误合并永久丢信息。
+
+    `texts`：与 `vecs` 同序的原文，**只用于日志示例**（`None` 则示例退化为下标）。
+    **签名保持向后兼容** —— 既有调用方与契约脚本只传 `vecs`。
+
+    另外记录**阈值两侧的相似度分布**（2026-09-24，复核意见 §7.3）：
+    「近阈值对」（`NEAR_MISS_LOW ≤ sim < threshold`，即差点被误合并的）与
+    「簇内最不像的一对」（真重复里离阈值最近的那对）。**只有一侧选不了阈值**：
+    只知道「最像的假对是 0.845」而不知道「最不像的真对是多少」，就无从判断
+    0.005 的余量到底是紧还是宽。
     """
     n = len(vecs)
     if n <= 1:
@@ -421,12 +448,27 @@ def _cluster_by_similarity(vecs: np.ndarray,
         if ra != rb:
             parent[max(ra, rb)] = min(ra, rb)
 
+    nm_count = 0                               # 近阈值对的总数
+    nm_top: list[tuple[float, int, int]] = []  # 每块只留 top-3，合并后仍是全局 top-3
     for i in range(0, n, chunk):
         sims = vecs[i:i + chunk] @ vecs[i:].T   # (c, n-i)
         rows, cols = np.where(sims >= threshold)
         for r, k in zip(rows.tolist(), cols.tolist()):
             if k > r:                          # 跳过对角线与重复的那一半
                 union(i + r, i + k)
+        # 近阈值对：与上面**同一遍枚举**（都要求 `k > r`），所以每对只数一次。
+        # 刻意用 numpy 取值、每块只留 top-3 —— 近阈值对可能有几千对，
+        # 在 Python 层逐对展开会同时吃掉 CPU 和日志（第 5 批刚做完日志降噪）。
+        nr, nc = np.where((sims >= NEAR_MISS_LOW) & (sims < threshold))
+        keep = nc > nr
+        nr, nc = nr[keep], nc[keep]
+        if nr.size:
+            nm_count += int(nr.size)
+            vals = sims[nr, nc]
+            take = (np.argpartition(vals, -3)[-3:] if vals.size > 3
+                    else np.arange(vals.size))
+            for t in take:
+                nm_top.append((float(vals[t]), i + int(nr[t]), i + int(nc[t])))
     buckets: dict[int, list[int]] = {}
     for idx in range(n):
         buckets.setdefault(find(idx), []).append(idx)
@@ -458,6 +500,40 @@ def _cluster_by_similarity(vecs: np.ndarray,
             out.extend([i] for i in c)
         else:
             out.append(c)
+
+    # 重复侧：每个多元素簇**内部最不像的一对**（簇内最小两两相似度）。
+    # 在**保护后**的簇上算 —— 每个簇 ≤ MAX_CLUSTER_SIZE，故 Σk² ≤ 20n，代价可忽略；
+    # 若在保护前算，一个 2000 条的巨型簇就是 4M 个浮点。
+    dup_min: float | None = None
+    dup_clusters = 0
+    for c in out:
+        if len(c) < 2:
+            continue
+        dup_clusters += 1
+        sub = vecs[c] @ vecs[c].T
+        np.fill_diagonal(sub, 1.0)     # 对角线上是同一条自己，不能算「最不像的一对」
+        m = float(sub.min())
+        dup_min = m if dup_min is None else min(dup_min, m)
+
+    nm_max = max((t[0] for t in nm_top), default=None)
+    logger.info(
+        f"[去重] 阈值余量：近阈值对 {nm_count} 对"
+        f"（≥{NEAR_MISS_LOW:.2f} 且 <{threshold}）"
+        + (f"，最高的那对 {nm_max:.4f}（距阈值还差 {threshold - nm_max:.4f}）"
+           if nm_max is not None else "")
+        + f"｜合并簇 {dup_clusters} 个"
+        + (f"，簇内最不像的一对 {dup_min:.4f}（高出阈值 {dup_min - threshold:+.4f}）"
+           if dup_min is not None else "")
+    )
+    # 示例单独一行、**只在真有近阈值对时打** —— 安静轮次不该多出一行。
+    if nm_top and texts:
+        examples = [
+            f"{s:.4f}「{_peek(texts[a])}」≈「{_peek(texts[b])}」"
+            for s, a, b in sorted(nm_top, reverse=True)[:3]
+            if a < len(texts) and b < len(texts)   # texts 比 vecs 短时不许越界
+        ]
+        if examples:
+            logger.info("[去重] 近阈值对示例：" + "；".join(examples))
     return out
 
 
@@ -771,7 +847,8 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
             f"[去重] 嵌入返回 {len(vecs)} 条，与候选数 {len(cands)} 不一致 —— "
             f"多出的候选拿不到近邻，会**一律按新条目处理**（宁可多存，不误合）"
         )
-    clusters = _cluster_by_similarity(vecs)
+    # 传 texts 只为让「近阈值对示例」能打出标题 —— 那正是标定阈值时最该被看见的东西
+    clusters = _cluster_by_similarity(vecs, texts=[c.text for c in cands])
     within_round = 0
     if len(clusters) != len(cands):
         before = len(cands)
