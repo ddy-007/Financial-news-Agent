@@ -170,7 +170,9 @@ def prepare_node(state: AnalystState) -> dict:
             )
         a_share, us = _market_snapshot(db, as_of)
         # 三项增量数据均加保护：任一失败只按缺省处理，不拖垮核心研判
-        from app.services.info_level import assess_info_level, classify_freshness
+        from app.services.info_level import (
+            assess_info_level, classify_freshness, is_stale,
+        )
         from app.services.sector_service import format_sector_summary
 
         indicators = _safe_extra(
@@ -224,7 +226,11 @@ def prepare_node(state: AnalystState) -> dict:
             for r in rows if r.publish_time
         ]
         data_freshness = {
-            "stale": bool(stale_cats),
+            # H2（2026-09-23）：**当日 0 条也算陈旧**。原先只看「近 1 天无新闻」，
+            # 于是 09-23 那种「当天 0 条、近 1 天有 1 条」被判为**新鲜** ——
+            # 数据缺失在报告的 `data_stale` 字段上完全不可见，正是 H2 要修的。
+            # 判定逻辑见 `is_stale`（抽出来是为了可测）。
+            "stale": is_stale(bool(stale_cats), freshness),
             "stale_categories": stale_cats,
             # 陈旧数据"截至"的日期（这批里最新的那条）——如实描述数据有多旧
             "stale_data_date": (
@@ -582,9 +588,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         divergence=final.get("divergence"),
         risk_veto=final.get("risk_veto"),
         low_info=info_level.get("low_info"),
-        # ⚠️ 「当日 0 条」也算陈旧（H2）：它原先只反映「近 1 天无新闻」，
-        # 而 09-23 那种「当天 0 条、近 1 天有 1 条」的情形被判为**新鲜**，
-        # 于是数据缺失在报告里完全不可见。
+        # 含义见 `is_stale`：近 1 天某类目无新闻 **或** 当日 0 条。
         data_stale=data_freshness.get("stale"),
         model=get_llm_model_name(part="expert"),
     )

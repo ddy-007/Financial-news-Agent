@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings  # noqa: E402
-from app.services.info_level import classify_freshness  # noqa: E402
+from app.services.info_level import classify_freshness, is_stale  # noqa: E402
 
 _RESULTS: list[tuple[bool, str]] = []
 
@@ -56,7 +56,16 @@ def main() -> int:
     check("阈值可覆盖", classify_freshness(5, threshold=3), "ok")
     check("阈值覆盖后低于门槛 → warn", classify_freshness(2, threshold=3), "warn")
 
-    print("\n[4] ok 是唯一「可以按事实陈述」的档位")
+    print("\n[4] 落地到报告字段：`is_stale`")
+    check("当日 0 条（error）→ 报告标陈旧", is_stale(False, "error"), True,
+          "**这是 H2 真正落地的一步** —— 只写日志的话，打开报告的人与评估层仍然看不到。"
+          "实测 09-23 那份报告 `data_stale=0`，缺失在字段上完全不可见")
+    check("某类目近 1 天无新闻（原判据）→ 报告标陈旧", is_stale(True, "ok"), True)
+    check("warn **不算**陈旧", is_stale(False, "warn"), False,
+          "warn 表示「素材可能不全」，与「数据是旧的」不是一回事，不该占用这个字段的语义")
+    check("ok → 不标陈旧", is_stale(False, "ok"), False)
+
+    print("\n[5] ok 是唯一「可以按事实陈述」的档位")
     ok_states = [classify_freshness(n) for n in range(0, th * 2)]
     check("只有达到门槛才出现 ok", sorted(set(ok_states)), ["error", "ok", "warn"],
           "error/warn 都意味着「今天的素材不完整」，报告里的否定性结论都不该照常写")

@@ -51,6 +51,23 @@ def classify_freshness(today_count: int, *, collecting: bool = False,
     return "ok"
 
 
+def is_stale(stale_categories: bool, freshness: str) -> bool:
+    """报告是否该标「数据陈旧」（`MarketReport.data_stale`）。
+
+    **这是 H2 真正落地的那一步** —— `classify_freshness` 只是算出档位，
+    而「当日 0 条」必须**落到报告的字段上**才算让缺失可见；只写日志的话，
+    打开报告的人（与评估层）仍然看不到。
+
+    两个来源取或：
+      · `stale_categories` —— 某个类目近 1 天**完全没新闻**（原有判据）
+      · `freshness == "error"` —— **当日 0 条**（H2 新增）
+
+    ⚠️ `warn` **不算陈旧**：它表示「素材可能不全」，与「数据是旧的」不是一回事，
+    不该占用这个字段的语义。
+    """
+    return bool(stale_categories) or freshness == "error"
+
+
 def assess_info_level(db: Session, target_date: date | None = None,
                       use_publish_time: bool = False) -> dict:
     """评估指定日期（默认今天）的信息量。
