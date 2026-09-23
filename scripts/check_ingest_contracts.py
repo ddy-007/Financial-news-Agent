@@ -563,7 +563,16 @@ def _within_round_in_pipeline():
     register("同事件A", "正文A", unit(1, 0))
     register("同事件B", "正文B", unit(0.99, 0.14))
     classify, calls = make_classifier()
-    with patched(embed_documents=fake_embed, vector_store=FakeStore(FakeCollection()),
+    # 数 embed_documents 的**调用次数与批量大小** —— M3 就是靠这个验的：
+    # 簇合并后若重新嵌入，这里会多出一次调用（2026-09-23 实机该步 22s）。
+    embed_batches: list[int] = []
+
+    def _counting_embed(texts):
+        embed_batches.append(len(texts))
+        return fake_embed(texts)
+
+    with patched(embed_documents=_counting_embed,
+                 vector_store=FakeStore(FakeCollection()),
                  classify_news=classify, _llm_is_duplicate=lambda *a: False,
                  _rebuild_bm25=lambda *a, **k: None, _upsert_index=lambda *a, **k: None):
         res = DA.run_data_agent(db, raw=[item("同事件A", "正文A"), item("同事件B", "正文B")])
@@ -571,6 +580,9 @@ def _within_round_in_pipeline():
           "直接调 _cluster_by_similarity 测不到「主流程有没有用它」")
     check("本轮内两条同事件 → within_round_merged = 1", res["within_round_merged"], 1)
     check("本轮内两条同事件 → 只送 1 条进分类", calls, [["同事件A"]])
+    check("**簇合并后不重新嵌入**（只调一次 embed_documents）", embed_batches, [2],
+          "合并后候选的 item 就是簇代表，文本未变 → vecs[rep] 直接可用。"
+          "重算一次是纯冗余（M3，实测该步 22s 里含一次全量重算）")
 
 
 def _duplicate_merge_target():

@@ -365,19 +365,30 @@ def _cluster_by_similarity(vecs: np.ndarray,
 
 
 def _collapse_clusters(cands: list[Candidate],
-                       clusters: list[list[int]]) -> list[Candidate]:
-    """把同簇候选并成一个：正文最长的当代表，sources 取并集。"""
-    out: list[Candidate] = []
+                       clusters: list[list[int]]) -> list[int]:
+    """把同簇候选并成一个；**返回每个新候选的代表在旧列表里的下标**。
+
+    返回**下标**而不是新建对象，是为了让调用方**复用首轮已经算好的向量** ——
+    合并后候选的 `item` 就是簇代表那一条，文本一字未变，`vecs[rep]` 直接可用。
+
+    ⚠️ 改动前这里返回新建的 `Candidate`，调用方拿不到对应向量，只能对全量重算一次
+    （`新闻采集入库索引已知问题.md` §8.8 的 M3）。2026-09-23 实机：该步 22s，
+    其中那次全量重算是**纯冗余** —— 文档 §10.2 的定性是对的，这里把量也补上了。
+
+    **副作用**：会就地把 `cands[rep]` 换成合并后的对象（代表下标不变）。
+    """
+    reps: list[int] = []
     for idxs in clusters:
         if len(idxs) == 1:
-            out.append(cands[idxs[0]])
+            reps.append(idxs[0])
             continue
         rep = max(idxs, key=lambda i: len(cands[i].item.content or ""))
         merged = Candidate(item=cands[rep].item, sources=[])
         for i in idxs:
             merged.sources.extend(cands[i].sources)
-        out.append(merged)
-    return out
+        cands[rep] = merged
+        reps.append(rep)
+    return reps
 
 
 def _nearest_existing(db: Session, cands: list[Candidate],
@@ -667,9 +678,12 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     within_round = 0
     if len(clusters) != len(cands):
         before = len(cands)
-        cands = _collapse_clusters(cands, clusters)
+        reps = _collapse_clusters(cands, clusters)
+        # **复用首轮向量**（M3）：合并后候选的 item 就是簇代表，文本未变，
+        # `vecs[rep]` 直接可用 —— 重算一次是纯冗余（2026-09-23 实测该步 22s）。
+        vecs = vecs[reps]
+        cands = [cands[i] for i in reps]
         within_round = before - len(cands)
-        vecs = _embed_candidates(cands)   # 代表条目可能换了，得重新嵌入
     logger.info(f"[去重] 批量嵌入完成：{len(cands)} 个候选，"
                 f"本轮内语义合并 {within_round} 个，耗时 {time.time() - _t_embed:.0f}s")
 
