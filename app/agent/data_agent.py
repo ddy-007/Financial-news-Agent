@@ -57,6 +57,18 @@ BATCH_SIZE = 20       # LLM 批量分类每批条数
 # 与采集层的 `MAX_CONSECUTIVE_PAGE_FAILS` 是同一个思路。
 MAX_CONSECUTIVE_BATCH_FAILS = 3
 DUP_THRESHOLD = 0.85  # 相似度 ≥ 此值判为重复（**直接合并，不过 LLM**）
+# 语义聚簇的**规模上限**（L1，2026-09-24）。
+#
+# union-find 的传递闭包有个已知的**渗流相变**：只要 A–B 与 B–C 都超阈值，
+# A、C 就被并进同一簇 —— 哪怕它俩的相似度远低于阈值。平时无害（簇小、成员确实相邻），
+# 但同一模板的快讯一旦连发（「XX 股涨停」几十条），**阈值不变**也可能突然冒出一个
+# 巨型连通分量，把大量真实信息并成一条 —— 而合并是**不可逆**的。
+#
+# 取 20 的依据：实测 source_count 分布 1源 607 / 2源 178 / 3源 140 ——
+# 库里最多 3 个源，单事件的簇大小在个位数，20 已是两个数量级的余量。
+# 撞上限时**拒绝自动合并**（降级为逐条），代价只是多花分类的钱，
+# 而误合并永久丢信息 —— 代价不对称，所以宁可不合。
+MAX_CLUSTER_SIZE = 20
 GRAY_LOW = 0.70       # 相似度在此区间则交 LLM 复核（保持原行为）
 # 语义去重的时间窗。**没有它就会过度合并** —— 详见 `_nearest_existing`。
 DEDUP_WINDOW_HOURS = 24
@@ -335,6 +347,10 @@ def _cluster_by_similarity(vecs: np.ndarray,
     分块计算：n 条候选的相似度矩阵是 n²，2200 条就是 480 万个数；回补场景可能
     上万条（10⁸），一次性算完内存吃不消。按 `EMBED_CHUNK` 行一块块来，
     且只与 `i` 之后的比（对称矩阵只用一半）。
+
+    返回前做两件事（L1，2026-09-24）：**记录簇大小分布**（观测）与
+    **拆掉超过 `MAX_CLUSTER_SIZE` 的簇**（保护）。后者会让返回值比「纯 union-find
+    的结果」更碎 —— 这是刻意的：漏合并只多花分类的钱，误合并永久丢信息。
     """
     n = len(vecs)
     if n <= 1:
@@ -361,7 +377,35 @@ def _cluster_by_similarity(vecs: np.ndarray,
     buckets: dict[int, list[int]] = {}
     for idx in range(n):
         buckets.setdefault(find(idx), []).append(idx)
-    return list(buckets.values())
+    clusters = list(buckets.values())
+
+    # ③ 分布观测：**一个数字就能报警**。刻意统计**保护前**的原始分布 ——
+    # 拆过之后再统计就永远看不到那个异常的大簇了，而「最大簇从 14 跳到 9000」
+    # 正是渗流相变唯一的早期信号。
+    sizes = sorted(len(c) for c in clusters)
+    if sizes:
+        p95 = sizes[min(len(sizes) - 1, int((len(sizes) - 1) * 0.95))]
+        logger.info(
+            f"[去重] 簇大小分布：组数 {len(sizes)}｜最大 {sizes[-1]}"
+            f"｜p95 {p95}｜中位 {sizes[len(sizes) // 2]}"
+        )
+
+    # ① 规模保护：超限的簇**拒绝自动合并**，降级为逐条处理。
+    # 降级的代价只是「本可以省下的几次分类」，而放它合并的代价是**永久丢信息**
+    # —— 不对称，所以宁可不合（详见 `MAX_CLUSTER_SIZE` 的注释）。
+    out: list[list[int]] = []
+    for c in clusters:
+        if len(c) > MAX_CLUSTER_SIZE:
+            logger.warning(
+                f"[去重] 候选簇规模 {len(c)} 超过上限 {MAX_CLUSTER_SIZE} —— "
+                f"**拒绝自动合并**，降级为逐条（多花分类的钱，不丢信息）。"
+                f"这通常是模板化快讯连发的征兆（传递闭包渗流），"
+                f"请对照本行的簇大小分布确认最大簇是否异常"
+            )
+            out.extend([i] for i in c)
+        else:
+            out.append(c)
+    return out
 
 
 def _collapse_clusters(cands: list[Candidate],

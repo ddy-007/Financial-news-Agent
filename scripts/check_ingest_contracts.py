@@ -285,6 +285,31 @@ def _cluster():
 
     check("空输入安全", DA._cluster_by_similarity(np.zeros((0, _DIM), dtype=np.float32)), [])
 
+    # ---- L1（2026-09-24）：传递闭包的规模保护与分布观测 ----
+    # 造 k 条**完全相同**的向量 —— 它们两两 cos=1.0，union-find 必然并成一个簇，
+    # 正是渗流相变的最小复现（模板化快讯连发时就是这个形态）。
+    cap = DA.MAX_CLUSTER_SIZE
+    sink = _Sink()
+    hid = logger.add(sink.write, level="INFO", format="{message}")
+    try:
+        over = DA._cluster_by_similarity(np.stack([v(1, 0)] * (cap + 1)))
+        at = DA._cluster_by_similarity(np.stack([v(1, 0)] * cap))
+    finally:
+        logger.remove(hid)
+    check(f"{cap + 1} 条全同 → 超过上限，**拒绝自动合并**、降级为逐条",
+          sorted(len(c) for c in over), [1] * (cap + 1),
+          "误合并是**不可逆**的（条目被吃进代表里），多花几次分类的钱是可接受的代价")
+    check(f"正好 {cap} 条 → 不拆（判据是「超过」而非「达到」）",
+          [len(c) for c in at], [cap])
+    check("簇大小分布已记录（组数 / 最大 / p95 / 中位 四个数）",
+          all(k in sink.text for k in ("组数", "最大", "p95", "中位")), True,
+          "「最大簇从 14 跳到 9000 就是警报，而这只是一个数字」—— "
+          "库内数据**原理上查不出已发生的误合并**（被吃掉的条目已不在库中），"
+          "所以这条长期监控是唯一的早期信号")
+    check("分布统计的是**保护前**的原始分布（最大簇照实报）",
+          f"最大 {cap + 1}" in sink.text, True,
+          "拆过之后再统计就永远看不到那个异常大簇了")
+
 
 # ============ ② 时间窗 ============
 def _time_window():
