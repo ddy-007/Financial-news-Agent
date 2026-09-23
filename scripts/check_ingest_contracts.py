@@ -779,6 +779,112 @@ def _result_shape():
     check("空输入不炸", (res["collected"], res["new"]), (0, 0))
 
 
+# ============ ⑫ B1：失败分类 / 抖动退避 / 熔断 ============
+class _BoomLLM:
+    """一调就抛的假 LLM —— 复现「LLM 不可用」那一轮（2026-09-22：0.43 秒刷 110 条）。"""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def invoke(self, _prompt):
+        raise self.exc
+
+
+class _FakeStatus(Exception):
+    """带 `status_code` 的假异常 —— `app.retry` 的判据优先看状态码，不看消息文本。"""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(f"Error code: {code} - fake")
+        self.status_code = code
+
+
+def _classification_failure():
+    print("\n[12] B1：失败分类 / 抖动退避 / 熔断（2026-09-24）")
+
+    # ---- ① 退避函数本身：下界固定、上界指数放大且被 cap 截断 ----
+    seen: list[tuple[float, float]] = []
+    orig_uniform = DA.random.uniform
+    DA.random.uniform = lambda a, b: (seen.append((a, b)), (a + b) / 2)[1]
+    try:
+        for att in (1, 2, 9):
+            DA._backoff_delay(att)
+    finally:
+        DA.random.uniform = orig_uniform
+    check("下界恒为 base，上界按 3 倍指数放大并被 cap 截断",
+          seen, [(1.0, 3.0), (1.0, 8.0), (1.0, 8.0)],
+          "AWS decorrelated jitter 形式。**抖动不能省** —— 写死的 2/4/8 会让多个客户端"
+          "同步重打（业界量化：抖动可减少 60~80% 的重试风暴）")
+    spread = {DA._backoff_delay(2) for _ in range(20)}
+    check("区间内真随机（20 次取值不全相同）", len(spread) > 1, True)
+    check("取值恒落在 [base, cap]",
+          all(DA.BACKOFF_BASE <= d <= DA.BACKOFF_CAP for d in spread), True)
+
+    # ---- ② 失败分类**复用 `app.retry.is_retryable`**，不另写一份 ----
+    from app.retry import is_retryable  # noqa: PLC0415
+    check("连接错误 → 可重试", is_retryable(ConnectionError("Connection error")), True)
+    check("429 限流 → 可重试", is_retryable(_FakeStatus(429)), True)
+    check("401 鉴权失败 → **不可重试**", is_retryable(_FakeStatus(401)), False,
+          "退避对 terminal 错误是纯白等 —— 换谁都不会好。判据**按状态码与异常类型**，"
+          "不匹配消息文本（文本里常含无关数字，会误伤 500/超时）")
+
+    # ---- ③ 循环里的实际行为：100 条 = 5 批，第 3 批熔断 ----
+    items = [item(f"t{i}") for i in range(100)]
+    sleeps: list[float] = []
+    sink = _Sink()
+    hid = logger.add(sink.write, level="INFO", format="{message}")
+    orig_sleep = DA.time.sleep            # `DA.time` 就是 time 模块本身，用完必须还原
+    try:
+        DA.time.sleep = sleeps.append
+        try:
+            with patched(get_llm=lambda **kw: _BoomLLM(ConnectionError("Connection error")),
+                         llm_retry_times=lambda **kw: 1):
+                results, failed = DA.classify_news(items)
+        finally:
+            DA.time.sleep = orig_sleep
+    finally:
+        logger.remove(hid)
+
+    lines = sink.text.splitlines()
+    batch_lines = [ln for ln in lines if "[分类] 第" in ln]
+    check("连续 3 批即熔断：只打了 3 条批日志（不是 5 条）",
+          len(batch_lines), DA.MAX_CONSECUTIVE_BATCH_FAILS,
+          "2026-09-22 实测：连接中断后 **0.433 秒内刷完 55 批**（3.9 毫秒/批），"
+          "循环里没有任何等待 —— 打 55 次和打 1 次没区别，只是把日志刷爆")
+    check("熔断时剩余条目**一并交出**（100 条全计入分类失败）", len(failed), 100,
+          "不交就会出现「既不在 results 也不在 failed」→ classify_failed=0 "
+          "→ 水位线照常推进 → 那批新闻**永久丢失**")
+    check("成功后无残留", results, [])
+    check("熔断行说清了「水位线不推进，下轮重取」",
+          "中断本轮分类" in sink.text and "水位线不推进" in sink.text, True)
+    check("退避真的执行了，且**跳过最后一次**（要中断了还等没有意义）",
+          len(sleeps), 2)
+    check("每次退避都在 [base, cap] 内",
+          all(DA.BACKOFF_BASE <= s <= DA.BACKOFF_CAP for s in sleeps), True)
+    check("全轮日志被压到 8 行以内（对照事故的 110 行）",
+          len([ln for ln in lines if "[分类]" in ln or "[重试]" in ln]) <= 8, True,
+          "文档 §8.4 的验收标准；每批仍会有 1 行 `[重试] …` 来自 app/retry.py，"
+          "那里是共用的采集层代码，本次不动")
+
+    # ---- ④ terminal 错误：不退避（白等）----
+    # 这一段只关心「睡没睡」，不关心日志文本 —— 整段静音，免得 8 行原始
+    # ERROR 混进断言输出里，让读的人以为脚本自己报错了。
+    sleeps2: list[float] = []
+    orig_sleep2 = DA.time.sleep
+    logger.disable("")
+    try:
+        DA.time.sleep = sleeps2.append
+        try:
+            with patched(get_llm=lambda **kw: _BoomLLM(_FakeStatus(401)),
+                         llm_retry_times=lambda **kw: 1):
+                DA.classify_news([item(f"u{i}") for i in range(100)])
+        finally:
+            DA.time.sleep = orig_sleep2
+    finally:
+        logger.enable("")
+    check("401（terminal）→ **一次都没退避**", sleeps2, [],
+          "对鉴权/参数类错误等待是纯白等；它们仍会按 3 批熔断，"
+          "所以日志量并不因此变多")
+
 def main() -> int:
     _fingerprint()
     _group_by_fingerprint()
@@ -791,6 +897,7 @@ def main() -> int:
     _duplicate_merge_target()
     _log_contracts()
     _result_shape()
+    _classification_failure()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:

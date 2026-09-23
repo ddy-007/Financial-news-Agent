@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ from app.agent.llm import get_llm, get_llm_model_name, llm_retry_times
 from app.agent.prompts import CLASSIFY_PROMPT, DEDUP_PROMPT
 from app.collectors.news_collector import NewsItem, collect_all_news
 from app.models.news import News
-from app.retry import call_with_retry
+from app.retry import call_with_retry, is_retryable
 from app.rag import vector_store
 from app.rag.embeddings import embed_documents
 from app.rag.retriever import get_retriever
@@ -56,6 +57,31 @@ BATCH_SIZE = 20       # LLM 批量分类每批条数
 # 3 批足够区分「偶发抖动」（重试后多半就成功了）与「整体不可用」。
 # 与采集层的 `MAX_CONSECUTIVE_PAGE_FAILS` 是同一个思路。
 MAX_CONSECUTIVE_BATCH_FAILS = 3
+
+# 批间**抖动**指数退避的上下界（秒，B1，2026-09-24）
+BACKOFF_BASE = 1.0
+BACKOFF_CAP = 8.0
+
+
+def _backoff_delay(attempt: int, *, base: float = BACKOFF_BASE,
+                   cap: float = BACKOFF_CAP) -> float:
+    """第 `attempt` 次连续失败时该等多久 —— **抖动**指数退避。
+
+    **为什么必须有**：2026-09-22 实测连接中断后 `0.433 秒内刷完 55 批`
+    （3.9 毫秒/批）—— 循环里没有任何等待，失败**瞬时返回**（连超时都不等）。
+    那样打 55 次和打 1 次没有区别，只是把日志刷爆 + 白烧 CPU。
+
+    **为什么加抖动**：`2→4→8` 这种写死的节奏在多个客户端同时失败时会让它们
+    **同步**重打（thundering herd）。业界量化结论是加抖动可减少 60~80% 的
+    重试风暴。这里用 AWS 的 decorrelated jitter 形式：下界固定 `base`、
+    上界随尝试次数指数放大到 `cap`，取值在区间内随机。
+
+    ⚠️ 与 `app/retry.py` 的退避**分工不同，不要合并**：那个在**一次调用内部**
+    重试时用（`retry_delay * 2**i`，进程内单次请求，没有同步问题，故不加抖动）；
+    这个在**批与批之间**用。且 `news` 分组配了备用模型后 `llm_retry_times()`
+    降为 1，内部退避**根本不会执行** —— 那条路指望不上（B1 的根因 2）。
+    """
+    return random.uniform(base, min(cap, base * (3 ** attempt)))
 DUP_THRESHOLD = 0.85  # 相似度 ≥ 此值判为重复（**直接合并，不过 LLM**）
 # 语义聚簇的**规模上限**（L1，2026-09-24）。
 #
@@ -197,8 +223,23 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
             # 交出来而不是丢掉 —— 上层要据此拒绝推进水位线（详见函数 docstring）
             failed.extend(batch)
             consecutive_fails += 1
-            logger.warning(f"LLM 分类失败（本批 {len(batch)} 条未分类）: {e}")
-            if consecutive_fails >= MAX_CONSECUTIVE_BATCH_FAILS:
+            # 日志合并成**一行**（B1 ③）：原先是「`[重试] …` + `LLM 分类失败…`」两行，
+            # 55 批就是 110 行，把别的信息全淹了。退避信息也并进这一行 ——
+            # 单独打会显得零碎，读者要拼三行才知道发生了什么。
+            retryable = is_retryable(e)
+            breaking = consecutive_fails >= MAX_CONSECUTIVE_BATCH_FAILS
+            delay = _backoff_delay(consecutive_fails) if retryable else 0.0
+            if not retryable:
+                note = "**不可重试**（鉴权/参数/配额类），不退避"
+            elif breaking:
+                note = "**可重试**，但已连续失败到熔断阈值 —— 不再退避，直接中断"
+            else:
+                note = f"**可重试**，退避 {delay:.1f}s 后打下一批"
+            logger.warning(
+                f"[分类] 第 {batch_idx}/{total_batches} 批失败"
+                f"（{len(batch)} 条未分类）：{e}｜{note}（连续失败 {consecutive_fails} 次）"
+            )
+            if breaking:
                 # **熔断**：LLM 连续失败通常意味着"不可用"（连接断了 / 额度耗尽 /
                 # key 失效），而不是"这一批运气不好"。此时把剩下的批次全打完，
                 # 只是白等 + 把日志刷爆（2026-09-22 实测：连接中断后 **0.43 秒内
@@ -215,6 +256,10 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
                     f"（水位线不推进，下轮重取）"
                 )
                 break
+            if retryable:
+                # 只对 transient 退避：对 401/403/400 等待是纯白等
+                # （判据复用 `app.retry.is_retryable`，不在这里重写一份）。
+                time.sleep(delay)
         else:
             consecutive_fails = 0
             # 日志 4/5：进度行补上「成功 / 漏项 / 模型」。

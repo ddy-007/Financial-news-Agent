@@ -303,7 +303,12 @@ def get_llm(temperature: float = 0.0, *, part: str):
         # 主模型在冷却期 → **从链首摘掉**，用第一个备用当主。
         # 这样整轮都不再白打主模型（实测 2026-09-23 那轮白打了 8 次）。
         head, rest = fallbacks[0], fallbacks[1:]
-        logger.warning(
+        # 这里**必须是 debug**：`get_llm` 每批都调一次，冷却期内每批都会走到这一行。
+        # 实测 2026-09-24 那轮：**6 秒 15 条**同样的 WARNING，把别的信息全淹了 ——
+        # 这与 B1 ③ 要修的「日志爆炸」是同一个毛病，只是换了个位置。
+        # 「进入冷却」那一条已经由 `_ModelRecorder` 在**新开冷却时**打过（见 :130），
+        # 每批重复说一次不再增加任何信息。
+        logger.debug(
             f"[{part}] 主模型 {model} 仍在冷却期（至 {cooling:%H:%M:%S}）—— "
             f"本轮**跳过主模型**，直接用 {effective_fallback_models(part)[0]}"
         )

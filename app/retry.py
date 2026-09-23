@@ -67,6 +67,20 @@ def _should_retry(exc: Exception) -> bool:
     return True
 
 
+def is_retryable(exc: Exception) -> bool:
+    """公开版 `_should_retry` —— 供**调用方**在重试之外判断错误性质。
+
+    **为什么需要**（B1，2026-09-24）：分类循环里每批之间要决定「退避多久再打下一批」。
+    退避对 401/403/400 是纯白等（换谁都不会好），对限流/连接错误才是对的 ——
+    于是那个循环需要同一个判定。**判据只保留一份**：这里转发，不复制逻辑，
+    否则两处迟早会漂移（"同一份事实的两个副本"，本模块与契约脚本要防的正是这个）。
+
+    与 `_should_retry` 的关系：那个是「装饰器内部要不要再试一次」，
+    这个是「调用方要不要等一会儿」—— 同源，只是使用位置不同。
+    """
+    return _should_retry(exc)
+
+
 def with_retry(fn: Callable | None = None, *, retry_times: int = DEFAULT_TIMES,
                retry_delay: float = DEFAULT_BASE_DELAY, retry_label: str = ""):
     """指数退避重试装饰器。

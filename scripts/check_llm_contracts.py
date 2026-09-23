@@ -130,6 +130,23 @@ def main() -> int:
               len([ln for ln in sink.lines if "冷却" in ln or "未成功" in ln]), 0,
               "实测那轮打了 8 条重复 WARNING —— 它们把别的信息淹了")
 
+        print("\n[6b] 冷却期内 `get_llm` 本身也不许刷屏（2026-09-24）")
+        # `get_llm` 每批都调一次，冷却期内每批都会走「跳过主模型」那一支。
+        # 实测 2026-09-24 那轮：**6 秒 15 条**同样的 WARNING —— 与 B1 ③ 是同一个毛病。
+        reset_cooldown()
+        L.note_primary_failed(PART)
+        sink2 = Sink()
+        hid2 = logger.add(sink2.write, level="WARNING", format="{message}")
+        try:
+            for _ in range(8):
+                head_and_fallbacks()
+        finally:
+            logger.remove(hid2)
+        check("冷却期内 8 次 `get_llm` → **0 条** WARNING",
+              len([ln for ln in sink2.lines if "冷却" in ln]), 0,
+              "「进入冷却」那一条已由 `_ModelRecorder` 在**新开冷却时**打过一次；"
+              "每批重复说一遍不增加任何信息，只会把别的信息淹掉")
+
         print("\n[7] 模型名溯源不被冷却影响")
         _head, _ = head_and_fallbacks()
         with fake_fallbacks(["FB-1"]):
