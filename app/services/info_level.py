@@ -70,6 +70,27 @@ def is_stale(stale_categories: bool, freshness: str) -> bool:
     return bool(stale_categories) or freshness == "error"
 
 
+def is_round_overdue(seconds_since_last_round: float | None,
+                     interval_minutes: float) -> bool:
+    """上一轮**完整成功**的采集是否已超过一个采集间隔（H1 的就绪判据）。
+
+    语义是「**本窗口的新闻还没落地**」：整点起跑的话，账面上任何时刻都应该有
+    一轮「距今不到一个间隔」的成功记录。超过了，说明本窗口那一轮没成 ——
+    没跑 / 跑挂了 / 分类失败导致水位线没推进。
+
+    `None`（**从没成功过**）返回 True：库里没有可用的新闻轮记录，
+    研判此时按「数据没落地」处理才是安全侧。
+
+    ⚠️ 与 `collector_health` 的陈旧判据**分工不同，别合并**：
+    那个用 `NEWS_STALE_FACTOR`（默认 3 倍）判「**源**是不是失效了」，容忍度高；
+    这里用 1 倍，只服务**研判取数**这一个决策，宁可早说 ——
+    H1 的要害正是研判**静默**地用了不含本窗口的数据（09-23 报告写「今日无重大消息」）。
+    """
+    if seconds_since_last_round is None:
+        return True
+    return seconds_since_last_round > interval_minutes * 60
+
+
 def assess_info_level(db: Session, target_date: date | None = None,
                       use_publish_time: bool = False) -> dict:
     """评估指定日期（默认今天）的信息量。

@@ -2,7 +2,8 @@
 
 用法：`.venv/Scripts/python.exe scripts/check_freshness_contracts.py`
 
-**完全不联网、不连库** —— 只测 `classify_freshness` 这个纯函数。
+**完全不联网、不连库** —— 测 `classify_freshness` / `is_stale` / `is_round_overdue`
+这三个纯函数，外加 H1 研判侧等待的**硬上限**（[7] 会真拿一次进程内锁，约 1.5 秒）。
 
 **为什么要单独钉它**：这个判定的失败方式是**静默的**，而且已经在 2026-09-23 真实发生过一次 ——
 当天新闻 0 条，旧判据（只看「近 1 天有没有新闻」）判为**新鲜**，于是日报写出
@@ -17,7 +18,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings  # noqa: E402
-from app.services.info_level import classify_freshness, is_stale  # noqa: E402
+from app.services.info_level import (  # noqa: E402
+    classify_freshness, is_round_overdue, is_stale,
+)
 
 _RESULTS: list[tuple[bool, str]] = []
 
@@ -69,6 +72,39 @@ def main() -> int:
     ok_states = [classify_freshness(n) for n in range(0, th * 2)]
     check("只有达到门槛才出现 ok", sorted(set(ok_states)), ["error", "ok", "warn"],
           "error/warn 都意味着「今天的素材不完整」，报告里的否定性结论都不该照常写")
+
+    print("\n[6] H1 就绪判据：`is_round_overdue`（2026-09-24 新增）")
+    check("上一轮刚跑完（半个间隔）→ 不算 overdue", is_round_overdue(30 * 60, 60), False)
+    check("正好一个间隔 → **不算**（判据是「超过」）", is_round_overdue(60 * 60, 60), False,
+          "边界取「超过」而非「达到」：整点轮次下正常时刻恰好接近一个间隔，"
+          "取「达到」会把正常轮次也报成未落地")
+    check("超过一个间隔 → overdue", is_round_overdue(60 * 60 + 1, 60), True,
+          "整点起跑的话，账面上任何时刻都该有一轮「距今不到一个间隔」的成功记录")
+    check("**从未成功过**（None）→ overdue", is_round_overdue(None, 60), True,
+          "库里没有任何一轮成功记录时，按「没落地」处理才是安全侧 —— "
+          "H1 的教训就是「没看到」被当成了「没发生」")
+    check("判据随间隔走：30 分钟间隔下 31 分钟即 overdue",
+          is_round_overdue(31 * 60, 30), True)
+
+    print("\n[7] H1 研判侧等待：`_wait_for_collect` 的硬上限（真拿一次锁，约 1.5 秒）")
+    import time as _time  # noqa: PLC0415
+
+    from app.collectors.scheduler import _wait_for_collect  # noqa: PLC0415
+    from app.services.news_service import _COLLECT_LOCK  # noqa: PLC0415
+
+    check("没在跑 → 立即返回 True（不空等）", _wait_for_collect(5.0), True)
+    _COLLECT_LOCK.acquire()
+    try:
+        _t0 = _time.monotonic()
+        _waited_ok = _wait_for_collect(0.02)          # 预算 1.2 秒
+        _elapsed = _time.monotonic() - _t0
+    finally:
+        _COLLECT_LOCK.release()
+    check("持锁超预算 → 返回 False（**不再等下去**）", _waited_ok, False,
+          "研判自己也有时效要求：无界等待等于把风险从「少用一天数据」"
+          "换成「当天没有报告」—— 后者更糟")
+    check("超时判定不越界（预算 1.2s，实测 < 3s）", _elapsed < 3.0, True,
+          f"实测 {_elapsed:.1f}s —— 睡眠被剩余预算夹住，不会多睡一整个轮询周期")
 
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")

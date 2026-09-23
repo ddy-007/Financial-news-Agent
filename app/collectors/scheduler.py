@@ -1,4 +1,6 @@
 """APScheduler 定时调度：新闻增量采集 / 行情采集 / 每日研判。"""
+import time
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
@@ -54,6 +56,50 @@ def _job_sector() -> None:
         db.close()
 
 
+_REPORT_WAIT_POLL_SECONDS = 10  # 等采集轮时多久查一次锁
+
+
+def _wait_for_collect(max_minutes: float) -> bool:
+    """研判起跑前，若新闻采集轮仍在运行，最多等它 `max_minutes` 分钟。
+
+    返回 True = 可以继续（本来就没在跑，或等到它结束了）；False = 超时仍在跑。
+
+    **为什么值得等**（H1，2026-09-23 实测）：新闻轮整点起跑、积压轮要跑 21 分钟，
+    而研判 18:15 取数 —— 缺口 6 分 9 秒，**当天的新闻一条都没进日报**。
+    把日报推到 18:30 是止血（固定 30 分钟余量），这里是**兜底** ——
+    LLM 变慢时余量会不够，而等待是按**实际进度**判定的。
+
+    **硬上限不能省**：研判自己也有时效要求，无界等待等于把风险从「少用一天数据」
+    换成「当天没有报告」。超时后照常生成，由 `prepare_node` 如实标注。
+
+    轮询而非 `lock.acquire()` 阻塞，是为了让日志能说清「等了多久」——
+    阻塞式等待在日志里是一片空白，事后无法判断研判是被拖住了还是卡住了。
+    """
+    from app.services.news_service import _COLLECT_LOCK
+
+    deadline = time.monotonic() + max_minutes * 60
+    waited = False
+    while _COLLECT_LOCK.locked():
+        if time.monotonic() >= deadline:
+            logger.warning(
+                f"[调度] 新闻采集轮等待 {max_minutes:.0f} 分钟仍未结束 —— **不再等**，"
+                f"本次研判将不包含这一轮的新闻（prepare_node 会如实标注）"
+            )
+            return False
+        if not waited:
+            waited = True
+            logger.info(
+                f"[调度] 新闻采集轮仍在运行，等待最多 {max_minutes:.0f} 分钟后开始研判…"
+            )
+        # 睡眠不越界：否则「最多等 5 分钟」实际会变成 5 分钟 + 一个轮询周期，
+        # 与 docstring 的承诺不符（超时判定在睡眠**之前**做）。
+        time.sleep(max(0.1, min(_REPORT_WAIT_POLL_SECONDS,
+                                deadline - time.monotonic())))
+    if waited:
+        logger.info("[调度] 新闻采集轮已结束，研判继续")
+    return True
+
+
 def _job_report() -> None:
     from app.collectors.trading_calendar import is_trading_day
     from app.db import SessionLocal
@@ -62,6 +108,8 @@ def _job_report() -> None:
     if not is_trading_day():
         logger.info("[调度] 今日非交易日，跳过每日研判")
         return
+    if settings.report_wait_max_minutes > 0:
+        _wait_for_collect(settings.report_wait_max_minutes)
     db = SessionLocal()
     try:
         report = run_daily_pipeline(db)

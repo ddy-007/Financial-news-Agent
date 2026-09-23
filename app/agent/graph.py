@@ -223,8 +223,9 @@ def prepare_node(state: AnalystState) -> dict:
         # 两者时间相近时，本轮日报**拿不到这一轮的新闻**（09-23 实测缺口 6 分 9 秒，
         # 日报据此写出「今日无重大消息」）。这里如实记录，让下游能区分
         # 「今天真没消息」与「今天的新闻还没落地」。
-        from app.services.news_service import _COLLECT_LOCK
-        collecting = _COLLECT_LOCK.locked()
+        from app.services.news_service import news_readiness
+        ready = news_readiness(db)
+        collecting = ready["collecting"]
         freshness = classify_freshness(today_count, collecting=collecting)
 
         stale_cats = [k for k, (_, st) in groups.items() if st]
@@ -251,6 +252,13 @@ def prepare_node(state: AnalystState) -> dict:
             "today_count": today_count,
             "freshness": freshness,        # ok / warn / error
             "collecting": collecting,      # 采集轮是否仍在运行
+            # ---- H1 就绪信号（2026-09-24 新增）----
+            # 「上一轮**完整成功**落地」的时刻。日志里只写「今日新增=0」分不出
+            # 「今天真没消息」与「新闻轮还没落地」，这一条给出可证伪的正向信息。
+            "last_round_at": (
+                ready["last_round_at"].isoformat() if ready["last_round_at"] else None
+            ),
+            "round_overdue": ready["overdue"],
         }
         if stale_cats:
             # 快讯是 7×24 的，出现"近 1 天无新闻"通常意味着**采集故障**，
@@ -273,6 +281,20 @@ def prepare_node(state: AnalystState) -> dict:
                 "新闻采集轮仍在运行 —— 本轮研判**不包含**这一轮的新闻。"
                 "若这是当日的主要新闻来源，报告的时效性会受影响。"
             )
+        elif ready["overdue"]:
+            # 采集轮**没在跑**，但上一轮成功已是超过一个采集间隔之前 ——
+            # 说明本窗口那一轮没成（没跑 / 跑挂了 / 分类失败水位线没推进）。
+            # 这与「今天真没消息」是完全不同的事实，必须显式说出来：
+            # H1 的要害正在于它原本被静默吞掉，报告照写「今日无重大消息」。
+            _secs = ready["seconds_since"]
+            logger.warning(
+                f"上一轮新闻采集距今 "
+                + ("**从未成功过**" if _secs is None else f"{_secs / 60:.0f} 分钟")
+                + f"（超过一个采集间隔 {settings.news_interval_minutes} 分钟）—— "
+                f"**本窗口的新闻很可能没有落地**。"
+                f"报告里「今日无重大消息」这类否定性结论不可信，"
+                f"请先核对采集链路与 reports/app.log"
+            )
 
         # 运行环境：交易日历降级（会按「工作日」猜测，节假日可能误判）
         env = {"calendar_degraded": _calendar_degraded()}
@@ -294,6 +316,9 @@ def prepare_node(state: AnalystState) -> dict:
         f"；⚠️ 数据陈旧（最新新闻 {data_freshness['newest_news_date']}）"
         if data_freshness["stale"] else ""
     )
+    # H1：ISO 时刻压到分钟（`2026-09-24T00:00:35.259` → `2026-09-24 00:00`），
+    # 否则日志行会被秒级小数撑长、也读不出重点。
+    _last_round = (data_freshness.get("last_round_at") or "")[:16].replace("T", " ")
     # 今日新增取不出来时给 '?'，**不要给 0** —— 0 会与「今天真的没有新消息」混淆，
     # 而这正是本次要修的那个误读。
     _signals = info_level.get("signals") or {}
@@ -308,6 +333,10 @@ def prepare_node(state: AnalystState) -> dict:
         # 而「最新新闻=2026-09-22 22:29」这一条就足以让人一眼看出问题。
         f"｜最新新闻={newest or '无'}｜今日新增={_new_count}"
         f"｜新鲜度={data_freshness.get('freshness', '?')}"
+        # H1（2026-09-24）：「上一轮成功落地」的时刻 —— 与「最新新闻」互补，
+        # 前者说明**采集轮**跑没跑成，后者说明**库里**有什么。
+        f"｜上轮采集={_last_round or '无'}"
+        + ("｜**本窗口新闻未落地**" if data_freshness.get("round_overdue") else "")
         + ("｜**采集轮仍在运行，本轮新闻未纳入**"
            if data_freshness.get("collecting") else "")
     )

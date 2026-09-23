@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timedelta
 
 from loguru import logger
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.collectors.news_collector import (
@@ -16,6 +17,7 @@ from app.models.news import News
 from app.rag import vector_store
 from app.rag.embeddings import embed_documents
 from app.rag.retriever import get_retriever
+from app.services.info_level import is_round_overdue
 
 
 # ================= 增量水位线 =================
@@ -191,6 +193,34 @@ def rebuild_bm25_index(db: Session, days: int = 7) -> None:
 #
 # 注意它只挡**同一进程内**的并发；多进程部署需要换成文件锁或 DB 锁。
 _COLLECT_LOCK = threading.Lock()
+
+
+def news_readiness(db: Session, *, now: datetime | None = None) -> dict:
+    """新闻轮的**就绪状态** —— 研判取数前判断「本窗口的新闻是否已落地」（H1，2026-09-24）。
+
+    **为什么需要它**：生产者（采集轮）与消费者（研判）之间原本**只有时间对齐**，
+    没有任何就绪信号。2026-09-23 实测：新闻轮 18:00 起跑、18:21:08 才入库，
+    而研判 18:15 取数 —— 缺口 6 分 9 秒，**当天的新闻一条都没进日报**，
+    报告却照事实写出「新增 0 条」，再把它解读成「今日无重大消息」。
+
+    **数据来源复用 `collector_state.last_ok_at`，不新增存储**：它只在
+    「采集完整 + 无分类失败 + 确有推进」时才更新（见 `save_states` 的规则表），
+    语义恰好就是「上一轮成功落地」。—— 取**所有源的最大值**，回答的是
+    「整轮有没有成功跑完」；单个源失效由 `collector_health` 负责告警，不在这里重复判。
+
+    ⚠️ 已知的**过报**（有意选择安全侧）：分类失败时水位线不推进 → `last_ok_at`
+    停在上一轮 → 这里会报「未落地」。而那一轮其实有部分条目入库了。宁可说
+    「本窗口数据可能不全」，也不要说「数据是新的」——H1 的教训正在这里。
+    """
+    now = now or datetime.now()
+    last = db.query(func.max(CollectorState.last_ok_at)).scalar()
+    secs = (now - last).total_seconds() if last else None
+    return {
+        "last_round_at": last,
+        "seconds_since": secs,
+        "collecting": _COLLECT_LOCK.locked(),
+        "overdue": is_round_overdue(secs, settings.news_interval_minutes),
+    }
 
 
 def run_collection(db: Session) -> tuple[list[NewsItem], list[SourceResult]]:
