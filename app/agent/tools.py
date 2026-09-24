@@ -3,6 +3,7 @@ from datetime import datetime, time
 
 import httpx
 from langchain_core.tools import tool
+from sqlalchemy import func
 
 from app.config import settings
 from app.db import SessionLocal
@@ -28,19 +29,49 @@ def search_news(query: str) -> str:
     return "\n".join(lines)
 
 
+# Agent 工具的**硬上限**。这些参数是 **LLM 生成**的，不是人填的 ——
+# 它可能给 `limit=-1`（SQLite 里等于**不限行数**）或一个极大的数。
+# 工具层自己再夹一次，不指望调用方守规矩（2026-09-25，巡检 M7）。
+_TOOL_MAX_ROWS = 50
+
+
+def _clamp_limit(limit, *, hi: int = _TOOL_MAX_ROWS, fallback: int = 10) -> int:
+    """把 LLM 传来的 limit 夹到 `[1, hi]`；不能转成整数就用 `fallback`。"""
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        return fallback
+    return max(1, min(n, hi))
+
+
 @tool
 def get_market_overview() -> str:
     """获取主要指数（A股+美股）最新行情：名称、收盘价、涨跌幅。用于了解当前市场整体表现。"""
     db = SessionLocal()
     try:
-        rows = db.query(MarketData).order_by(MarketData.date.desc()).all()
-        latest: dict[str, MarketData] = {}
-        for r in rows:
-            latest.setdefault(r.symbol, r)
+        # ⚠️ **在 SQL 里取每个指数的最新一条**，不要把全表拉回来再在 Python 里
+        # `setdefault`（2026-09-25 修，第三方巡检 L2）。原写法每问一次就把整张
+        # 行情表物化一遍 —— 现在才 543 行无感，但它**随采集天数线性增长、无上限**。
+        # 子查询写法兼容 SQLite（没有 `DISTINCT ON`），且能吃到
+        # `UNIQUE(symbol, date)` 带来的复合索引。
+        newest = (
+            db.query(MarketData.symbol, func.max(MarketData.date).label("mx"))
+            .group_by(MarketData.symbol)
+            .subquery()
+        )
+        rows = (
+            db.query(MarketData)
+            .join(newest, (MarketData.symbol == newest.c.symbol)
+                  & (MarketData.date == newest.c.mx))
+            # 同一 symbol 同一时刻有多行时（数据质量问题，见行情采集的日期兜底）
+            # 取 id 稳定排序，避免每次调用给出不同的那一条
+            .order_by(MarketData.symbol.asc(), MarketData.id.asc())
+            .all()
+        )
         lines = [
             f"{r.name}({r.symbol}): 收盘 {r.close}，涨跌幅 {r.change_pct}%，"
             f"日期 {r.date.date()}"
-            for r in latest.values()
+            for r in rows
         ]
         return "\n".join(lines) if lines else "暂无行情数据。"
     finally:
@@ -52,7 +83,8 @@ def get_recent_news(keyword: str = "", category: str = "", limit: int = 10) -> s
     """按关键词或分类查询最近新闻。category 取 宏观/政策/行业/公司/国际/资金 之一（可空）。"""
     db = SessionLocal()
     try:
-        q = db.query(News).order_by(News.publish_time.desc()).limit(limit)
+        q = (db.query(News).order_by(News.publish_time.desc())
+             .limit(_clamp_limit(limit)))
         if keyword:
             q = q.filter(News.title.contains(keyword))
         if category:
@@ -107,7 +139,7 @@ def get_report_history(limit: int = 5) -> str:
             .filter((MarketReport.report_type == "daily")
                     | (MarketReport.report_type.is_(None)))
             .order_by(MarketReport.date.desc())
-            .limit(limit)
+            .limit(_clamp_limit(limit, fallback=5))
             .all()
         )
         lines = [

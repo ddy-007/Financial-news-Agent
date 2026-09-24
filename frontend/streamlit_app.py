@@ -47,6 +47,19 @@ def api_post(path: str, json_data: dict | None = None):
         return None
 
 
+def _fmt_score(v) -> str:
+    """分数格式化：**拿不到就显示占位符，绝不显示成 0**。
+
+    `f"{None:+.2f}"` 会直接抛 `TypeError`（键存在、值为 None 时
+    `data.get("score", 0)` 的默认值**不生效** —— 默认值只在键缺失时用）。
+
+    ⚠️ 兜成 `0` 是**错的方向**：`0` 是「中性」这个**真实结论**，
+    `None` 是「拿不到」。把后者显示成 `+0.00` 等于凭空造了一个结论
+    —— 与本页 `divergence` 那行（`if div is not None else "—"`）保持一致。
+    """
+    return f"{v:+.2f}" if isinstance(v, (int, float)) else "—"
+
+
 # ================= 页面：每日研判 =================
 def page_dashboard():
     st.title("📊 每日市场研判")
@@ -102,7 +115,7 @@ def page_dashboard():
 
     c1, c2, c3 = st.columns(3)
     c1.metric("市场情绪", data.get("sentiment", "中性"))
-    c2.metric("综合情绪分", f"{data.get('score', 0):+.2f}")
+    c2.metric("综合情绪分", _fmt_score(data.get("score")))
     c3.metric("置信度", data.get("confidence", ""))
 
     # —— 专家观点卡片 ——
@@ -115,7 +128,7 @@ def page_dashboard():
                 stance = o.get("stance", "中性")
                 icon = {"看多": "🟥", "看空": "🟩"}.get(stance, "⬜")
                 st.markdown(f"**{o.get('expert', '')}**")
-                st.markdown(f"{icon} {stance} `{o.get('score', 0):+.2f}`")
+                st.markdown(f"{icon} {stance} `{_fmt_score(o.get('score'))}`")
                 st.caption(f"置信度：{o.get('confidence', '')}")
                 for p in (o.get("key_points") or [])[:2]:
                     st.caption(f"· {p[:55]}")
@@ -203,7 +216,7 @@ def page_weekly():
 
     c1, c2, c3 = st.columns(3)
     c1.metric("周定调", data.get("sentiment", "中性"))
-    c2.metric("周综合分", f"{data.get('score', 0):+.2f}")
+    c2.metric("周综合分", _fmt_score(data.get("score")))
     div = data.get("divergence")
     c3.metric("日均分歧度", f"{div:.2f}" if div is not None else "—")
 

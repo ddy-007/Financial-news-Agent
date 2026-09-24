@@ -690,6 +690,27 @@ def _fmt_for_dedup(title: str, content: str | None) -> str:
     return f"{title}｜{body}" if body else title
 
 
+def _normalize_verdict(text: str | None) -> bool | None:
+    """把 LLM 的 true/false 响应规范化成三态：`True` / `False` / **`None`（拿不准）**。
+
+    **容错的只有「格式」**（这些都是同一个语义，只是包裹不同）：
+    首尾空白、` ``` ` 代码围栏、尾部句号/冒号、大小写、外层引号。
+
+    **绝不做子串匹配** —— 那是 2026-09-25 修掉的毛病：
+    `not true`（语义相反）、`untrue`（子串命中）、`true. 因为…`（带解释）
+    在原实现下**全部会被判成「重复」**，而误判的代价是**真实新闻被永久合并**，
+    与 fail-open 的方向正好相反。拿不准就返回 `None`，交上层当新条目处理。
+    """
+    s = (text or "").strip()
+    s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s).strip()   # 去代码围栏
+    s = s.strip("。.：:；; \t\"'“”").lower()
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    return None
+
+
 def _llm_is_duplicate(a: News, cand: Candidate) -> bool | None:
     """灰色区间复核：LLM 判断**库内已有那条**与**本轮候选**是否同一事件。
 
@@ -711,7 +732,21 @@ def _llm_is_duplicate(a: News, cand: Candidate) -> bool | None:
     )
     try:
         resp = llm.invoke(prompt)
-        return "true" in (resp.content or "").lower()
+        # ⚠️ **精确匹配，不用子串**（2026-09-25 修，第三方巡检 L1）。
+        # 原写法 `"true" in resp.lower()` 会把这些**全部**误判成「重复」：
+        #   · `not true`        —— 语义恰好相反
+        #   · `true. 因为…`     —— 带解释（模型没严格守「只输出 true/false」）
+        #   · `untrue`          —— 子串命中
+        # 误判的代价是**把真实新闻永久合并掉**（不可逆），方向与 fail-open 相反。
+        # 现在：只接受规范化后**恰好**是 true / false；其余一律返回 None
+        # （= 调用失败），沿用上层的 fail-open「当新条目入库」，并留下日志。
+        verdict = _normalize_verdict(resp.content)
+        if verdict is None:
+            logger.warning(
+                f"灰区判重返回了非 true/false 的内容，按「不是重复」处理"
+                f"（宁可多存一条）：{(resp.content or '')[:80]!r}"
+            )
+        return verdict
     except Exception as e:  # noqa: BLE001
         logger.warning(f"灰区判重调用失败，按「不是重复」处理（宁可多存一条）: {e}")
         return None

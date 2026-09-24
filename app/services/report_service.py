@@ -71,6 +71,14 @@ def report_to_dict(r: MarketReport) -> dict:
         content = json.loads(r.content)
     except (json.JSONDecodeError, TypeError):
         content = r.content
+    # ⚠️ `content` **必须是 dict** —— 前端拿到后无条件 `c.get(...)`。
+    # 有两个形态会漏过去（第三方巡检 2026-09-25 发现，并补了第二支）：
+    #   ① 非 JSON 文本（历史手工数据 / 纯 markdown）→ `str`
+    #   ② **合法 JSON 但顶层是数组**（如 `[1,2]`）→ `list`
+    # 两者都会让前端抛 `AttributeError: 'str'/'list' object has no attribute 'get'`，
+    # **整页崩掉**。在这里一次性收口，别让每个消费方各自防。
+    if not isinstance(content, dict):
+        content = {"raw": content} if content else {}
     try:
         experts = json.loads(r.expert_opinions) if r.expert_opinions else []
     except (json.JSONDecodeError, TypeError):

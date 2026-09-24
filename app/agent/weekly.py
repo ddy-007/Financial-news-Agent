@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.agent.experts import extract_json
 from app.agent.llm import get_llm, get_llm_model_name
+from app.config import settings
 from app.models.market import MarketData
 from app.models.report import MarketReport
 
@@ -180,7 +181,14 @@ def generate_weekly_report(db: Session,
     # 量化汇总
     scores = [r.score for r in rows if r.score is not None]
     weekly_score = sum(scores) / len(scores) if scores else 0.0
-    sentiment = "偏多" if weekly_score > 0.15 else ("偏空" if weekly_score < -0.15 else "中性")
+    # ⚠️ **必须走配置**，不写死 0.15（2026-09-25 修）。
+    # 这里是全项目**第 4 个**用「中性带」的地方（前三处：`aggregate_node` 定调 /
+    # `compute_backtest` 判方向 / `_score_bucket` 分档），而 `config.py` 的注释
+    # 明写「三处共用这一套值，不许各写各的」。周报这处漏了 —— 改配置后
+    # 日报与周报会对**同一个分数**给出不同方向。
+    _band = settings.score_neutral_band
+    sentiment = ("偏多" if weekly_score > _band
+                 else ("偏空" if weekly_score < -_band else "中性"))
     divs = [r.divergence for r in rows if r.divergence is not None]
     divergence = round(sum(divs) / len(divs), 3) if divs else None
     # risk_veto 已在上面（去重之前）算好

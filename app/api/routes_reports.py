@@ -1,5 +1,5 @@
 """研判报告相关接口。"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -36,7 +36,8 @@ def generate_weekly(db: Session = Depends(get_db)):
 
 
 @router.get("")
-def list_reports(limit: int = 30, report_type: str | None = "daily",
+def list_reports(limit: int = Query(30, ge=1, le=200),
+                 report_type: str | None = "daily",
                  db: Session = Depends(get_db)):
     """报告列表。report_type: daily / weekly / all"""
     rt = None if report_type == "all" else report_type

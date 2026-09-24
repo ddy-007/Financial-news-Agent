@@ -1,7 +1,7 @@
 """新闻相关接口。"""
 from datetime import date, datetime, time, timedelta
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -74,10 +74,16 @@ def news_dates(db: Session = Depends(get_db)):
 @router.get("")
 def list_news(
     keyword: str | None = None,
-    days: int | None = None,
+    # ⚠️ **必须夹住上下界**（2026-09-25 修，第三方巡检 M7）。裸 `int` 有两个真问题：
+    #   · `limit=-1` —— SQLite 的 `LIMIT -1` 是「**不限制**」，
+    #     实测返回全表 9543 行（`LIMIT -5` 同理）；一次请求就能把整库序列化出去
+    #   · `days=0` —— falsy，被当成「未传」静默忽略，与「今天」的直觉相反
+    # 上限取 1000：前端 selectbox 的最大档就是 1000，再大没有正常用法。
+    # `days` 取 1~30：前端滑块就是 1~30，与它对齐。
+    days: int | None = Query(None, ge=1, le=30),
     start: date | None = None,
     end: date | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=1000),
     db: Session = Depends(get_db),
 ):
     """新闻列表。

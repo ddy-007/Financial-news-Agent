@@ -1,5 +1,5 @@
 """行情相关接口。"""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -12,7 +12,9 @@ router = APIRouter(prefix="/api/v1/market", tags=["market"])
 @router.get("")
 def list_market(
     symbol: str | None = None,
-    limit: int = 50,
+    # 夹住上下界：`limit=-1` 在 SQLite 里等于**不限行数**（见 routes_news 的说明）。
+    # 上限 1000：前端最大档位是 500。
+    limit: int = Query(50, ge=1, le=1000),
     db: Session = Depends(get_db),
 ):
     q = db.query(MarketData).order_by(MarketData.date.desc())
