@@ -260,6 +260,11 @@ def generate_weekly_report(db: Session,
         report = MarketReport(date=report_date, report_type="weekly")
         db.add(report)
 
+    # H2（2026-09-25）：业务日 —— 周报按它的 `report_date` 记。
+    # 唯一索引是 `(report_type, report_day)`，不设的话这一列会一直是 NULL，
+    # 而 **SQLite 的唯一索引认为 NULL 互不相等**，等于在索引上留了个洞。
+    report.report_day = report_date.date()
+
     report.title = str(final["market_summary"])[:200]
     report.content = json.dumps(final, ensure_ascii=False, indent=2)
     report.sentiment = sentiment

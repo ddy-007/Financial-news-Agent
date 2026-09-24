@@ -141,6 +141,97 @@ def main() -> int:
     check("数据库缺失（键都没有）→ unavailable",
           _readiness_status({}), "unavailable")
 
+    print("\n[7] 日报「一天一份」真的生效了（巡检 H2）")
+    import datetime as _dt  # noqa: PLC0415
+
+    from sqlalchemy import create_engine  # noqa: PLC0415
+    from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
+    from sqlalchemy.orm import sessionmaker  # noqa: PLC0415
+
+    import app.models  # noqa: PLC0415,F401
+    from app.models.base import Base  # noqa: PLC0415
+    from app.services.report_service import upsert_daily_report  # noqa: PLC0415
+
+    _eng = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(_eng)
+    _db = sessionmaker(bind=_eng)()
+
+    def _mk(dayh, **over):
+        f = {"date": dayh, "title": "t", "content": "{}", "score": 0.1}
+        f.update(over)
+        return f
+
+    # ⚠️ 必须接住异常：这些断言依赖「同日覆盖」，而被测代码一旦退化成「无条件插入」，
+    # 就会撞唯一索引抛 IntegrityError —— 第一版没接住，变异时看到的是**一整条
+    # Traceback**（后面全跑不到），而不是一行 FAIL。本项目栽过同一个坑。
+    def _safe(fn, *a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception as e:  # noqa: BLE001
+            return f"<{type(e).__name__}: {e}>"
+
+    d1 = _dt.datetime(2026, 9, 24, 18, 30, 1, 111)
+    r1 = _safe(upsert_daily_report, _db, d1.date(), **_mk(d1))
+    n1 = _db.query(MarketReport).count()
+    d1b = _dt.datetime(2026, 9, 24, 19, 5, 22, 222)      # 同一天、晚 35 分钟
+    r2 = _safe(upsert_daily_report, _db, d1b.date(), **_mk(d1b, score=0.9))
+    _db.rollback()   # 万一撞了约束，事务是脏的 —— 后面的断言需要一个能用的会话
+
+    # 断言一律**不假设 r1/r2 是对象**：被测代码一退化成「无条件插入」，
+    # `_safe` 返回的就是哨兵字符串，此时下面几条会给出干净的 FAIL，
+    # 而不是先炸在属性访问上（第一版就是这样，变异时看到的是整条 Traceback）。
+    check("同一天第二次写入 → **原地覆盖，不新增**",
+          (not isinstance(r2, str),
+           _db.query(MarketReport).count(),
+           getattr(r2, "id", None) == getattr(r1, "id", None)),
+          (True, n1, True),
+          "改动前是无条件 `db.add`，同日判定落在含微秒的 `date` 上 —— 实测库里 "
+          "2026-09-15 落了 **3 份**、09-14/09-06 各 2 份，而且**不报任何错**")
+    check("覆盖后 score 更新为新值（不是留旧的）", getattr(r2, "score", r2), 0.9)
+    d2 = _dt.datetime(2026, 9, 25, 18, 30, 0, 0)
+    upsert_daily_report(_db, d2.date(), **_mk(d2))
+    check("换一天 → 正常新增一份", _db.query(MarketReport).count(), n1 + 1)
+    # 同一天再来一份**周报**（不同 report_type）→ 应当允许
+    _db.add(MarketReport(date=d1, report_type="weekly", report_day=d1.date(),
+                         title="同日的周报", content="{}"))
+    _db.commit()
+    check("日报与周报互不干扰（唯一键含 report_type）",
+          _db.query(MarketReport).count(), n1 + 2)
+
+    # 身份键不许经 fields 传 —— 传了会 `setattr` 盖掉已有行的 report_type，
+    # 而 SQLite 的唯一索引**认为 NULL 互不相等**，「一天一份」当场失效。
+    # 同样走 `_safe`：不加护栏时这里会 `setattr` 盖掉已有行的身份键，
+    # 进而撞上**别的**唯一约束（实测撞的是 `report.date`）——
+    # 不接住就是又一条 Traceback。
+    _r = _safe(upsert_daily_report, _db, d1.date(), **_mk(d1, report_type="weekly"))
+    _db.rollback()
+    check("`report_type` 经 fields 传入 → 必须拒绝",
+          str(_r).startswith("<ValueError"), True,
+          "实测就是这么发现隐患的：传一次 `report_type=None` 把已有日报改了类型，"
+          "而 SQLite 的唯一索引**认为 NULL 互不相等**，「一天一份」当场失效")
+
+    # 库级约束是最后一道防线：绕过应用层直接插同日重复，**必须被拒**
+    # ⚠️ `date` 必须**错开**（与已有行不同的一秒）。
+    # 第一版直接复用了 `d1b` —— 于是这次插入是被 **`date` 上的唯一索引**
+    # （`ix_report_date`，早就存在）拒掉的，跟 `(report_type, report_day)` 毫无关系：
+    # 断言在**为错误的理由通过**。是变异测试（把模型里的 Index 摘掉却不 FAIL）抓出来的。
+    _raw = MarketReport(date=d1b + _dt.timedelta(seconds=1), report_type="daily",
+                        report_day=d1b.date(),
+                        title="绕过应用层的写入", content="{}")
+    _db.add(_raw)
+    try:
+        _db.commit()
+        check("直接插同日重复 → 被唯一索引拒绝", "竟然成功了", "IntegrityError")
+    except IntegrityError:
+        check("直接插同日重复 → 被唯一索引拒绝", "IntegrityError", "IntegrityError",
+              "应用层的 upsert 是**软**保护（单进程），库级唯一索引才是硬约束。"
+              "两处都要有：全新库靠模型声明，既有库靠 `_migrate` 补建")
+    finally:
+        _db.rollback()
+
+    check("`report_to_dict` 暴露了 report_day（前端按天分组要用它）",
+          "report_day" in report_to_dict(r1), True)
+
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:

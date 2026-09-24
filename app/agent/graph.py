@@ -613,9 +613,17 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
     info_level = final.get("info_level") or {}
     data_freshness = final.get("data_freshness") or {}
 
-    report = MarketReport(
-        date=date,
-        report_type="daily",
+    # H2（2026-09-25）：按 **(report_type, report_day)** 幂等写入 ——
+    # 同一天已有日报就**原地覆盖**，不再无脑 `db.add`。
+    # 改动前这里是无条件 add，而同日的判定落在 `date`（含微秒的生成时刻）上，
+    # 于是同一天能落多份（实测 09-15 落了 3 份），只不过**没有任何报错**：
+    # `/reports/today` 只显示最后一份，回测得自己按天去重否则同一天被重复加权。
+    from app.services.report_service import upsert_daily_report  # 循环导入：延后到调用时
+
+    report = upsert_daily_report(
+        db,
+        date.date(),                      # 业务日：`date` 传进来时就是报告日（补跑也如此）
+        date=date,                        # 生成时刻，保留可追溯性
         title=str(final.get("market_summary", ""))[:200],
         content=json.dumps(final, ensure_ascii=False, indent=2),
         sentiment=final.get("sentiment", "中性"),
@@ -629,7 +637,4 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         data_stale=data_freshness.get("stale"),
         model=get_llm_model_name(part="expert"),
     )
-    db.add(report)
-    db.commit()
-    db.refresh(report)
     return report

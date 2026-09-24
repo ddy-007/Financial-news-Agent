@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 from loguru import logger
 from sqlalchemy.orm import Session
@@ -66,6 +67,51 @@ def list_reports(db: Session, limit: int = 30,
     return q.order_by(MarketReport.date.desc()).limit(limit).all()
 
 
+def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport:
+    """按 `(report_type='daily', report_day)` 幂等写入日报：**当天已有则原地覆盖**。
+
+    **为什么需要**（H2，2026-09-25）：日报原先是无条件 `db.add(...)`，
+    而同日的判定落在 `date`（生成时刻，含微秒）上 —— 于是**同一天可以落多份**。
+    实测库里 `2026-09-15` 落了 3 份、`09-14`/`09-06` 各 2 份。
+    多份的后果不是报错，是**静默**：`/reports/today` 只返回最后一份，
+    更早的结果被隐藏；回测得自己在内存里按天去重，否则同一天被当成多个独立样本
+    **重复加权**。
+
+    语义与周报的「同周覆盖更新」保持一致 —— 保留原 `id`，只覆盖内容，
+    这样外部引用（若有）不会失效。
+    """
+    # ⚠️ `report_type` / `report_day` 是**本函数的身份键**，不许经 `fields` 传进来。
+    # 不拦的话 `fields` 里的同名键会被 `setattr` 盖到已有行上 ——
+    # 实测：传一次 `report_type=None` 就把那一行的类型改成了 NULL，
+    # 而 **SQLite 的唯一索引认为 NULL 互不相等**，于是「一天一份」当场失效。
+    for _reserved in ("report_type", "report_day"):
+        if _reserved in fields:
+            raise ValueError(
+                f"`upsert_daily_report` 的 `{_reserved}` 由函数自己管理，"
+                f"不能经 fields 传入（会覆盖身份键、让唯一索引失效）"
+            )
+    existing = (
+        db.query(MarketReport)
+        .filter(MarketReport.report_type == "daily",
+                MarketReport.report_day == report_day)
+        .first()
+    )
+    if existing is not None:
+        logger.info(
+            f"当日（{report_day}）已有日报 id={existing.id}（生成于 {existing.date}）—— "
+            f"**原地覆盖**，不再新增一份（H2：`date` 含微秒，原先的「一天一份」没约束住）"
+        )
+        for k, v in fields.items():
+            setattr(existing, k, v)
+        report = existing
+    else:
+        report = MarketReport(report_type="daily", report_day=report_day, **fields)
+        db.add(report)
+    db.commit()
+    db.refresh(report)
+    return report
+
+
 def report_to_dict(r: MarketReport) -> dict:
     try:
         content = json.loads(r.content)
@@ -86,6 +132,9 @@ def report_to_dict(r: MarketReport) -> dict:
     return {
         "id": r.id,
         "date": r.date.isoformat(),
+        # 业务日（H2，2026-09-25）：`date` 是生成时刻、`report_day` 才是「哪一天」。
+        # 前端要按天分组/比较时应使用它。
+        "report_day": r.report_day.isoformat() if r.report_day else None,
         "report_type": r.report_type or "daily",
         "title": r.title,
         "content": content,
