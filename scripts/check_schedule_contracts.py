@@ -220,6 +220,32 @@ def main() -> int:
         S.scheduler.start = real_start
         S.scheduler.remove_all_jobs()  # 清掉本次注册，别留给同进程的其它用例
 
+    # ---- ⑥ 四个时刻的 HH:MM 校验（2026-09-25，应巡检 M4）----
+    #
+    # 非法值会让 `_parse_hhmm` / `CronTrigger` 直接抛异常，顺着 lifespan
+    # **把后端启动整个掀翻**。所以四个字段都要有校验，且非法值必须**回退 + 告警**
+    # 而不是抛错（与本项目对 `NEWS_INTERVAL_MINUTES` 的立场一致：
+    # 「这比漂移更糟，是启动失败」）。
+    #
+    # ⚠️ 检查方式是**真造一个 Settings 实例**，不是看源码里有没有校验器 ——
+    # 后者只能证明「写了」，证明不了「生效」。
+    print("\n[6] 四个时刻的 HH:MM 校验（巡检 M4）")
+    from app.config import Settings  # noqa: PLC0415
+
+    for field, default in (("market_collect_time", "17:30"),
+                           ("sector_collect_time", "17:40"),
+                           ("report_time", "18:30"),
+                           ("weekly_report_time", "19:30")):
+        bad = [Settings(**{field: v}).__getattribute__(field)
+               for v in ("25:00", "18:60", "abc", "1830", "", "12:5")]
+        check(f"{field} 的非法值全部回退为 {default}",
+              bad == [default] * 6,
+              f"实测 {sorted(set(bad))} —— 回退是刻意的：抛错会掀翻启动")
+        good = [Settings(**{field: v}).__getattribute__(field)
+                for v in ("00:00", "9:05", "23:59")]
+        check(f"{field} 的合法值原样通过（并补零）",
+              good, ["00:00", "09:05", "23:59"])
+
     print(f"\n{'=' * 46}\n{PASS} PASS / {FAIL} FAIL\n{'=' * 46}")
     return 1 if FAIL else 0
 

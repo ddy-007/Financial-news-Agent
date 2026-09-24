@@ -1,5 +1,36 @@
 """全局配置：从 .env / 环境变量读取。"""
+import re
+
+from loguru import logger
+from pydantic import ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_HHMM = re.compile(r"^\d{1,2}:\d{2}$")
+
+
+def _check_hhmm(v: str, info: ValidationInfo) -> str:
+    """`HH:MM` 校验 —— 非法值**回退到该字段的默认值并大声告警**（2026-09-25 加）。
+
+    **为什么是回退而不是抛错**：这四个值经 `_parse_hhmm` → `CronTrigger` 构造，
+    非法值（缺冒号 / 非数字 / `25:00` / `18:60`）会**在 `start_scheduler()` 里抛异常**，
+    顺着 FastAPI lifespan 把**后端启动整个掀翻**。本项目对这类后果有明确立场 ——
+    见 `news_interval_minutes` 的注释：「与其让它悄悄变成另一种节奏，不如回退并告警」
+    以及 `_interval_ok` 里「这比漂移更糟，是**启动失败**」。
+    一个手滑的时间配置不该让整个服务起不来。
+
+    ⚠️ 回退**必须留痕**：静默回退才是真的坑（用户以为设成了 X、实际跑 Y）。
+    """
+    if isinstance(v, str) and _HHMM.match(v.strip()):
+        h, m = (int(x) for x in v.strip().split(":"))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return f"{h:02d}:{m:02d}"
+    default = Settings.model_fields[info.field_name].default
+    logger.warning(
+        f"{info.field_name.upper()}={v!r} 不是合法的 HH:MM（需 0<=时<24、0<=分<60）—— "
+        f"**回退为 {default}**。不抛错是刻意的：非法时间会让 CronTrigger 构造失败、"
+        f"进而掀翻整个后端启动，那比降级更糟"
+    )
+    return default
 
 
 class Settings(BaseSettings):
@@ -231,6 +262,13 @@ class Settings(BaseSettings):
     # 也不能取 19:00：新闻采集改成整点后，`minute="0"` 会在 19:00 同样触发。
     # 19:30 距日报 75 分钟、距 19:00 那轮新闻 30 分钟，两边都不撞。
     weekly_report_time: str = "19:30"
+
+    # 四个调度时刻统一校验（2026-09-25）。非法值**回退到默认并告警**，
+    # 不让一个手滑的配置把后端启动掀翻 —— 判据见 `_check_hhmm`。
+    _v_times = field_validator(
+        "market_collect_time", "sector_collect_time",
+        "report_time", "weekly_report_time",
+    )(_check_hhmm)
 
 
 settings = Settings()

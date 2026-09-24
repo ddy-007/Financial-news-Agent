@@ -3,7 +3,7 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -102,4 +102,75 @@ app.include_router(routes_agent.router)
 
 @app.get("/api/v1/health")
 def health():
+    """**存活探针**（liveness）：只表示「进程还在」。
+
+    ⚠️ 它**不检查任何依赖** —— 数据库断了、BM25 空了、调度器没起来，它照样返回
+    `ok`。这是**刻意**的：把依赖检查塞进存活探针，会变成「进程没死但探针失败 →
+    被反复重启」的经典事故。要判断「能不能正经干活」，用 `/api/v1/health/ready`。
+    """
     return {"status": "ok"}
+
+
+def _readiness_status(checks: dict) -> str:
+    """由各依赖状态推出 `ok` / `degraded` / `unavailable`。**纯函数，可测**。
+
+    **为什么分三档而不是二值**（2026-09-25 新增，应巡检 M8）：
+    原来只有一个返回常量的 `/health`，「进程活着但核心功能失效」与「一切正常」
+    在监控眼里**完全一样**，故障发现被推迟。
+
+    ⚠️ **只有数据库失败才算 `unavailable`**（503）：
+      · 数据库是唯一的硬依赖 —— 它挂了，任何接口都做不了事；
+      · BM25 为空只是**检索质量降级**（退化为纯向量），服务照常可用；
+      · 调度器没跑只是「不再自动采集」，手动接口仍然工作。
+    把后两者也算成 503，会让负载均衡在**服务其实能用**的时候把它摘掉 ——
+    那比不报更糟。它们以 `degraded` 如实呈现，不掩盖。
+    """
+    if checks.get("database") is not True:
+        return "unavailable"
+    if checks.get("bm25_ready") is not True or checks.get("scheduler_running") is not True:
+        return "degraded"
+    return "ok"
+
+
+@app.get("/api/v1/health/ready")
+def readiness(response: Response):
+    """**就绪探针**：核心依赖是否可用（巡检 M8）。
+
+    每个依赖**单独报状态**，不合成一个布尔 —— 「哪一项坏了」比「坏了」有用得多。
+    """
+    checks: dict = {}
+
+    # ① 数据库：真发一条最轻的查询，不是看 engine 对象在不在
+    try:
+        from sqlalchemy import text as _text
+
+        from app.db import SessionLocal
+        _db = SessionLocal()
+        try:
+            _db.execute(_text("SELECT 1"))
+            checks["database"] = True
+        finally:
+            _db.close()
+    except Exception as e:  # noqa: BLE001
+        checks["database"] = f"{type(e).__name__}: {e}"
+
+    # ② BM25（RAG 的关键词路）：空索引会让检索**静默**退化为纯向量
+    try:
+        from app.rag.retriever import get_retriever
+        _r = get_retriever()
+        checks["bm25_ready"] = _r.is_ready()
+        checks["bm25_size"] = _r.size
+    except Exception as e:  # noqa: BLE001
+        checks["bm25_ready"] = f"{type(e).__name__}: {e}"
+
+    # ③ 调度器：定时采集 / 研判全靠它
+    try:
+        from app.collectors.scheduler import scheduler
+        checks["scheduler_running"] = bool(scheduler.running)
+    except Exception as e:  # noqa: BLE001
+        checks["scheduler_running"] = f"{type(e).__name__}: {e}"
+
+    status = _readiness_status(checks)
+    if status == "unavailable":
+        response.status_code = 503
+    return {"status": status, "checks": checks}

@@ -53,11 +53,30 @@ copy .env.example .env
 ### 3. 启动后端
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 - 启动时会自动建表 + 启动定时调度器。
 - API 文档：http://localhost:8000/docs
+- 就绪探针：http://localhost:8000/api/v1/health/ready （存活探针是 `/api/v1/health`）
+
+> ⚠️ **默认只绑回环地址（127.0.0.1），这是 2026-09-25 改的，原来写的是 `0.0.0.0`。**
+> 后端**没有任何鉴权**，且好几个接口是**写操作或会花钱的**：
+> `POST /api/v1/news/collect`（触发采集 + 大量 LLM 分类）、`POST /api/v1/reports/generate`
+> （整条多专家研判管线）、`POST /api/v1/agent/chat`（任意人打 LLM）。
+> `DESIGN.md` §1.3 把「多用户权限体系」明确列为 **v1 非目标**，所以这不是代码缺陷 ——
+> 但**一旦监听 `0.0.0.0` 且端口可被不受信任的网络访问，这些成本与数据就都是敞开的**。
+>
+> **要对外提供服务，请自己做**（本项目的定位是单机学习研究）：
+> 1. 反向代理 + 鉴权（别让反代无保护转发）；
+> 2. 用防火墙 / 安全组限制来源；
+> 3. 收紧 `app/main.py` 里 `allow_origins=["*"]` 的 CORS 来源；
+> 4. 不要因为「想远程看看」就改回 `0.0.0.0`。
+>
+> 另外：**不要用 `--workers N`**。每个 uvicorn worker 都会跑一遍 lifespan、
+> 各起一个 `BackgroundScheduler`，于是采集与研判会**按 worker 数重复执行**
+> （重复的 LLM 花费 + SQLite 写竞争）。`--reload` 没这个问题（父进程只监听文件、
+> 不跑 lifespan，且重启是先停旧再起新）。
 
 ### 4. 启动前端
 

@@ -120,6 +120,27 @@ def main() -> int:
     check("两处分数都改用了 `_fmt_score`",
           src.count("_fmt_score(data.get(\"score\"))"), 2)
 
+    print("\n[6] 就绪探针的三档判定（巡检 M8）")
+    from app.main import _readiness_status, health  # noqa: PLC0415
+
+    check("存活探针仍是不带依赖的常量（不能改成查库）",
+          health(), {"status": "ok"},
+          "把依赖检查塞进存活探针会变成「进程没死但探针失败 → 被反复重启」")
+    ok_all = {"database": True, "bm25_ready": True, "scheduler_running": True}
+    check("全好 → ok", _readiness_status(ok_all), "ok")
+    check("**数据库挂了 → unavailable**（唯一给 503 的情形）",
+          _readiness_status({**ok_all, "database": "OperationalError: x"}), "unavailable",
+          "数据库是唯一的硬依赖 —— 它挂了任何接口都做不了事")
+    check("BM25 空 → degraded（**不是 503**）",
+          _readiness_status({**ok_all, "bm25_ready": False}), "degraded",
+          "BM25 为空只是检索质量降级（退化为纯向量），服务照常可用。"
+          "算成 503 会让负载均衡在**服务其实能用**时把它摘掉 —— 比不报更糟")
+    check("调度器没跑 → degraded",
+          _readiness_status({**ok_all, "scheduler_running": False}), "degraded",
+          "只是「不再自动采集」，手动接口仍然工作")
+    check("数据库缺失（键都没有）→ unavailable",
+          _readiness_status({}), "unavailable")
+
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:
