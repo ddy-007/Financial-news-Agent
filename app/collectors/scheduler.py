@@ -1,5 +1,7 @@
 """APScheduler 定时调度：新闻增量采集 / 行情采集 / 每日研判。"""
+import os
 import time
+from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -8,6 +10,84 @@ from loguru import logger
 from app.config import settings
 
 scheduler = BackgroundScheduler()  # 使用系统本地时区（中国 = 北京时间）
+
+# 跨进程的「只允许一个调度器」锁文件（H3，2026-09-25）。
+#
+# **为什么必需**：`scheduler.running` 是**进程内**判断。uvicorn 以 `--workers N`
+# 运行时，每个 worker 都会跑一遍 lifespan、各起一个 `BackgroundScheduler` ——
+# 于是采集与研判**按 worker 数重复执行**（重复的 LLM 花费 + SQLite 写竞争）。
+# 联网核到的业界做法里，单机场景最省事的就是文件锁（`fcntl.flock` / `msvcrt.locking`），
+# 不引入 Redis / 数据库依赖，而且**进程退出时由内核自动释放**（不会因崩溃留下死锁）。
+#
+# ⚠️ `--reload` **不需要**它：reloader 父进程只监听文件、不跑 lifespan，
+# 且重启是先停旧 worker 再起新的（已读 uvicorn 源码确认），不会重叠。
+# 这把锁是给**多进程部署**兜底的，不是给日常开发用的。
+_SCHED_LOCK_FILE = Path("data/.scheduler.lock")
+_sched_lock_fd: int | None = None
+
+
+def _acquire_scheduler_lock() -> int | None:
+    """尝试独占调度器锁。成功返回 fd（**必须留着不关**），失败返回 `None`。
+
+    锁靠「持有打开的文件描述符」维持 —— 一旦关闭或进程退出，内核自动释放。
+    """
+    try:
+        _SCHED_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(_SCHED_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:  # 目录不可写等
+        logger.warning(f"[调度] 无法创建调度器锁文件 {_SCHED_LOCK_FILE}：{e} —— 跳过互斥检查")
+        return -1          # -1 表示「没锁上，但别因此拦住启动」
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)   # msvcrt 从当前位置开始锁
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _unlock_fd(fd: int) -> None:
+    """放开并关闭一个锁 fd（`_release_scheduler_lock` 与探针共用）。"""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _release_scheduler_lock() -> None:
+    global _sched_lock_fd
+    if _sched_lock_fd is None:
+        return
+    if _sched_lock_fd >= 0:
+        _unlock_fd(_sched_lock_fd)
+    _sched_lock_fd = None
+
+
+def scheduler_lock_available() -> bool:
+    """**别的进程**有没有正持有调度器锁。只是给调用方一个可判断的探针。
+
+    为什么要它：契约脚本要验「装配」就必须能启动调度器；而后端正在跑时锁被它占着，
+    脚本装配不上 —— 那要报**「跳过（未验证）」**，不能报 FAIL（环境问题不是代码问题）。
+    """
+    fd = _acquire_scheduler_lock()
+    if fd is None:
+        return False
+    if fd >= 0:
+        _unlock_fd(fd)
+    return True
 
 
 def _job_news() -> None:
@@ -199,9 +279,26 @@ def _news_trigger() -> CronTrigger:
     return CronTrigger(hour=f"*/{n // 60}", minute="0")
 
 
-def start_scheduler() -> None:
+def start_scheduler() -> bool:
+    """启动调度器。返回 **True = 本进程真的启动了**；False = 跳过（已有别的进程在跑）。
+
+    返回值的意义：调用方（与契约脚本）得能区分「起了」与「因为抢不到锁而没起」——
+    否则测试会把「别的进程持有锁」误判成「装配失败」。
+    """
+    global _sched_lock_fd
     if scheduler.running:
-        return
+        return True
+    # ⚠️ **先抢跨进程锁再装配**：多 worker 部署下每个进程都会走到这里，
+    # 只有第一个能拿到锁，其余只提供 API、不跑定时任务（H3，见文件头注释）。
+    _sched_lock_fd = _acquire_scheduler_lock()
+    if _sched_lock_fd is None:
+        logger.warning(
+            "[调度] **另一个进程已持有调度器锁 —— 本进程不启动调度器**，只提供 API。"
+            "多 worker / 多进程部署下每个进程都会跑一遍 lifespan，"
+            "不限流的话采集与研判会按进程数重复执行（重复的 LLM 花费 + SQLite 写竞争）。"
+            "若这不是你想要的，请用单进程启动（见 README 的部署约束）"
+        )
+        return False
     # 新闻：按 NEWS_INTERVAL_MINUTES 增量采集（默认 60 分钟整点）
     scheduler.add_job(_job_news, _news_trigger(), id="news_collect")
     # 行情：收盘后（工作日）
@@ -229,10 +326,15 @@ def start_scheduler() -> None:
         id="weekly_report",
     )
     scheduler.start()
-    logger.info("调度器已启动（行情/研判/周报均按交易日历跳过非交易日）")
+    logger.info(
+        "调度器已启动（行情/研判/周报均按交易日历跳过非交易日）"
+        + ("；本进程持有调度器锁" if _sched_lock_fd is not None else "")
+    )
+    return True
 
 
 def stop_scheduler() -> None:
     if scheduler.running:
         scheduler.shutdown()
         logger.info("调度器已停止")
+    _release_scheduler_lock()   # 让出跨进程锁，别挡着下一个进程（含 --reload 的新 worker）

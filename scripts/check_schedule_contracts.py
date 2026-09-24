@@ -202,23 +202,32 @@ def main() -> int:
     # 若调度器已在运行，`start_scheduler()` 会提前 return、news_collect 根本不会
     # 被注册，下面两条就会**误报** FAIL。先把这个前提本身说清楚。
     check("装配检查的前提：调度器未处于运行态", not S.scheduler.running)
-    real_start = S.scheduler.start
-    S.scheduler.start = lambda *a, **k: None  # 拦住真正的 start()
-    try:
-        S.start_scheduler()
-        job = S.scheduler.get_job("news_collect")
-        check("news_collect 已注册", job is not None)
-        if job is not None:
-            actual = [f.strftime("%H:%M") for f in fire_times(job.trigger)]
-            expect = [f.strftime("%H:%M") for f in fire_times(S._news_trigger())]
-            check(
-                "news_collect 实际挂的触发器与 _news_trigger() 一致",
-                actual == expect,
-                f"装配的是 {actual[:4]}…，按配置应为 {expect[:4]}…",
-            )
-    finally:
-        S.scheduler.start = real_start
-        S.scheduler.remove_all_jobs()  # 清掉本次注册，别留给同进程的其它用例
+    # ⚠️ 2026-09-25（H3）起 `start_scheduler()` 先抢**跨进程文件锁**：抢不到就跳过装配。
+    # 所以后端正在跑时，本脚本是**装配不上**的 —— 那必须报「跳过（未验证）」，
+    # 不能报 FAIL：那是环境问题，不是代码问题。
+    # （「结构哨兵」那次的教训：干净的 SKIP 比假 FAIL 可信得多。）
+    if not S.scheduler_lock_available():
+        print("  ⏭ **跳过**：另一个进程持有调度器锁（后端正在跑？）—— 本次无法验证装配")
+    else:
+        real_start = S.scheduler.start
+        S.scheduler.start = lambda *a, **k: None  # 拦住真正的 start()
+        try:
+            check("抢得到锁 → start_scheduler() 返回 True",
+                  S.start_scheduler(), True)
+            job = S.scheduler.get_job("news_collect")
+            check("news_collect 已注册", job is not None)
+            if job is not None:
+                actual = [f.strftime("%H:%M") for f in fire_times(job.trigger)]
+                expect = [f.strftime("%H:%M") for f in fire_times(S._news_trigger())]
+                check(
+                    "news_collect 实际挂的触发器与 _news_trigger() 一致",
+                    actual == expect,
+                    f"装配的是 {actual[:4]}…，按配置应为 {expect[:4]}…",
+                )
+        finally:
+            S.scheduler.start = real_start
+            S.scheduler.remove_all_jobs()  # 清掉本次注册，别留给同进程的其它用例
+            S.stop_scheduler()             # 同时让出文件锁，别挡着后续用例
 
     # ---- ⑥ 四个时刻的 HH:MM 校验（2026-09-25，应巡检 M4）----
     #
@@ -245,6 +254,28 @@ def main() -> int:
                 for v in ("00:00", "9:05", "23:59")]
         check(f"{field} 的合法值原样通过（并补零）",
               good, ["00:00", "09:05", "23:59"])
+
+    # ---- ⑦ 跨进程调度器锁（2026-09-25，应巡检 H3）----
+    print("\n[7] 调度器跨进程锁（巡检 H3）")
+    _fd = S._acquire_scheduler_lock()
+    try:
+        check("持锁期间，别的「进程」抢不到（本进程用第二个 fd 模拟）",
+              S.scheduler_lock_available() is False,
+              "多 worker 下每个进程都会跑一遍 lifespan —— 进程内的 `scheduler.running` "
+              "挡不住它们各起一个调度器，采集与研判会**按进程数重复执行**"
+              "（重复的 LLM 花费 + SQLite 写竞争）")
+        check("抢不到锁 → `start_scheduler()` **返回 False 且不装配**",
+              S.start_scheduler() is False,
+              "返回布尔而不是 None：调用方与测试才分得清「起了」与「抢不到锁」")
+        check("抢不到锁时也不会把 job 注册进去",
+              S.scheduler.get_job("news_collect") is None)
+    finally:
+        if _fd is not None and _fd >= 0:
+            S._unlock_fd(_fd)        # 用局部引用释放：start_scheduler 可能已把模块变量置空
+    check("释放后别人又能抢到（锁不是一次性的）",
+          S.scheduler_lock_available() is True,
+          "锁靠「持有打开的文件描述符」维持，进程退出时内核自动释放 —— "
+          "不会因为崩溃留下死锁")
 
     print(f"\n{'=' * 46}\n{PASS} PASS / {FAIL} FAIL\n{'=' * 46}")
     return 1 if FAIL else 0
