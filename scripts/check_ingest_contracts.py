@@ -311,67 +311,84 @@ def _cluster():
           "拆过之后再统计就永远看不到那个异常大簇了")
 
     # ---- 阈值两侧的相似度分布（2026-09-24，复核意见 §7.3）----
+    #
+    # ⚠️ **每个用例一个 sink**。巡检 2026-09-24 指出：原先共用 `sink2` 时，
+    # `"近阈值对 0 对" in text and "合并簇 0 个" in text` 是**跨用例的子串与** ——
+    # 两个子串分别来自 `dup` 与 `near` 两次调用，于是 `far` 无论怎么错都照样 PASS。
+    # 「看上去在验、实际没验」正是这套脚本最该防的毛病。
+    def _logged(vecs, texts=None):
+        """跑一次并**单独**捕获它自己的日志，返回 `(簇, 该次调用的日志文本)`。"""
+        s = _Sink()
+        hid = logger.add(s.write, level="INFO", format="{message}")
+        try:
+            clusters = DA._cluster_by_similarity(vecs, texts=texts)
+        finally:
+            logger.remove(hid)
+        return clusters, s.text
+
     print("\n[3b] 阈值余量观测：两侧分布都要有")
-    sink2 = _Sink()
-    hid2 = logger.add(sink2.write, level="INFO", format="{message}")
-    try:
-        # 0.83 落在近阈值带 [0.82, 0.85) —— 差点被误合并，但不该被合并
-        near = DA._cluster_by_similarity(
-            np.stack([v(1, 0), v(0.83, 0.558)]), texts=["甲快讯", "乙快讯"])
-        # 两对近阈值对、且分别落在**互相正交**的两组维度上 —— 这样交叉项余弦为 0，
-        # 不会混进近阈值带，可以精确断言「计数」与「示例排序」。
-        # 0.84² + 0.5426² = 1，0.83² + 0.5578² = 1（unit 会再归一化一次，无妨）
-        multi = DA._cluster_by_similarity(
-            np.stack([v(1, 0, 0, 0), v(0.84, 0.5426, 0, 0),
-                      v(0, 0, 1, 0), v(0, 0, 0.83, 0.5578)]),
-            texts=["P文", "Q文", "R文", "S文"])
-        # 两条完全相同 → 真重复侧，簇内最小两两相似度 = 1.0
-        dup = DA._cluster_by_similarity(
-            np.stack([v(1, 0), v(1, 0)]), texts=["同一条", "同一条"])
-        # 两条无关 → 两侧都该是 0 / 空
-        far = DA._cluster_by_similarity(
-            np.stack([v(1, 0), v(0, 1)]), texts=["丙", "丁"])
-        # 两个合并簇、簇内最小值**不同** → 报的必须是更小的那个（最不像的真重复对）。
-        # 顺序刻意让「像的那簇」排在前、「不像的那簇」排在后 —— 若把 `min` aggregation
-        # 写成「最后一个胜出」，报出来的就会是 1.0 而不是 0.86。
-        two = DA._cluster_by_similarity(
-            np.stack([v(0, 0, 1, 0), v(0, 0, 0.86, 0.5103),   # 簇 A：cos 0.86（贴着阈值）
-                      v(1, 0, 0, 0), v(1, 0, 0, 0)]),          # 簇 B：cos 1.0
-            texts=["a1", "a2", "b1", "b2"])
-        DA._cluster_by_similarity(np.stack([v(1, 0)]), texts=None)   # 不传 texts 不许炸
-    finally:
-        logger.remove(hid2)
+    # 0.83 落在近阈值带 [0.82, 0.85) —— 差点被误合并，但不该被合并
+    near, near_log = _logged(np.stack([v(1, 0), v(0.83, 0.558)]), ["甲快讯", "乙快讯"])
+    # 两对近阈值对、分别落在**互相正交**的两组维度上 —— 交叉项余弦为 0，
+    # 不会混进近阈值带，可以精确断言「计数」与「示例排序」。
+    # 0.84² + 0.5426² = 1，0.83² + 0.5578² = 1（unit 会再归一化一次，无妨）
+    multi, multi_log = _logged(
+        np.stack([v(1, 0, 0, 0), v(0.84, 0.5426, 0, 0),
+                  v(0, 0, 1, 0), v(0, 0, 0.83, 0.5578)]),
+        ["P文", "Q文", "R文", "S文"])
+    # 两条完全相同 → 真重复侧，簇内最小两两相似度 = 1.0
+    dup, dup_log = _logged(np.stack([v(1, 0), v(1, 0)]), ["同一条", "同一条"])
+    # 两条无关 → 两侧都该是 0
+    far, far_log = _logged(np.stack([v(1, 0), v(0, 1)]), ["丙", "丁"])
+    # 两个合并簇、簇内最小值**不同** → 报的必须是更小的那个（最不像的真重复对）。
+    # 顺序刻意让「像的那簇」排在前、「不像的那簇」排在后 —— 若把 `min` aggregation
+    # 写成「最后一个胜出」，报出来的就会是 1.0 而不是 0.86。
+    two, two_log = _logged(
+        np.stack([v(0, 0, 1, 0), v(0, 0, 0.86, 0.5103),   # 簇 A：cos 0.86（贴着阈值）
+                  v(1, 0, 0, 0), v(1, 0, 0, 0)]),          # 簇 B：cos 1.0
+        ["a1", "a2", "b1", "b2"])
+    single, _single_log = _logged(np.stack([v(1, 0)]), None)   # 不传 texts
 
     check(f"近阈值带 = [阈值−{DA.NEAR_MISS_MARGIN}, 阈值)", DA.NEAR_MISS_LOW, 0.82,
           "**跟着阈值走**，不写死 —— 阈值若抬高，观测带自动跟随")
-    check("0.83 的对被记成「近阈值对 1 对」", "近阈值对 1 对" in sink2.text, True,
-          "这是**差点被误合并**的那一侧：只知道它有多近，才知道余量紧不紧")
+    check("0.83 的对被记成「近阈值对 1 对」", "近阈值对 1 对" in near_log, True,
+          "这是离**误合并**最近的那一侧：只知道它有多近，才知道余量紧不紧")
+    check("日志写明是「**直接**相似度」，不是含糊的「差点被误合并」",
+          "**直接**相似度" in near_log, True,
+          "传递闭包并进同一簇的两条，彼此**直接**相似度可能落在带内"
+          "（A–B、B–C ≥0.85 而 A–C 只有 0.83）—— 措辞不写清就会被读成"
+          "「这一对差点被合并」（巡检 2026-09-24 指出）")
     # ⚠️ 只断到 3 位小数：`v(0.83, 0.558)` 归一化后余弦是 **0.82989**（不是 0.83），
     # 所以差值是 0.0201 而非 0.0200 —— 一开始把预期写成 0.0200，是**过度指定**
     # （同一类错犯过：断言依赖了被测代码里没有的精确性）。
-    check("且报了它距阈值还差多少", "距阈值还差 0.020" in sink2.text, True,
+    check("且报了它距阈值还差多少", "距阈值还差 0.020" in near_log, True,
           "余量的**绝对量**才是判断紧不紧的依据；只报相似度数字要读者自己减")
     check("近阈值对没被合并（0.83 < 0.85）", sorted(sorted(c) for c in near), [[0], [1]])
     check("示例带原文标题（标定时要能一眼看到是哪两对）",
-          "甲快讯" in sink2.text and "乙快讯" in sink2.text, True,
+          "甲快讯" in near_log and "乙快讯" in near_log, True,
           "复核方 2026-09-24 的插桩点观测不到这批对，示例是让人工复核够得着它们")
     check("真重复侧记了「簇内最不像的一对 1.0000」",
-          "簇内最不像的一对 1.0000" in sink2.text, True)
+          "簇内最不像的一对 1.0000" in dup_log, True)
+    check("两条完全相同的 → 真并成一簇", sorted(sorted(c) for c in dup), [[0, 1]])
     check("符号写成「高出阈值 +0.1500」",
-          "高出阈值 +0.1500" in sink2.text, True,
+          "高出阈值 +0.1500" in dup_log, True,
           "**只有非重复侧选不了阈值**：不知道「最不像的真对是多少」，"
           "就判断不了 0.005 的余量是紧还是宽")
-    check("无关的两条：两侧都报 0", "近阈值对 0 对" in sink2.text
-          and "合并簇 0 个" in sink2.text, True)
-    check("不传 texts 不越界、不炸", True, True)
+    check("无关的两条：**它自己那一次**两侧都报 0",
+          "近阈值对 0 对" in far_log and "合并簇 0 个" in far_log, True,
+          "断言必须落在 `far_log` 上 —— 用整块累积文本会变成跨用例的子串与，"
+          "那样这条断言永远不会 FAIL（巡检已复现）")
+    check("无关的两条 → 各自成簇", sorted(sorted(c) for c in far), [[0], [1]])
+    check("单条 + 不传 texts：返回 [[0]]（不炸由返回值兜住，不再用恒真断言）",
+          single, [[0]])
 
     print("\n[3c] 近阈值对的**计数**与**排序**（正交维度构造，交叉项为 0）")
-    check("两对近阈值对 → 计数 2", "近阈值对 2 对" in sink2.text, True,
+    check("两对近阈值对 → 计数 2", "近阈值对 2 对" in multi_log, True,
           "计数是「模板变更预警」的基线：某轮突然暴涨 = 源站文本模板变了")
-    check("且报的是**最大**的那对 0.8400", "最高的那对 0.8400" in sink2.text, True)
+    check("且报的是**最大**的那对 0.8400", "最高的那对 0.8400" in multi_log, True)
     check("0.84 / 0.83 两对都不合并（都 < 0.85）",
           sorted(sorted(c) for c in multi), [[0], [1], [2], [3]])
-    _ex = next((ln for ln in sink2.text.splitlines()
+    _ex = next((ln for ln in multi_log.splitlines()
                 if "近阈值对示例" in ln and "S文" in ln), "")
     check("示例按相似度**从高到低**排（最危险的一对排最前）",
           _ex.find("0.8400") != -1 and _ex.find("0.8400") < _ex.find("0.8300"), True,
@@ -379,9 +396,9 @@ def _cluster():
 
     print("\n[3d] 重复侧的**聚合**：多个合并簇时取最不像的那一对")
     check("两个合并簇（0.86 与 1.0）→ 报 0.86，不是 1.0",
-          "簇内最不像的一对 0.8600" in sink2.text, True,
+          "簇内最不像的一对 0.8600" in two_log, True,
           "它回答的是「真重复离阈值最近能有多近」——报成 1.0 等于把这一侧又变回盲区")
-    check("并给出它高出阈值的绝对量", "高出阈值 +0.0100" in sink2.text, True)
+    check("并给出它高出阈值的绝对量", "高出阈值 +0.0100" in two_log, True)
     check("两簇都识别为多元素簇（各 2 条）",
           sorted(sorted(c) for c in two), [[0, 1], [2, 3]])
 

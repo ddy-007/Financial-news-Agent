@@ -427,10 +427,14 @@ def _cluster_by_similarity(vecs: np.ndarray,
     **签名保持向后兼容** —— 既有调用方与契约脚本只传 `vecs`。
 
     另外记录**阈值两侧的相似度分布**（2026-09-24，复核意见 §7.3）：
-    「近阈值对」（`NEAR_MISS_LOW ≤ sim < threshold`，即差点被误合并的）与
+    「近阈值对」（**两两直接**相似度落在 `[NEAR_MISS_LOW, threshold)`）与
     「簇内最不像的一对」（真重复里离阈值最近的那对）。**只有一侧选不了阈值**：
     只知道「最像的假对是 0.845」而不知道「最不像的真对是多少」，就无从判断
     0.005 的余量到底是紧还是宽。
+
+    ⚠️ 「近阈值对」**不等于**「差点被误合并」：传递闭包并进同一簇的两条，
+    彼此直接相似度可能落在带内（A–B、B–C ≥0.85 而 A–C 只有 0.83）。
+    日志措辞已写明是「**直接**相似度」，别把它读成「这一对被单独差点合并」。
     """
     n = len(vecs)
     if n <= 1:
@@ -517,8 +521,12 @@ def _cluster_by_similarity(vecs: np.ndarray,
 
     nm_max = max((t[0] for t in nm_top), default=None)
     logger.info(
+        # ⚠️ 措辞里必须有「**直接**相似度」：`nm_count` 数的是**两两直接**落在
+        # [NEAR_MISS_LOW, threshold) 的对，**不等于**「差点被误合并」——
+        # 经传递闭包已并进同一簇、但彼此直接相似度偏低的那些对也会被计入
+        # （A–B、B–C 都 ≥0.85 时，A–C 可能只有 0.83）。巡检 2026-09-24 指出。
         f"[去重] 阈值余量：近阈值对 {nm_count} 对"
-        f"（≥{NEAR_MISS_LOW:.2f} 且 <{threshold}）"
+        f"（**直接**相似度 ≥{NEAR_MISS_LOW:.2f} 且 <{threshold:.2f}）"
         + (f"，最高的那对 {nm_max:.4f}（距阈值还差 {threshold - nm_max:.4f}）"
            if nm_max is not None else "")
         + f"｜合并簇 {dup_clusters} 个"
