@@ -79,15 +79,23 @@ def _fmt_score(v) -> str:
 
 
 # ================= 页面：每日研判 =================
-def page_dashboard():
-    st.title("📊 每日市场研判")
-    data = api_get("/api/v1/reports/today")
+def page_dashboard(data: dict | None = None, *, include_market: bool = True):
+    if data is None:
+        st.title("📊 每日市场研判")
+        data = api_get("/api/v1/reports/today")
+    else:
+        st.markdown("#### 日报详情")
     if not data:
         st.info("暂无研判报告。请先在后端执行 `POST /api/v1/reports/generate`，或等待定时任务。")
         return
 
     c = data.get("content") or {}
-    st.subheader(data.get("title", ""))
+    title = data.get("title") or ""
+    if not include_market and len(title) > 60:
+        with st.expander("报告标题"):
+            st.write(title)
+    else:
+        st.subheader(title)
     generated_at = str(data.get("date") or "")
     report_day = data.get("report_day") or generated_at[:10]
     generated_label = generated_at.replace("T", " ")[:19] or "未知"
@@ -95,6 +103,10 @@ def page_dashboard():
         f"报告日期：{report_day}  ·  生成时间：{generated_label}  ·  "
         f"模型：{data.get('model', '')}"
     )
+    if c.get("raw"):
+        st.markdown("#### 报告正文")
+        st.write(c["raw"])
+        return
 
     # 数据时效：基于陈旧数据时必须明示，不能冒充"今日研判"
     fr = c.get("data_freshness") or {}
@@ -232,39 +244,34 @@ def page_dashboard():
     st.markdown("#### 大盘综述")
     st.write(c.get("market_summary", ""))
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("#### 主要驱动因素")
-        for x in c.get("key_drivers", []):
-            st.markdown(f"- {x}")
-        st.markdown("#### 板块机会")
-        for x in c.get("sector_opportunities", []):
-            st.markdown(f"- {x}")
-    with col_b:
-        st.markdown("#### 风险提示")
-        for x in c.get("risks", []):
-            st.markdown(f"- {x}")
-        st.markdown("#### 引用新闻")
-        for x in c.get("reference_news", []):
-            st.markdown(f"- {x}")
+    for label, key in (
+        ("主要驱动因素", "key_drivers"),
+        ("板块机会", "sector_opportunities"),
+        ("风险提示", "risks"),
+        ("引用新闻", "reference_news"),
+    ):
+        items = c.get(key) or []
+        with st.expander(f"{label}（{len(items)}）"):
+            for x in items:
+                st.markdown(f"- {x}")
 
     st.warning("⚠️ 以上内容由 AI 基于历史数据生成，仅供参考，不构成投资建议。")
 
-    # 行情概览
-    st.markdown("#### 主要指数概览")
-    market = api_get("/api/v1/market", {"limit": 50})
-    if market:
-        latest = {}
-        for r in market:
-            latest.setdefault(r["symbol"], r)
-        cols = st.columns(len(latest) or 1)
-        for i, r in enumerate(latest.values()):
-            pct = r.get("change_pct")
-            cols[i].metric(
-                r.get("name", ""),
-                f"{r.get('close')}",
-                f"{pct:+.2f}%" if pct is not None else "—",
-            )
+    if include_market:
+        st.markdown("#### 主要指数概览")
+        market = api_get("/api/v1/market", {"limit": 50})
+        if market:
+            latest = {}
+            for r in market:
+                latest.setdefault(r["symbol"], r)
+            cols = st.columns(len(latest) or 1)
+            for i, r in enumerate(latest.values()):
+                pct = r.get("change_pct")
+                cols[i].metric(
+                    r.get("name", ""),
+                    f"{r.get('close')}",
+                    f"{pct:+.2f}%" if pct is not None else "—",
+                )
 
 
 # ================= 页面：周度综述 =================
@@ -665,6 +672,19 @@ def page_history():
         display = df[["业务日期", "生成时间", "sentiment", "score", "title"]].copy()
         display.columns = ["业务日期", "生成时间", "情绪", "综合分", "标题"]
         st.dataframe(display, use_container_width=True, height=400)
+
+        report_by_id = {r["id"]: r for r in reports if r.get("id")}
+        selected_id = st.selectbox(
+            "查看完整日报",
+            [""] + list(report_by_id),
+            format_func=lambda rid: (
+                f"{report_by_id[rid].get('report_day') or report_by_id[rid]['date'][:10]}"
+                f" · {report_by_id[rid]['date'].replace('T', ' ')[:16]}"
+                f" · {report_by_id[rid].get('title', '')[:40]}"
+            ) if rid else "选择日期",
+        )
+        if selected_id:
+            page_dashboard(report_by_id[selected_id], include_market=False)
 
 
 # ================= 主入口 =================
