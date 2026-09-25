@@ -70,7 +70,13 @@ def page_dashboard():
 
     c = data.get("content") or {}
     st.subheader(data.get("title", ""))
-    st.caption(f"报告日期：{data.get('date', '')[:10]}  ·  模型：{data.get('model', '')}")
+    generated_at = str(data.get("date") or "")
+    report_day = data.get("report_day") or generated_at[:10]
+    generated_label = generated_at.replace("T", " ")[:19] or "未知"
+    st.caption(
+        f"报告日期：{report_day}  ·  生成时间：{generated_label}  ·  "
+        f"模型：{data.get('model', '')}"
+    )
 
     # 数据时效：基于陈旧数据时必须明示，不能冒充"今日研判"
     fr = c.get("data_freshness") or {}
@@ -568,9 +574,14 @@ def page_history():
     st.markdown("#### 历史报告")
     reports = api_get("/api/v1/reports", {"limit": 50})
     if reports:
-        df = pd.DataFrame(reports)[["date", "sentiment", "score", "title"]]
-        df.columns = ["日期", "情绪", "综合分", "标题"]
-        st.dataframe(df, use_container_width=True, height=400)
+        df = pd.DataFrame(reports)
+        if "report_day" not in df:
+            df["report_day"] = None
+        df["业务日期"] = df["report_day"].fillna(df["date"].str[:10])
+        df["生成时间"] = df["date"].str.replace("T", " ", regex=False).str[:19]
+        display = df[["业务日期", "生成时间", "sentiment", "score", "title"]].copy()
+        display.columns = ["业务日期", "生成时间", "情绪", "综合分", "标题"]
+        st.dataframe(display, use_container_width=True, height=400)
 
 
 # ================= 主入口 =================
