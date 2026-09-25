@@ -124,20 +124,43 @@ def page_dashboard():
     c2.metric("综合情绪分", _fmt_score(data.get("score")))
     c3.metric("置信度", data.get("confidence", ""))
 
-    # —— 专家观点卡片 ——
+    # —— 专家观点 ——
+    # 顶部使用可展开区域，保留完整观点、证据和不确定性，避免窄屏多列压缩。
     experts = data.get("expert_opinions") or []
     if experts:
         st.markdown("#### 专家观点")
-        cols = st.columns(len(experts))
-        for col, o in zip(cols, experts):
-            with col:
-                stance = o.get("stance", "中性")
-                icon = {"看多": "🟥", "看空": "🟩"}.get(stance, "⬜")
-                st.markdown(f"**{o.get('expert', '')}**")
-                st.markdown(f"{icon} {stance} `{_fmt_score(o.get('score'))}`")
+        for o in experts:
+            if not isinstance(o, dict):
+                continue
+            stance = o.get("stance", "中性")
+            icon = {"看多": "🟥", "看空": "🟩"}.get(stance, "⬜")
+            label = (
+                f"{icon} {o.get('expert', '未命名专家')} · {stance} · "
+                f"综合分 {_fmt_score(o.get('score'))}"
+            )
+            with st.expander(label):
                 st.caption(f"置信度：{o.get('confidence', '')}")
-                for p in (o.get("key_points") or [])[:2]:
-                    st.caption(f"· {p[:55]}")
+                key_points = o.get("key_points") or []
+                if not isinstance(key_points, list):
+                    key_points = []
+                if key_points:
+                    st.markdown("**核心观点**")
+                    for point in key_points:
+                        st.markdown(f"- {point}")
+                evidence = o.get("evidence") or []
+                if not isinstance(evidence, list):
+                    evidence = []
+                if evidence:
+                    st.markdown("**证据**")
+                    for item in evidence:
+                        st.markdown(f"- {item}")
+                uncertainties = o.get("uncertainties") or []
+                if not isinstance(uncertainties, list):
+                    uncertainties = []
+                if uncertainties:
+                    st.markdown("**不确定性**")
+                    for item in uncertainties:
+                        st.markdown(f"- {item}")
 
     # —— 风险官 ——
     risk = c.get("risk_opinion") or {}
@@ -162,6 +185,31 @@ def page_dashboard():
         st.info(
             f"专家分歧度：**{div:.2f}**（{desc}）　最终置信度：**{data.get('confidence', '')}**{veto}"
         )
+
+    consensus_note = c.get("consensus_note")
+    if consensus_note:
+        with st.expander("专家共识与主要分歧"):
+            st.write(consensus_note)
+
+    info = c.get("info_level") or {}
+    freshness = c.get("data_freshness") or {}
+    if info or freshness:
+        with st.expander("信息量与数据质量"):
+            if info.get("reason"):
+                st.write(f"信息量判断：{info['reason']}")
+            signals = info.get("signals") or {}
+            if isinstance(signals, dict) and signals:
+                signal_rows = []
+                for signal in signals.values():
+                    if isinstance(signal, dict):
+                        signal_rows.append(signal)
+                if signal_rows:
+                    st.dataframe(pd.DataFrame(signal_rows), use_container_width=True)
+            if freshness:
+                st.write(
+                    f"最新新闻日期：{freshness.get('newest_news_date') or '未知'}　"
+                    f"数据状态：{freshness.get('freshness') or ('陈旧' if freshness.get('stale') else '正常')}"
+                )
 
     st.markdown("#### 大盘综述")
     st.write(c.get("market_summary", ""))
