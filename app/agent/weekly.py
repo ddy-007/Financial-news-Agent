@@ -228,7 +228,7 @@ def generate_weekly_report(db: Session,
         "score": round(weekly_score, 3),
         "key_drivers": data.get("key_drivers") or [],
         "sector_opportunities": data.get("sector_opportunities") or [],
-        "risks": weekly_risks[:20],
+        "risks": weekly_risks,
         "consensus_note": str(data.get("consensus_note", "")),
         "daily_count": len(rows),
         "daily_series": [
