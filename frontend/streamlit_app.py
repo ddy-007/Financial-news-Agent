@@ -98,10 +98,8 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
         st.subheader(title)
     generated_at = str(data.get("date") or "")
     report_day = data.get("report_day") or generated_at[:10]
-    generated_label = generated_at.replace("T", " ")[:19] or "未知"
     st.caption(
-        f"报告日期：{report_day}  ·  生成时间：{generated_label}  ·  "
-        f"模型：{data.get('model', '')}"
+        f"报告日期：{report_day}  ·  模型：{data.get('model', '')}"
     )
     if c.get("raw"):
         st.markdown("#### 报告正文")
@@ -668,9 +666,8 @@ def page_history():
         if "report_day" not in df:
             df["report_day"] = None
         df["业务日期"] = df["report_day"].fillna(df["date"].str[:10])
-        df["生成时间"] = df["date"].str.replace("T", " ", regex=False).str[:19]
-        display = df[["业务日期", "生成时间", "sentiment", "score", "title"]].copy()
-        display.columns = ["业务日期", "生成时间", "情绪", "综合分", "标题"]
+        display = df[["业务日期", "sentiment", "score", "title"]].copy()
+        display.columns = ["业务日期", "情绪", "综合分", "标题"]
         st.dataframe(display, use_container_width=True, height=400)
 
         report_by_id = {r["id"]: r for r in reports if r.get("id")}
@@ -679,7 +676,6 @@ def page_history():
             [""] + list(report_by_id),
             format_func=lambda rid: (
                 f"{report_by_id[rid].get('report_day') or report_by_id[rid]['date'][:10]}"
-                f" · {report_by_id[rid]['date'].replace('T', ' ')[:16]}"
                 f" · {report_by_id[rid].get('title', '')[:40]}"
             ) if rid else "选择日期",
         )
