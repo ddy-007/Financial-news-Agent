@@ -5,6 +5,7 @@ import json
 from datetime import date
 
 from loguru import logger
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agent.graph import generate_daily_report
@@ -107,7 +108,23 @@ def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport
     else:
         report = MarketReport(report_type="daily", report_day=report_day, **fields)
         db.add(report)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # 两个进程可能同时查不到同一业务日。唯一索引负责仲裁，
+        # 后提交者回滚后重新读取获胜行，再按本次生成结果覆盖。
+        db.rollback()
+        report = (
+            db.query(MarketReport)
+            .filter(MarketReport.report_type == "daily",
+                    MarketReport.report_day == report_day)
+            .first()
+        )
+        if report is None:
+            raise
+        for k, v in fields.items():
+            setattr(report, k, v)
+        db.commit()
     db.refresh(report)
     return report
 

@@ -152,7 +152,8 @@ def readiness(response: Response):
         finally:
             _db.close()
     except Exception as e:  # noqa: BLE001
-        checks["database"] = f"{type(e).__name__}: {e}"
+        logger.warning(f"[就绪] 数据库检查失败：{type(e).__name__}: {e}")
+        checks["database"] = "unavailable"
 
     # ② BM25（RAG 的关键词路）：空索引会让检索**静默**退化为纯向量
     try:
@@ -161,14 +162,16 @@ def readiness(response: Response):
         checks["bm25_ready"] = _r.is_ready()
         checks["bm25_size"] = _r.size
     except Exception as e:  # noqa: BLE001
-        checks["bm25_ready"] = f"{type(e).__name__}: {e}"
+        logger.warning(f"[就绪] BM25 检查失败：{type(e).__name__}: {e}")
+        checks["bm25_ready"] = "unavailable"
 
     # ③ 调度器：定时采集 / 研判全靠它
     try:
         from app.collectors.scheduler import scheduler
         checks["scheduler_running"] = bool(scheduler.running)
     except Exception as e:  # noqa: BLE001
-        checks["scheduler_running"] = f"{type(e).__name__}: {e}"
+        logger.warning(f"[就绪] 调度器检查失败：{type(e).__name__}: {e}")
+        checks["scheduler_running"] = "unavailable"
 
     status = _readiness_status(checks)
     if status == "unavailable":

@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 
 from loguru import logger
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
@@ -34,7 +35,16 @@ def save_market_data(db: Session, rows: list[dict]) -> int:
     """
     if not rows:
         return 0
-    stmt = sqlite_insert(MarketData).on_conflict_do_nothing(
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == "sqlite":
+        insert = sqlite_insert
+    elif dialect_name == "postgresql":
+        insert = postgresql_insert
+    else:
+        raise RuntimeError(
+            f"行情幂等写入暂不支持数据库方言: {dialect_name}"
+        )
+    stmt = insert(MarketData).on_conflict_do_nothing(
         index_elements=["symbol", "date"]
     )
     # ⚠️ 必须走 `db.connection()`（Core 连接）而不是 `db.execute()`：

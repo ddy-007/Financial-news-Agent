@@ -22,7 +22,9 @@ scheduler = BackgroundScheduler()  # 使用系统本地时区（中国 = 北京�
 # ⚠️ `--reload` **不需要**它：reloader 父进程只监听文件、不跑 lifespan，
 # 且重启是先停旧 worker 再起新的（已读 uvicorn 源码确认），不会重叠。
 # 这把锁是给**多进程部署**兜底的，不是给日常开发用的。
-_SCHED_LOCK_FILE = Path("data/.scheduler.lock")
+# Resolve from this module rather than the process CWD. Different launch
+# directories must still contend for the same scheduler lock.
+_SCHED_LOCK_FILE = Path(__file__).resolve().parents[2] / "data" / ".scheduler.lock"
 _sched_lock_fd: int | None = None
 
 
@@ -35,8 +37,11 @@ def _acquire_scheduler_lock() -> int | None:
         _SCHED_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(_SCHED_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as e:  # 目录不可写等
-        logger.warning(f"[调度] 无法创建调度器锁文件 {_SCHED_LOCK_FILE}：{e} —— 跳过互斥检查")
-        return -1          # -1 表示「没锁上，但别因此拦住启动」
+        logger.error(
+            f"[调度] 无法创建调度器锁文件 {_SCHED_LOCK_FILE}：{e} —— "
+            "为避免多进程重复调度，本进程不启动调度器"
+        )
+        return None
     try:
         if os.name == "nt":
             import msvcrt
@@ -293,7 +298,8 @@ def start_scheduler() -> bool:
     _sched_lock_fd = _acquire_scheduler_lock()
     if _sched_lock_fd is None:
         logger.warning(
-            "[调度] **另一个进程已持有调度器锁 —— 本进程不启动调度器**，只提供 API。"
+            "[调度] 调度器锁不可用（可能已被其他进程持有，或锁文件无法创建）—— "
+            "**本进程不启动调度器**，只提供 API。"
             "多 worker / 多进程部署下每个进程都会跑一遍 lifespan，"
             "不限流的话采集与研判会按进程数重复执行（重复的 LLM 花费 + SQLite 写竞争）。"
             "若这不是你想要的，请用单进程启动（见 README 的部署约束）"
