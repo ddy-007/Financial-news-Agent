@@ -51,7 +51,7 @@ def news_sources_health(db: Session = Depends(get_db)):
 def news_dates(db: Session = Depends(get_db)):
     """库中有新闻的日期清单（含每天条数）。
 
-    **前端靠它生成「按日期筛选」的标签和覆盖率提示，所以必须完整。**
+    **前端靠它确定日历范围、默认日期和单日总数，所以必须完整。**
     原先前端是拿一批新闻（`limit=1000`）再从中"推"出日期 —— 数据量一超过
     这个上限，老日期连按钮都不会出现（实证：库里 4632 条覆盖 10 天，
     但前端那 1000 条只剩 09-19/09-20 两天）。
@@ -79,20 +79,23 @@ def list_news(
     #     实测返回全表 9543 行（`LIMIT -5` 同理）；一次请求就能把整库序列化出去
     #   · `days=0` —— falsy，被当成「未传」静默忽略，与「今天」的直觉相反
     # 上限取 1000：前端 selectbox 的最大档就是 1000，再大没有正常用法。
-    # `days` 取 1~30：前端滑块就是 1~30，与它对齐。
+    # `days` 保留给已有 API 调用方，限制在 1~30 天。
     days: int | None = Query(None, ge=1, le=30),
     start: date | None = None,
     end: date | None = None,
     limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     """新闻列表。
 
     - `days=N`：近 N 天
     - `start`/`end`：按**发布日期**区间（含两端），用于"只看某一天"
-    - 三者都不传：行为与本接口引入这些参数前一致（取最新 `limit` 条）
+    - `offset`：跳过前 N 条，供前端翻页
+    - `days`/`start`/`end` 都不传：取最新 `limit` 条
     """
-    q = db.query(News).order_by(News.publish_time.desc())
+    # 同一发布时间的新闻用 id 固定次序，避免翻页时重复或漏项。
+    q = db.query(News).order_by(News.publish_time.desc(), News.id.desc())
     if keyword:
         # autoescape：否则关键词里的 % / _ 会被当成 LIKE 通配符
         # （搜 "a_c" 会命中 "abc"）—— 用户输入应当按字面匹配
@@ -107,7 +110,7 @@ def list_news(
         q = q.filter(News.publish_time >= datetime.combine(start, time.min))
     if end:
         q = q.filter(News.publish_time <= datetime.combine(end, time.max))
-    rows = q.limit(limit).all()
+    rows = q.offset(offset).limit(limit).all()
     return [_news_dict(n) for n in rows]
 
 

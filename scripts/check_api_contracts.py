@@ -23,6 +23,7 @@ from app.agent.tools import _clamp_limit  # noqa: E402
 from app.api.routes_market import list_market  # noqa: E402
 from app.api.routes_news import list_news  # noqa: E402
 from app.api.routes_reports import list_reports  # noqa: E402
+from app.models.news import News  # noqa: E402
 from app.models.report import MarketReport  # noqa: E402
 from app.services.report_service import compute_backtest, report_to_dict  # noqa: E402
 from app.config import settings  # noqa: E402
@@ -96,8 +97,8 @@ def main() -> int:
           "`limit=-1` 在 SQLite 里是「**不限制**」，实测返回全表 9543 行。"
           "上限 1000 = 前端 selectbox 的最大档")
     check("news `days` 夹在 [1, 30]", _bounds(list_news, "days"), (1, 30),
-          "`days=0` 是 falsy、被静默当成「未传」，与「今天」的直觉相反；"
-          "1~30 与前端滑块对齐")
+          "`days=0` 是 falsy、被静默当成「未传」，与「今天」的直觉相反")
+    check("news `offset` 不允许负数", _bounds(list_news, "offset"), (0, None))
     check("market `limit` 夹在 [1, 1000]", _bounds(list_market, "limit"), (1, 1000))
     check("reports `limit` 夹在 [1, 200]", _bounds(list_reports, "limit"), (1, 200))
 
@@ -156,6 +157,20 @@ def main() -> int:
     _eng = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(_eng)
     _db = sessionmaker(bind=_eng)()
+
+    for i in range(4):
+        _db.add(News(title=f"分页新闻 {i}", source="测试", content="",
+                     url=f"https://example.com/news/{i}",
+                     publish_time=_dt.datetime(2026, 9, 24, 12, 0)))
+    _db.commit()
+
+    def _news_page(limit, offset):
+        return [r["id"] for r in list_news(
+            days=None, start=None, end=None, limit=limit, offset=offset, db=_db
+        )]
+
+    check("同一发布时间的新闻翻页不重不漏",
+          _news_page(2, 0) + _news_page(2, 2), _news_page(4, 0))
 
     def _mk(dayh, **over):
         f = {"date": dayh, "title": "t", "content": "{}", "score": 0.1}

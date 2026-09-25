@@ -387,19 +387,7 @@ def page_news():
         return
 
     dates = [date.fromisoformat(r["date"]) for r in date_rows]   # 接口已按日期降序
-    # 跨年时标签必须带年份，否则「9月5日」会撞键、导致某一年那一天点不到
-    _multi_year = dates[0].year != dates[-1].year
-    date_map: dict = {}
-    date_count: dict = {}
-    for r in date_rows:
-        d = date.fromisoformat(r["date"])
-        label = d.isoformat() if _multi_year else f"{d.month}月{d.day}日"
-        date_map[label] = d
-        date_count[label] = r["count"]
-    selected = st.pills("按日期筛选", ["全部日期"] + list(date_map.keys()), default="全部日期")
-
-    # 数据可用范围必须显式说明：下面的滑块能拉到 30 天，但库里未必有那么多天。
-    # 标签组只列「有数据的日期」，空缺是**静默跳过**的（比如 09-18 直接跳到 09-16）。
+    date_count = {date.fromisoformat(r["date"]): r["count"] for r in date_rows}
     _span = (dates[0] - dates[-1]).days + 1
     _missing = _span - len(dates)
     _suffix = f"，其中 **{_missing} 天无数据**）" if _missing > 0 else "）"
@@ -409,65 +397,92 @@ def page_news():
     )
 
     col_a, col_b = st.columns([2, 1])
-    days = col_a.slider("近 N 天", 1, 30, 7)
+    selected_date = col_a.date_input(
+        "日期", value=dates[0], min_value=dates[-1],
+        max_value=max(date.today(), dates[0]),
+    )
     limit = col_b.selectbox("显示条数", [100, 300, 500, 1000], index=1)
+    if selected_date is None:
+        st.info("请选择日期。")
+        return
 
-    # ② 按需向后端取，筛选交给数据库做 —— 不再拿一坨固定数据在本地硬筛。
-    #    选具体某天就只要那天；否则按「近 N 天」窗口。
-    params: dict = {"limit": limit}
-    if selected and selected != "全部日期":
-        d = date_map[selected]
-        params["start"] = d.isoformat()
-        params["end"] = d.isoformat()
-    else:
-        params["days"] = days
+    filter_key = (get_api_base(), selected_date, keyword, limit)
+    if st.session_state.get("news_filter_key") != filter_key:
+        st.session_state.news_filter_key = filter_key
+        st.session_state.news_page = 1
+    page = st.session_state.news_page
+    offset = (page - 1) * limit
+
+    params: dict = {
+        "start": selected_date.isoformat(),
+        "end": selected_date.isoformat(),
+        "limit": limit,
+        "offset": offset,
+    }
     if keyword:
         params["keyword"] = keyword
 
     data = api_get("/api/v1/news", params)
+    if data is None:
+        return
     if not data:
-        st.info(
-            "该筛选条件下**没有新闻数据**。\n\n"
-            "常见原因：① 选定日期当天没有采集到新闻；"
-            "② 「近 N 天」窗口内库里没有数据；③ 关键词没有命中。"
-        )
+        st.info("该日期或关键词下没有新闻数据。")
+        if page > 1 and st.button("上一页", icon=":material/chevron_left:"):
+            st.session_state.news_page -= 1
+            st.rerun()
         return
 
     df = pd.DataFrame(data)
-
-    # 单日条数可能超过「显示条数」而被服务端截断 —— 不说明会让人以为那天只有这么多
-    if selected and selected != "全部日期":
-        _total = date_count.get(selected, 0)
-        if _total > len(df):
-            st.caption(
-                f"⚠️ 该日共 **{_total}** 条，此处按「显示条数」只展示最新的 "
-                f"**{len(df)}** 条（调大「显示条数」可看更多）。"
-            )
+    total = date_count.get(selected_date) if not keyword else None
+    if total is None and len(data) == limit:
+        next_params = {**params, "limit": 1, "offset": offset + limit}
+        has_more = bool(api_get("/api/v1/news", next_params))
+    else:
+        has_more = offset + len(data) < total if total is not None else False
 
     df["源数"] = df["source_count"].apply(
         lambda x: f"🔥 {int(x)}源" if x and x >= 2 else "1源"
     )
     df["题材"] = df["themes"].apply(_fmt_themes)
-    df["时间"] = pd.to_datetime(df["publish_time"]).dt.strftime("%m-%d %H:%M")
+    df["时间"] = pd.to_datetime(df["publish_time"]).dt.strftime("%H:%M")
 
     display = df[
-        ["title", "category", "market", "源数", "题材", "时间", "url"]
+        ["时间", "title", "url", "category", "market", "源数", "题材"]
     ].copy()
-    display.columns = ["标题", "分类", "市场", "源数", "题材", "时间", "原文"]
-    # 重置索引并生成从 1 开始的序号（筛选后重新编号）
+    display.columns = ["时间", "标题", "原文", "分类", "市场", "源数", "题材"]
     display = display.reset_index(drop=True)
-    display.insert(0, "序号", range(1, len(display) + 1))
+    display.insert(0, "序号", range(offset + 1, offset + len(display) + 1))
 
     st.dataframe(
         display,
         column_config={
-            "原文": st.column_config.LinkColumn("原文", display_text="查看"),
+            "序号": st.column_config.NumberColumn("序号", width=55),
+            "原文": st.column_config.LinkColumn(
+                "原文", display_text="🔗", width=60, help="打开原文"
+            ),
         },
         hide_index=True,  # 隐藏 pandas 原生索引，只显示「序号」列
         use_container_width=True,
         height=600,
     )
-    st.caption(f"共 {len(display)} 条新闻")
+    end = offset + len(display)
+    count_label = f"第 {offset + 1}-{end} 条"
+    if total is not None:
+        count_label += f" / 当日共 {total} 条"
+    st.caption(count_label)
+
+    prev_col, page_col, next_col = st.columns([1, 2, 1])
+    with prev_col:
+        if st.button("上一页", icon=":material/chevron_left:",
+                     disabled=page == 1, use_container_width=True):
+            st.session_state.news_page -= 1
+            st.rerun()
+    page_col.caption(f"第 {page} 页")
+    with next_col:
+        if st.button("下一页", icon=":material/chevron_right:",
+                     disabled=not has_more, use_container_width=True):
+            st.session_state.news_page += 1
+            st.rerun()
 
 
 
