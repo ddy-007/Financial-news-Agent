@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 
 import httpx
@@ -18,6 +19,7 @@ import streamlit as st
 UP_COLOR = "#a32a2a"    # 涨（红，深）
 DOWN_COLOR = "#6ec96e"  # 跌（绿，浅）
 NEUTRAL = "#898781"     # 中性/文字
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="金融新闻情报简报 Agent", page_icon="📈", layout="wide")
 
@@ -27,23 +29,39 @@ def get_api_base() -> str:
     return st.session_state.get("api_base", "http://localhost:8000")
 
 
+@st.cache_resource
+def _http_client() -> httpx.Client:
+    return httpx.Client()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_get(api_base: str, path: str, params_items: tuple):
+    params = dict(params_items)
+    r = _http_client().get(f"{api_base}{path}", params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
 def api_get(path: str, params: dict | None = None):
     try:
-        r = httpx.get(f"{get_api_base()}{path}", params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
+        params_items = tuple(sorted((params or {}).items()))
+        return _cached_get(get_api_base(), path, params_items)
     except Exception as e:  # noqa: BLE001
-        st.error(f"后端请求失败：{e}")
+        logger.exception("GET 请求失败 path=%s", path)
+        st.error("暂时无法获取数据，请检查后端服务后重试。")
         return None
 
 
-def api_post(path: str, json_data: dict | None = None):
+def api_post(path: str, json_data: dict | None = None, *, invalidate_cache: bool = True):
     try:
-        r = httpx.post(f"{get_api_base()}{path}", json=json_data, timeout=180)
+        r = _http_client().post(f"{get_api_base()}{path}", json=json_data, timeout=180)
         r.raise_for_status()
+        if invalidate_cache:
+            _cached_get.clear()
         return r.json()
     except Exception as e:  # noqa: BLE001
-        st.error(f"后端请求失败：{e}")
+        logger.exception("POST 请求失败 path=%s", path)
+        st.error("操作暂时失败，请检查后端服务后重试。")
         return None
 
 
@@ -331,8 +349,10 @@ def page_news():
     with col2:
         st.write("")
         if st.button("采集最新新闻", use_container_width=True):
-            api_post("/api/v1/news/collect")
-            st.rerun()
+            with st.spinner("正在采集并整理新闻，请稍候…"):
+                resp = api_post("/api/v1/news/collect")
+            if resp is not None:
+                st.success("新闻采集完成，列表已刷新。")
 
     # ① 日期清单单独取 —— 它回答的是「库里有哪些日期」，与新闻总量无关（一条聚合查询）。
     #    原先是拿一批新闻（limit=1000）再从中"推"日期，数据量一超过上限，
@@ -436,8 +456,10 @@ def page_news():
 def page_market():
     st.title("📉 指数行情")
     if st.button("采集最新行情"):
-        api_post("/api/v1/market/collect")
-        st.rerun()   # 与新闻页的同名按钮一致：不 rerun 就看不到刷新
+        with st.spinner("正在采集最新行情，请稍候…"):
+            resp = api_post("/api/v1/market/collect")
+        if resp is not None:
+            st.success("行情采集完成，数据已刷新。")
 
     data = api_get("/api/v1/market", {"limit": 500})
     if not data:
@@ -478,8 +500,11 @@ def page_market():
 
     # 最新行情表
     latest = df.sort_values("date").drop_duplicates("symbol", keep="last")
-    table = latest[["name", "symbol", "close", "change_pct", "date"]]
-    table.columns = ["名称", "代码", "收盘", "涨跌幅%", "日期"]
+    latest["方向"] = latest["change_pct"].map(
+        lambda v: "—" if pd.isna(v) else ("涨 ↑" if v > 0 else ("跌 ↓" if v < 0 else "平 →"))
+    )
+    table = latest[["name", "symbol", "close", "change_pct", "方向", "date"]]
+    table.columns = ["名称", "代码", "收盘", "涨跌幅%", "方向", "日期"]
     st.dataframe(table, use_container_width=True)
 
     _render_sector_board()
@@ -575,17 +600,27 @@ def page_chat():
 
         # 构造历史（去掉当前 query 后的两两配对）
         history = []
-        prev = st.session_state.messages[:-1]
-        for i in range(0, len(prev) - 1, 2):
-            if prev[i]["role"] == "user" and prev[i + 1]["role"] == "assistant":
-                history.append([prev[i]["content"], prev[i + 1]["content"]])
+        pending_user = None
+        for message in st.session_state.messages[:-1]:
+            if message.get("role") == "user":
+                pending_user = message.get("content")
+            elif message.get("role") == "assistant" and pending_user is not None:
+                history.append([pending_user, message.get("content", "")])
+                pending_user = None
 
         with st.chat_message("assistant"):
             with st.spinner("思考中…"):
-                resp = api_post("/api/v1/agent/chat", {"query": query, "chat_history": history})
-            answer = (resp or {}).get("answer", "（无响应）")
-            st.markdown(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+                resp = api_post(
+                    "/api/v1/agent/chat",
+                    {"query": query, "chat_history": history},
+                    invalidate_cache=False,
+                )
+            answer = (resp or {}).get("answer") if resp else None
+            if answer:
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+            else:
+                st.error("本次问答没有返回结果，请稍后重试。")
 
 
 # ================= 页面：历史与回测 =================
@@ -637,6 +672,9 @@ def main():
     st.sidebar.title("📈 金融情报简报 Agent")
     api_base = st.sidebar.text_input("后端地址", value=get_api_base())
     st.session_state.api_base = api_base
+    if st.sidebar.button("刷新数据"):
+        _cached_get.clear()
+        st.rerun()
 
     page = st.sidebar.radio(
         "导航",
