@@ -437,15 +437,17 @@ CHIEF_PROMPT = """你是一位首席策略师，负责汇总多位分析师的�
 {info_hint}{fail_hint}{data_hint}
 
 撰写要求：
-1. market_summary：综合多方观点，**并体现主要分歧**，不要只挑乐观的说
-2. key_drivers：核心驱动因素，每条注明依据
-3. sector_opportunities：具体板块机会
-4. risks：**必须完整包含风险官提出的所有风险点，不得删减或淡化**
-5. reference_news：引用的新闻标题
-6. consensus_note：说明专家之间的分歧所在，以及为什么最终这样定调
+1. title：生成一段**简洁、可独立阅读的中文标题**，8~24 字，概括当天核心定调；不要写日期、编号、引号或 Markdown
+2. market_summary：综合多方观点，**并体现主要分歧**，不要只挑乐观的说
+3. key_drivers：核心驱动因素，每条注明依据
+4. sector_opportunities：具体板块机会
+5. risks：**必须完整包含风险官提出的所有风险点，不得删减或淡化**
+6. reference_news：引用的新闻标题
+7. consensus_note：说明专家之间的分歧所在，以及为什么最终这样定调
 
 严格只输出 JSON（不要输出任何其他文字）：
 {{
+  "title": "简洁的市场定调标题",
   "market_summary": "大盘综述",
   "key_drivers": ["驱动因素（附依据）"],
   "sector_opportunities": ["板块机会"],
@@ -550,6 +552,7 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
             risks.append(r)
 
     return {
+        "title": str(data.get("title", "")).strip(),
         "market_summary": str(data.get("market_summary", "")),
         "key_drivers": _as_list(data.get("key_drivers")),
         "sector_opportunities": _as_list(data.get("sector_opportunities")),

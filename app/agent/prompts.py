@@ -22,6 +22,7 @@ REPORT_PROMPT_TEMPLATE = """请基于以下信息，生成 {date} A 股市场的
 
 请严格按以下 JSON 结构输出（不要输出 JSON 以外的任何内容）：
 {{
+  "title": "简洁的市场定调标题（8~24字）",
   "market_summary": "大盘综述，一句话",
   "sentiment": "偏多/中性/偏空",
   "confidence": "high/medium/low",

@@ -30,6 +30,7 @@ class FinalReport(BaseModel):
     """首席策略师输出（兼容既有 MarketReport 字段）。"""
 
     # —— 沿用既有字段 ——
+    title: str = ""                                  # 顶部短标题（8~24字）
     market_summary: str = ""
     sentiment: Literal["偏多", "中性", "偏空"] = "中性"
     confidence: Literal["high", "medium", "low"] = "medium"

@@ -463,6 +463,7 @@ def chief_node(state: AnalystState) -> dict:
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[首席] 汇总失败，使用降级结构：{e}")
         narrative = {
+            "title": "日报生成暂不可用",
             "market_summary": "（首席汇总失败）",
             "key_drivers": [], "sector_opportunities": [],
             "risks": list(risk.risks), "reference_news": [], "consensus_note": "",
@@ -499,6 +500,7 @@ def _fallback_report(db: Session, as_of: datetime | None = None) -> dict:
     if not isinstance(data, dict):
         data = {}
     return {
+        "title": str(data.get("title", "")).strip(),
         "market_summary": str(data.get("market_summary", "")),
         "sentiment": data.get("sentiment", "中性"),
         "confidence": data.get("confidence", "medium"),
@@ -620,11 +622,19 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
     # `/reports/today` 只显示最后一份，回测得自己按天去重否则同一天被重复加权。
     from app.services.report_service import upsert_daily_report  # 循环导入：延后到调用时
 
+    report_title = str(final.get("title") or "").strip()
+    report_title = report_title.strip("\"'“”‘’").replace("\n", " ")[:24]
+    if not report_title:
+        # 兼容旧模型/旧降级响应：仅在 LLM 没有返回 title 时才回退，
+        # 不再把完整综述直接截成标题。
+        report_title = str(final.get("market_summary") or "日报研判").strip()
+        report_title = report_title.split("。", 1)[0][:24] or "日报研判"
+
     report = upsert_daily_report(
         db,
         date.date(),                      # 业务日：`date` 传进来时就是报告日（补跑也如此）
         date=date,                        # 生成时刻，保留可追溯性
-        title=str(final.get("market_summary", ""))[:200],
+        title=report_title,
         content=json.dumps(final, ensure_ascii=False, indent=2),
         sentiment=final.get("sentiment", "中性"),
         confidence=final.get("confidence") or final.get("final_confidence"),
