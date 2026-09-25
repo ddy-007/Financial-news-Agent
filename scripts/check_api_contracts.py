@@ -24,7 +24,8 @@ from app.api.routes_market import list_market  # noqa: E402
 from app.api.routes_news import list_news  # noqa: E402
 from app.api.routes_reports import list_reports  # noqa: E402
 from app.models.report import MarketReport  # noqa: E402
-from app.services.report_service import report_to_dict  # noqa: E402
+from app.services.report_service import compute_backtest, report_to_dict  # noqa: E402
+from app.config import settings  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 _RESULTS: list[tuple[bool, str]] = []
@@ -231,6 +232,9 @@ def main() -> int:
 
     check("`report_to_dict` 暴露了 report_day（前端按天分组要用它）",
           "report_day" in report_to_dict(r1), True)
+    check("回测响应暴露当前中性带（前端规则说明与后端同源）",
+          compute_backtest(_db)["score_neutral_band"],
+          settings.score_neutral_band)
 
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")

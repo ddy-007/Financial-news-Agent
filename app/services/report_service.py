@@ -269,6 +269,8 @@ def compute_backtest(db: Session) -> dict:
         "total": total,
         "correct": correct,
         "accuracy": accuracy,
+        # 前端说明必须与实际判方向阈值保持同源，避免硬编码旧值。
+        "score_neutral_band": settings.score_neutral_band,
         "by_bucket": by_bucket,
         "details": details,
     }

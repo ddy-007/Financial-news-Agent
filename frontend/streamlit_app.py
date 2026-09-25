@@ -544,7 +544,17 @@ def page_history():
         c2.metric("方向正确数", backtest.get("correct", 0))
         acc = backtest.get("accuracy", 0)
         c3.metric("方向准确率", f"{acc}%")
-        st.caption("回测规则：综合情绪分 >0.1 视为看多、<-0.1 看空，与上证指数次日涨跌方向比对。仅供参考。")
+        neutral_band = backtest.get("score_neutral_band")
+        if isinstance(neutral_band, (int, float)):
+            rule = (
+                f"综合情绪分 >{neutral_band:g} 视为看多、"
+                f"<-{neutral_band:g} 视为看空"
+            )
+        else:
+            rule = "看多/看空阈值由后端配置决定"
+        st.caption(
+            f"回测规则：{rule}，与上证指数次日涨跌方向比对。仅供参考。"
+        )
         by_bucket = backtest.get("by_bucket", [])
         if by_bucket:
             st.markdown("#### 按情绪分档胜率")
