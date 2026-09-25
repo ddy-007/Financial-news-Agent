@@ -429,7 +429,7 @@ def page_market():
         st.plotly_chart(fig, use_container_width=True)
 
     # 最新行情表
-    latest = df.sort_values("date").groupby("symbol", as_index=False).last()
+    latest = df.sort_values("date").drop_duplicates("symbol", keep="last")
     table = latest[["name", "symbol", "close", "change_pct", "date"]]
     table.columns = ["名称", "代码", "收盘", "涨跌幅%", "日期"]
     st.dataframe(table, use_container_width=True)
