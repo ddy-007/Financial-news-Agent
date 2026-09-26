@@ -15,8 +15,10 @@ from datetime import datetime, timedelta
 import httpx
 from loguru import logger
 
-from app.collectors.http_client import get_client
-from app.retry import with_retry
+from app.collectors.http_client import (
+    get_client, is_connection_error, reset_client,
+)
+from app.retry import describe_exception, with_retry
 
 
 @dataclass
@@ -193,10 +195,32 @@ class BaseCollector(ABC):
 
         允许注入是为了**构造测试**：给一个返回固定 JSON 的假 client，
         就能离线验证四道 guard 与逐页容错，不必打真实源。
+
+        ⚠️ **连接类故障后丢弃共享 client**（2026-09-26 实机）：进程级单例把
+        连接池 / SSL 上下文 / 代理挂载在**创建时**就固定下来，网络路径一变就可能
+        **持续**失败 —— 现场表现是「三个源一起 TLS 超时，重启后端立刻好」。
+        在这里重建，`with_retry` 的**下一次尝试**就用上全新连接，
+        等于把那次人工重启自动化。
+
+        ⚠️ **必须在重试循环内部重建**：若挪到一轮结束时再重建，这一轮仍要白等满
+        三次重试（实测约 4 分钟）—— 那只是让下一轮变好，救不了当下。
+
+        注入的 `client` **不**重建：那是调用方（测试 / 脚本）自己的对象，
+        关掉它会污染调用方后续的使用。
         """
         c = client or get_client()
-        r = c.get(url, **kwargs)
-        r.raise_for_status()
+        try:
+            r = c.get(url, **kwargs)
+            r.raise_for_status()
+        except Exception as e:  # noqa: BLE001
+            # 只认「连接层面坏了」这一类；400/404/500 换个连接也没用，不该重建。
+            if client is None and is_connection_error(e):
+                reset_client()
+                logger.warning(
+                    f"[http] 连接类故障，已丢弃共享 client 待重建："
+                    f"{describe_exception(e)}"
+                )
+            raise
         return r.json()
 
 
@@ -226,7 +250,10 @@ class SinaCollector(BaseCollector):
                 # 逐页容错：本页失败**不丢已得的页**，继续下一页（设计 §9.2）
                 failed_pages += 1
                 consecutive_fails += 1
-                logger.warning(f"[{self.source_name}] 第 {page} 页失败，跳过：{e}")
+                logger.warning(
+                    f"[{self.source_name}] 第 {page} 页失败，跳过："
+                    f"{describe_exception(e)}"
+                )
                 if consecutive_fails >= MAX_CONSECUTIVE_PAGE_FAILS:
                     logger.error(
                         f"[{self.source_name}] 连续 {consecutive_fails} 页失败，"
@@ -318,7 +345,8 @@ class EastmoneyCollector(BaseCollector):
                 #  2026-09-22 实测发现并写回文档。）
                 failed_pages += 1
                 logger.warning(
-                    f"[{self.source_name}] 第 {page} 页失败：{e}；"
+                    f"[{self.source_name}] 第 {page} 页失败："
+                    f"{describe_exception(e)}；"
                     f"游标型分页跳不过本页（游标未推进），在此停止"
                     f"（已得的 {len(items)} 条保留）"
                 )
@@ -416,7 +444,8 @@ class ClsCollector(BaseCollector):
                 # 同东财：游标型分页跳不过失败页（游标未推进），在此停止。
                 failed_pages += 1
                 logger.warning(
-                    f"[{self.source_name}] 第 {page} 页失败：{e}；"
+                    f"[{self.source_name}] 第 {page} 页失败："
+                    f"{describe_exception(e)}；"
                     f"游标型分页跳不过本页（游标未推进），在此停止"
                     f"（已得的 {len(items)} 条保留）"
                 )
@@ -501,7 +530,9 @@ def collect_all_news(anchors: dict[str, Anchor] | None = None
         except Exception as e:  # noqa: BLE001
             # P1 起 fetch 内部已逐页容错，能走到这里的都是**帧级**异常
             # （比如解析逻辑本身出错）。仍然不让它拖垮其他源。
-            logger.warning(f"[{col.source_name}] 采集失败: {e}")
+            logger.warning(
+                f"[{col.source_name}] 采集失败: {describe_exception(e)}"
+            )
             results.append(SourceResult(source=col.source_name, items=[],
                                         rejected=[], ok=False))
     return results

@@ -22,6 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+ROOT = Path(__file__).resolve().parents[1]
+
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
@@ -431,6 +433,141 @@ def _mutex():
           "非阻塞获取：一轮几十分钟，等它对调用方毫无意义")
 
 
+# ============ H. 连接类故障自愈 + 异常描述 ============
+def _connection_selfheal():
+    """锁定「连接类故障 → 丢弃共享 client」这条自愈路径（2026-09-26 实机）。
+
+    **背景**：后端连续运行几小时后，三个源**一起**变成 TLS 握手超时，
+    重启后端立刻恢复；同一台机器上新起的进程一切正常。坏的是**进程内的 client
+    对象**（连接池 / SSL 上下文 / 代理挂载在创建时就固定了），不是外网。
+
+    这里钉两件事：
+    ① 异常描述必须带**类型名与 cause 链** —— 否则下次还是查不出根因
+       （实测日志只剩 `[重试] 新闻接口 重试 3 次后仍失败:`，冒号后是空的）；
+    ② 连接类故障必须重置单例，且**只对内部单例**重置 ——
+       注入的 client 是调用方自己的对象。
+    """
+    print("\nH. 连接类故障自愈 + 异常描述（2026-09-26）")
+    import httpx
+
+    from app.collectors import http_client as HC
+    from app.collectors import news_collector as NC
+    from app.retry import describe_exception
+
+    # ---- ① 异常描述 ----
+    try:
+        try:
+            raise ValueError("底层原因")
+        except ValueError as inner:
+            raise RuntimeError("外层") from inner
+    except RuntimeError as e:
+        desc = describe_exception(e)
+    check("describe_exception 以类型名开头", desc.startswith("RuntimeError: "), True,
+          "只打 {e} 时类型信息全丢")
+    check("describe_exception 追到 cause",
+          ("ValueError" in desc and "底层原因" in desc), True,
+          "httpx → httpcore → ssl/socket 的链条必须可见，否则分不出 DNS/TLS/读超时")
+    check("空消息异常也留下类型名",
+          describe_exception(httpx.ConnectTimeout("")).startswith("ConnectTimeout"),
+          True,
+          "httpx 重包 httpcore 时 str(e) 常为空串 —— 本次故障正是这一类")
+
+    # ---- ② 连接类判定（按类型，不看文本）----
+    _req = httpx.Request("GET", "https://example.com")
+    _404 = httpx.HTTPStatusError(
+        "404", request=_req, response=httpx.Response(404, request=_req))
+    check("ConnectError → 连接类", HC.is_connection_error(httpx.ConnectError("x")),
+          True)
+    check("ConnectTimeout → 连接类",
+          HC.is_connection_error(httpx.ConnectTimeout("")), True,
+          "本次故障正是 TLS 握手超时")
+    check("ReadTimeout → 连接类", HC.is_connection_error(httpx.ReadTimeout("")), True)
+    check("HTTP 404 → **不是**连接类", HC.is_connection_error(_404), False,
+          "服务端已明确回应，换个连接打过去还是 404 —— 重建纯属浪费")
+    check("普通异常 → **不是**连接类", HC.is_connection_error(RuntimeError("x")),
+          False)
+
+    # ---- ③ 重置确实换了一个新对象 ----
+    before = HC.get_client()
+    HC.reset_client()
+    after = HC.get_client()
+    check("reset_client 后拿到的是新对象", before is not after, True,
+          "旧连接池 / SSL 上下文 / 代理挂载一并丢弃 —— 这就是「重启才恢复」的自动化")
+    check("旧对象已被关闭", before.is_closed, True, "不能只丢引用不关连接")
+
+    # ---- ④ 接线：只有内部单例才重置 ----
+    # ⚠️ 绕开 @with_retry 的 1s/2s 退避，直接测函数体 —— 否则本用例要白等 3 秒。
+    raw = NC.SinaCollector._get_json.__wrapped__
+    col = NC.SinaCollector()
+    resets: list[str] = []
+    orig_get, orig_reset = NC.get_client, NC.reset_client
+    try:
+        NC.reset_client = lambda: resets.append("reset")
+
+        NC.get_client = lambda: FakeClient([httpx.ConnectError("boom")])
+        try:
+            raw(col, "https://x", client=None)
+        except httpx.ConnectError:
+            pass
+        check("内部单例 + 连接类故障 → 触发 reset", resets, ["reset"],
+              "不重置就退化成「必须人工重启后端」")
+
+        resets.clear()
+        try:
+            raw(col, "https://x", client=FakeClient([httpx.ConnectError("boom")]))
+        except httpx.ConnectError:
+            pass
+        check("注入的 client 故障 → **不** reset", resets, [],
+              "测试/脚本注入的对象归调用方管，关掉它会污染调用方后续使用")
+
+        resets.clear()
+        NC.get_client = lambda: FakeClient([RuntimeError("server said 500")])
+        try:
+            raw(col, "https://x", client=None)
+        except RuntimeError:
+            pass
+        check("非连接类故障 → **不** reset", resets, [],
+              "只有连接层面坏了才值得换一条连接")
+
+        # ---- ⑤ 端到端：坏 client → 重置 → **第二次尝试就成功** ----
+        # 这条是本改动的**全部目的**：把「三源全挂、必须人工重启后端」变成自愈。
+        # 走**装饰过的**函数（不绕退避），因为要验的正是重试之间的重建时序。
+        # ⚠️ 若把重建挪到一轮结束时，这里会看到第二次尝试仍用坏 client → FAIL。
+        bad = FakeClient([httpx.ConnectError("boom")])
+        good = FakeClient([_sina_page([_sina_row()]), _sina_page([])])
+        handed: list = []
+
+        def _next_client():
+            c = [bad, good][min(len(handed), 1)]
+            handed.append(c)
+            return c
+
+        resets.clear()
+        NC.get_client = _next_client
+        got = NC.SinaCollector._get_json(col, "https://x")
+        check("第一次失败 → 重置 → 第二次用新 client 并成功",
+              (resets, len(handed), [c is bad for c in handed], isinstance(got, dict)),
+              (["reset"], 2, [True, False], True),
+              "实测故障就是这个形态：坏 client 让三个源一起 TLS 超时，重启才好")
+    finally:
+        NC.get_client, NC.reset_client = orig_get, orig_reset
+        HC.reset_client()          # 收尾：别把本用例造出来的 client 留成单例
+
+    # ---- ⑤ 源码守卫：日志不能退回只打 {e} ----
+    nc_src = (ROOT / "app" / "collectors" / "news_collector.py").read_text(
+        encoding="utf-8")
+    retry_src = (ROOT / "app" / "retry.py").read_text(encoding="utf-8")
+    # ⚠️ 这里断言的是**不变量**（不许再格式化裸异常），不是次数。
+    # 第一版写死「等于 3」—— 结果 `_get_json` 里的重置告警也算一处、共 4 处，
+    # 报了一条假 FAIL。次数会随调用点增减漂移，**不变量不会**。
+    check("采集层不再直接格式化裸异常", "{e}" in nc_src, False,
+          "逐页失败（新浪/东财/财联社）+ 帧级失败 + 重置告警共 5 处，"
+          "漏一处那一路故障就又变成无字天书")
+    check("重试的最终失败带异常描述",
+          "describe_exception(last)" in retry_src, True,
+          "「重试 3 次后仍失败:」后面原来是空的")
+
+
 def main() -> int:
     _guards()
     _page_tolerance()
@@ -439,6 +576,7 @@ def main() -> int:
     _state_rules()
     _classify_fallback()
     _mutex()
+    _connection_selfheal()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:

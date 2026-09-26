@@ -81,6 +81,35 @@ def is_retryable(exc: Exception) -> bool:
     return _should_retry(exc)
 
 
+def describe_exception(exc: BaseException, *, max_depth: int = 3) -> str:
+    """把异常连成**一行**可读的因果链：类型名 + repr，再逐层追 `__cause__` / `__context__`。
+
+    **为什么必须有**（2026-09-26 实机）：日志原先只打 `{e}`。httpx 重新包装
+    httpcore 异常时会**丢掉消息** —— 实测抛出的是 `httpx.ConnectTimeout('')`，
+    `str(e)` 是空串，于是日志里只剩：
+
+        [重试] 新闻接口 重试 3 次后仍失败:
+
+    冒号后面什么都没有。同一轮里新浪、东方财富、财联社三个源全挂，却分不出
+    是谁因为什么挂的。**类型名与 cause 链是唯一能区分**
+    「DNS 失败 / 连接被拒 / TLS 握手超时 / 读超时 / 协议中断」的信息。
+
+    `max_depth` 默认 3 层：httpx → httpcore → 底层 ssl/socket 通常正好三层，
+    再深只是噪音。`seen` 防自引用链把循环卡死。
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and len(parts) < max_depth and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(f"{type(cur).__name__}: {cur!r}")
+        # `getattr` 而非直接取属性：本函数只服务于**日志路径**，
+        # 它自己抛错会把真正的失败盖掉。
+        cur = (getattr(cur, "__cause__", None)
+               or getattr(cur, "__context__", None))
+    return " ← ".join(parts)
+
+
 def with_retry(fn: Callable | None = None, *, retry_times: int = DEFAULT_TIMES,
                retry_delay: float = DEFAULT_BASE_DELAY, retry_label: str = ""):
     """指数退避重试装饰器。
@@ -101,16 +130,23 @@ def with_retry(fn: Callable | None = None, *, retry_times: int = DEFAULT_TIMES,
                 except Exception as e:  # noqa: BLE001
                     last = e
                     if not _should_retry(e):
-                        logger.warning(f"[重试] {name}：不可重试的错误，直接抛出: {e}")
+                        logger.warning(
+                            f"[重试] {name}：不可重试的错误，直接抛出: "
+                            f"{describe_exception(e)}"
+                        )
                         raise
                     if i == retry_times - 1:
                         break
                     delay = retry_delay * (2 ** i)
                     logger.warning(
-                        f"[重试] {name} 第 {i + 1}/{retry_times} 次失败，{delay:.1f}s 后重试: {e}"
+                        f"[重试] {name} 第 {i + 1}/{retry_times} 次失败，"
+                        f"{delay:.1f}s 后重试: {describe_exception(e)}"
                     )
                     time.sleep(delay)
-            logger.error(f"[重试] {name} 重试 {retry_times} 次后仍失败: {last}")
+            logger.error(
+                f"[重试] {name} 重试 {retry_times} 次后仍失败: "
+                f"{describe_exception(last)}"
+            )
             raise last  # type: ignore[misc]
         return wrapper
 
