@@ -568,6 +568,40 @@ def _connection_selfheal():
           "「重试 3 次后仍失败:」后面原来是空的")
 
 
+def _failure_logging():
+    print("\nI. 入库异常日志与回滚")
+    from unittest.mock import Mock, patch
+
+    from loguru import logger
+    from sqlalchemy.exc import IntegrityError
+    import app.agent.data_agent as DA
+    import app.services.news_service as NS
+
+    failure = IntegrityError("INSERT INTO news", {"private": "do-not-log-params"},
+                             ValueError("UNIQUE constraint failed: news.url"))
+    db = Mock()
+    messages = []
+    sink = logger.add(lambda msg: messages.append(str(msg)), format="{message}")
+    caught = False
+    try:
+        with patch.object(NS, "run_collection", return_value=([], [])), \
+                patch.object(DA, "run_data_agent", side_effect=failure), \
+                patch.object(NS, "save_states") as save:
+            try:
+                NS.collect_and_store_news(db)
+            except IntegrityError:
+                caught = True
+            check("入库失败不保存水位线", save.called, False)
+    finally:
+        logger.remove(sink)
+    output = "".join(messages)
+    check("异常继续抛出且数据库回滚", (caught, db.rollback.call_count), (True, 1))
+    check("失败日志包含约束原因与调用位置",
+          "news.url" in output and "news_service.py" in output, True)
+    check("失败日志不展开 SQL 参数", "do-not-log-params" in output, False)
+    check("失败后释放采集互斥锁", NS._COLLECT_LOCK.locked(), False)
+
+
 def main() -> int:
     _guards()
     _page_tolerance()
@@ -577,6 +611,7 @@ def main() -> int:
     _classify_fallback()
     _mutex()
     _connection_selfheal()
+    _failure_logging()
     failed = [n for ok, n in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)}/{len(_RESULTS)} 通过")
     if failed:

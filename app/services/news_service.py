@@ -277,5 +277,18 @@ def collect_and_store_news(db: Session) -> int:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[源健康] 巡检失败（不影响本轮采集结果）: {e}")
         return res["new"]
+    except Exception as exc:
+        db.rollback()
+        # 写入 loguru 文件 sink；只输出堆栈帧，避免诊断器展开 SQL 参数和局部变量。
+        import traceback
+        from sqlalchemy.exc import SQLAlchemyError
+        from app.retry import describe_exception
+
+        detail = (describe_exception(exc.orig) if isinstance(exc, SQLAlchemyError)
+                  and getattr(exc, "orig", None) is not None
+                  else describe_exception(exc))
+        frames = "".join(traceback.format_tb(exc.__traceback__))
+        logger.error(f"[采集] 流程失败，未保存本轮水位线：{detail}\n{frames}")
+        raise
     finally:
         _COLLECT_LOCK.release()

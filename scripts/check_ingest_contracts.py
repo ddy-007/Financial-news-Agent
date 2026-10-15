@@ -592,6 +592,48 @@ def _pipeline_order():
     check("同内容无 url 三条 → exact_deduped = 2", res["exact_deduped"], 2)
 
 
+def _url_identity():
+    print("\n[URL] 重抓与重复分类结果不应触发唯一约束")
+    reset_vectors()
+    db = fresh_db()
+    old = add_news(db, "旧标题", "旧正文", url="https://example.com/existing")
+    classify, calls = make_classifier()
+    indexed = []
+    with patched(embed_documents=fake_embed,
+                 vector_store=FakeStore(FakeCollection()),
+                 classify_news=classify,
+                 _rebuild_bm25=lambda *a, **k: None,
+                 _upsert_index=lambda rows: indexed.extend(n.id for n in rows)):
+        res = DA.run_data_agent(db, raw=[
+            item("改过的标题", "更长的新正文" * 5, url=old.url),
+            item("全新新闻", "新正文", url="https://example.com/new"),
+        ])
+    check("同 URL 即使向量库无记录也走合并", db.query(News).count(), 2)
+    check("已有 URL 不再花钱分类", calls, [["全新新闻"]])
+    check("已有 URL 更新正文并重新索引",
+          (old.content, old.id in indexed), ("更长的新正文" * 5, True))
+    check("新增与 URL 合并计数正确", (res["new"], res["merged"]), (1, 1))
+    db.close()
+
+    db = fresh_db()
+    classify, _ = make_classifier()
+
+    def duplicate_classifier(items):
+        rows, failed = classify(items)
+        return rows + rows, failed
+
+    with patched(embed_documents=fake_embed,
+                 vector_store=FakeStore(FakeCollection()),
+                 classify_news=duplicate_classifier,
+                 _rebuild_bm25=lambda *a, **k: None,
+                 _upsert_index=lambda *a: None):
+        res = DA.run_data_agent(db, raw=[
+            item("重复分类结果", "正文", url="https://example.com/duplicate")
+        ])
+    check("同事务重复结果仅新增一条", (db.query(News).count(), res["new"]), (1, 1))
+    db.close()
+
+
 # ============ ⑤ P2 / P3 / fail-open ============
 def _p2_p3_failopen():
     print("\n[7] P2 重索引 / P3 按需 BM25 / 灰区 fail-open")
@@ -877,13 +919,15 @@ def _log_contracts():
     hid = logger.add(sink4.write, level="INFO", format="{message}")
     try:
         with patched(get_llm=lambda **k: _DupLLM()):
-            DA.classify_news([item("T0"), item("T1")])
+            duplicate_results, duplicate_failed = DA.classify_news([item("T0"), item("T1")])
     finally:
         logger.remove(hid)
     check("LLM 返回重复 id → 「漏项」不为负，且与同批 warning 一致",
           "漏项 1" in sink4.text and "漏项 -1" not in sink4.text, True,
           "按 len(batch_ok) 算会得「成功 3 / 漏项 -1」（批只有 2 条）—— "
           "巡检已复现；也与那条 len(missed)/len(batch) 的 warning 自相矛盾")
+    check("LLM 重复 ID 只接收一次，漏项仍交回失败列表",
+          (len(duplicate_results), len(duplicate_failed)), (1, 1))
 
 
 def _result_shape():
@@ -1047,6 +1091,7 @@ def main() -> int:
     _time_window()
     _merge_and_insert()
     _pipeline_order()
+    _url_identity()
     _p2_p3_failopen()
     _within_round_in_pipeline()
     _duplicate_merge_target()

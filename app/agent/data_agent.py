@@ -209,7 +209,7 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
                 if not isinstance(entry, dict):
                     continue
                 idx = int(entry.get("id", -1)) - 1
-                if 0 <= idx < len(batch):
+                if 0 <= idx < len(batch) and idx not in covered:
                     covered.add(idx)
                     themes = entry.get("themes") or []
                     if isinstance(themes, str):
@@ -902,9 +902,22 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
         raw = [it for r in collect_all_news() for it in r.items]
     raw = _dedup_by_url(raw)
 
+    # URL 是数据库身份键，不能依赖向量召回或 LLM 来保证唯一性。
+    urls = [it.url for it in raw if it.url]
+    by_url: dict[str, News] = {}
+    for start in range(0, len(urls), 500):
+        by_url.update({n.url: n for n in db.query(News).filter(
+            News.url.in_(urls[start:start + 500])
+        ).all()})
+    url_matches = [
+        (by_url[it.url], Candidate(item=it, sources=[(it.source, it.url)]))
+        for it in raw if it.url in by_url
+    ]
+    unseen = [it for it in raw if it.url not in by_url]
+
     # 2. ①【几乎免费】确定性去重：正文相同的合成一个候选
-    cands = _group_by_fingerprint(raw)
-    exact_deduped = len(raw) - len(cands)
+    cands = _group_by_fingerprint(unseen)
+    exact_deduped = len(unseen) - len(cands)
 
     # 3. ②【便宜】批量嵌入 + 语义近邻
     #
@@ -935,7 +948,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
 
     matches = _nearest_existing(db, cands, vecs)
 
-    to_merge: list[tuple[News, Candidate]] = []
+    to_merge: list[tuple[News, Candidate]] = list(url_matches)
     to_classify: list[Candidate] = []
     gray_failed = 0
     gray_calls = 0
@@ -1005,12 +1018,24 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
             changed[news_row.id] = news_row
 
     new_news: list[News] = []
+    url_merged = 0
     for r in relevant:
         cand = by_item.get(id(r["item"]))
         if cand is None:              # 理论上不会发生；真要发生，宁可跳过也不要瞎插
             logger.warning("[入库] 分类结果找不到对应候选，已跳过该条")
             continue
-        new_news.append(_insert_new(db, cand, r))
+        url = next((u for _, u in _dedup_sources(cand.sources) if u), None)
+        existing = by_url.get(url)
+        if existing is not None:
+            updated = _merge_into(db, existing, cand)
+            if updated and existing.id is not None:
+                changed[existing.id] = existing
+            url_merged += 1
+            continue
+        news = _insert_new(db, cand, r)
+        new_news.append(news)
+        if url:
+            by_url[url] = news  # 同一事务尚未提交的新增记录也参与去重。
 
     db.commit()
 
@@ -1022,7 +1047,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     # 而改动前是**每轮无条件**重建）。
     if new_news or changed:
         _rebuild_bm25(db)
-    logger.info(f"[入库] 完成：新增 {len(new_news)}、合并 {len(to_merge)}、"
+    logger.info(f"[入库] 完成：新增 {len(new_news)}、合并 {len(to_merge) + url_merged}、"
                 f"改写重索引 {len(changed)}，耗时 {time.time() - _t_ingest:.0f}s")
 
     result = {
@@ -1040,7 +1065,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
         "dropped": dropped,
         "classify_failed": len(classify_failed),
         "new": len(new_news),
-        "merged": len(to_merge),
+        "merged": len(to_merge) + url_merged,
         "gray_check_failed": gray_failed,
     }
     logger.info(
