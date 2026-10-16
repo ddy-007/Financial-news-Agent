@@ -203,6 +203,17 @@ class AuditContracts(unittest.TestCase):
                 self.assertNotIn("请在 market_summary 中如实说明「今日无重大消息」", prompt)
         self.assertNotIn("【采集覆盖提示】", self.chief_prompt(self.freshness(round_overdue=False)))
 
+    def test_chief_and_frontend_show_gap_even_when_latest_round_is_ready(self):
+        fr = self.freshness(round_overdue=False, coverage_incomplete=True,
+                            pending_count=2, open_gap_count=1)
+        prompt = self.chief_prompt(fr)
+        self.assertIn("【覆盖缺口提示】", prompt)
+        self.assertNotIn("请在 market_summary 中如实说明「今日无重大消息」", prompt)
+        text = self.dashboard_text(fr)
+        self.assertIn("2 条原文待处理", text)
+        self.assertIn("1 个历史覆盖缺口", text)
+        self.assertNotIn("今日无重大消息", text)
+
     def test_historical_prepare_does_not_use_live_readiness(self):
         self.db.add(News(title="旧闻", source="财联社", publish_time=self.now - timedelta(hours=1), category="宏观"))
         self.db.commit()

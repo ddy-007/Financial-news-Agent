@@ -30,6 +30,8 @@ from app.agent.llm import get_llm, get_llm_model_name, llm_retry_times
 from app.agent.prompts import CLASSIFY_PROMPT, DEDUP_PROMPT
 from app.collectors.news_collector import NewsItem, collect_all_news
 from app.models.news import News
+from app.models.news_ingest import RawNews
+from app.services.news_archive import acknowledge, archive_items, item_key
 from app.retry import call_with_retry, is_retryable
 from app.rag import vector_store
 from app.rag.embeddings import embed_documents
@@ -319,6 +321,7 @@ class Candidate:
     """
     item: NewsItem                                  # 代表条目（正文最长的那个）
     sources: list[tuple[str, str | None]] = field(default_factory=list)
+    members: list[NewsItem] = field(default_factory=list)  # 全部原文，不能只保留代表
 
     @property
     def text(self) -> str:
@@ -354,9 +357,10 @@ def _group_by_fingerprint(items: list[NewsItem]) -> list[Candidate]:
         fp = _fingerprint(it.title, it.content or "")
         c = groups.get(fp)
         if c is None:
-            groups[fp] = Candidate(item=it, sources=[(it.source, it.url)])
+            groups[fp] = Candidate(item=it, sources=[(it.source, it.url)], members=[it])
             continue
         c.sources.append((it.source, it.url))
+        c.members.append(it)
         # 代表条目取**正文最长**的 —— 信息更全，分类与嵌入都用它
         if len(it.content or "") > len(c.item.content or ""):
             c.item = it
@@ -416,7 +420,9 @@ def _cluster_by_similarity(vecs: np.ndarray,
                            threshold: float = DUP_THRESHOLD,
                            chunk: int = EMBED_CHUNK,
                            texts: list[str] | None = None) -> list[list[int]]:
-    """按余弦相似度 ≥ threshold 把候选聚成簇（union-find），返回下标分组。
+    """先用 union-find 找候选连通分量，再以完整链接约束分组。
+
+    最终每个组内的任意两条均须达到 threshold；A≈B、B≈C 不能推出 A≈C。
 
     为什么要自己做这一步：本轮新增的条目要等入库后才进 Chroma，所以**同轮内
     跨源的同一事件互相看不见**。实测反例：「海光信息将发布新品类芯片」三个源
@@ -547,7 +553,7 @@ def _cluster_by_similarity(vecs: np.ndarray,
         f"（**直接**相似度 ≥{NEAR_MISS_LOW:.2f} 且 <{threshold:.2f}）"
         + (f"，最高的那对 {nm_max:.4f}（距阈值还差 {threshold - nm_max:.4f}）"
            if nm_max is not None else "")
-        + f"｜合并簇 {dup_clusters} 个"
+        + f"｜候选合并簇 {dup_clusters} 个"
         + (f"，簇内最不像的一对 {dup_min:.4f}（高出阈值 {dup_min - threshold:+.4f}"
            + (f"；**{chain_suspects} 个簇里存在低于灰区下限 {GRAY_LOW} 的一对**"
               if chain_suspects else "")
@@ -578,7 +584,32 @@ def _cluster_by_similarity(vecs: np.ndarray,
         ]
         if examples:
             logger.info("[去重] 近阈值对示例：" + "；".join(examples))
-    return out
+    refined: list[list[int]] = []
+    for c in out:
+        if len(c) < 3:
+            refined.append(c)
+            continue
+        sub = vecs[c] @ vecs[c].T
+        groups = [[i] for i in range(len(c))]
+        # complete linkage：每次选组间最小相似度最高的一对，满足阈值才合。
+        # 每个候选分量已限制到 20 条，不引入新的聚类依赖。
+        while len(groups) > 1:
+            best = None
+            for a in range(len(groups)):
+                for b in range(a + 1, len(groups)):
+                    similarity = float(np.min(sub[np.ix_(groups[a], groups[b])]))
+                    if similarity >= threshold and (best is None or similarity > best[0]):
+                        best = (similarity, a, b)
+            if best is None:
+                break
+            _, a, b = best
+            groups[a] = sorted(groups[a] + groups[b])
+            groups.pop(b)
+        refined.extend([c[i] for i in g] for g in groups)
+        if len(groups) > 1:
+            logger.info(f"[去重] 完整链接保护：{len(c)} 条候选拆为 {len(groups)} 组，"
+                        f"每组两两相似度均 ≥{threshold:.2f}")
+    return refined
 
 
 def _collapse_clusters(cands: list[Candidate],
@@ -603,6 +634,7 @@ def _collapse_clusters(cands: list[Candidate],
         merged = Candidate(item=cands[rep].item, sources=[])
         for i in idxs:
             merged.sources.extend(cands[i].sources)
+            merged.members.extend(cands[i].members or [cands[i].item])
         cands[rep] = merged
         reps.append(rep)
     return reps
@@ -892,7 +924,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
 
     `raw` 不为 None 时**不再自行采集**，直接用调用方给的条目 ——
     2026-09-22 起采集由 `news_service.run_collection` 负责，这样水位线才能
-    「采集 → 分类 → 入库全部成功后才推进」。传 None 时保持旧行为（自采），
+    「原文和抓取进度先持久化，分类/入库/索引成功后才推进处理水位」。传 None 时自采，
     供 `scripts/` 里的独立脚本使用。
 
     顺序见模块 docstring。返回值**保持既有键**（`collected` / `classified` /
@@ -907,7 +939,34 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     if raw is None:
         # 顺序与改动前一致：仍是 新浪 → 东财 → 财联社 依次拼接
         raw = [it for r in collect_all_news() for it in r.items]
+    # 必须早于任何去重；同 URL 不同正文也保留独立原文版本。
+    archive_items(db, raw)
+    db.commit()
+    original = list(raw)
+    # 上次业务入库已提交但索引失败：只恢复索引，不重付分类费用。
+    retries = {}
+    processed = set()
+    keys = list({item_key(it) for it in raw})
+    for start in range(0, len(keys), 500):
+        for row in db.query(RawNews).filter(RawNews.id.in_(keys[start:start + 500])).all():
+            if row.status == "index_pending":
+                retries[row.id] = row.news_id
+            elif row.status == "processed":
+                processed.add(row.id)
+    if retries:
+        rows = [db.get(News, k) for k in set(retries.values()) if k]
+        if any(r is None for r in rows):
+            raise ValueError("原文关联的新闻记录不存在，保留待处理状态")
+        _upsert_index(rows)
+        if rows:
+            _rebuild_bm25(db)
+        acknowledge(db, retries)
+    raw = [it for it in raw if item_key(it) not in retries and item_key(it) not in processed]
     raw = _dedup_by_url(raw)
+    url_members: dict[str, list[NewsItem]] = {}
+    for it in original:
+        if it.url:
+            url_members.setdefault(it.url, []).append(it)
 
     # URL 是数据库身份键，不能依赖向量召回或 LLM 来保证唯一性。
     urls = [it.url for it in raw if it.url]
@@ -917,13 +976,17 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
             News.url.in_(urls[start:start + 500])
         ).all()})
     url_matches = [
-        (by_url[it.url], Candidate(item=it, sources=[(it.source, it.url)]))
+        (by_url[it.url], Candidate(item=it, sources=[(it.source, it.url)],
+                                   members=url_members[it.url]))
         for it in raw if it.url in by_url
     ]
     unseen = [it for it in raw if it.url not in by_url]
 
     # 2. ①【几乎免费】确定性去重：正文相同的合成一个候选
     cands = _group_by_fingerprint(unseen)
+    for cand in cands:
+        cand.members = [origin for it in cand.members
+                        for origin in (url_members[it.url] if it.url else [it])]
     exact_deduped = len(unseen) - len(cands)
 
     # 3. ②【便宜】批量嵌入 + 语义近邻
@@ -1020,9 +1083,19 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     # 重复 id 会让 Chroma 抛 DuplicateIDError，且**异常发生在 db.commit() 之后** ——
     # 整轮会以「数据已提交、索引没更新」的半完成状态收场。
     changed: dict[str, News] = {}
+    outcomes: dict[str, str | None] = {}
+
+    def record(cand: Candidate, news_id: str | None) -> None:
+        outcomes.update({item_key(it): news_id for it in (cand.members or [cand.item])})
+
     for news_row, cand in to_merge:
         if _merge_into(db, news_row, cand):
             changed[news_row.id] = news_row
+        record(cand, news_row.id)
+
+    for r in classified:
+        if not r["relevant"] and id(r["item"]) in by_item:
+            record(by_item[id(r["item"])], None)
 
     new_news: list[News] = []
     url_merged = 0
@@ -1038,12 +1111,22 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
             if updated and existing.id is not None:
                 changed[existing.id] = existing
             url_merged += 1
+            db.flush()
+            record(cand, existing.id)
             continue
         news = _insert_new(db, cand, r)
         new_news.append(news)
+        db.flush()
+        record(cand, news.id)
         if url:
             by_url[url] = news  # 同一事务尚未提交的新增记录也参与去重。
 
+    # 新闻和处理决定同一事务保存。索引出错后靠 index_pending 恢复，而非重新分类。
+    keys = list(outcomes)
+    for start in range(0, len(keys), 500):
+        for row in db.query(RawNews).filter(RawNews.id.in_(keys[start:start + 500])).all():
+            row.status = "index_pending"
+            row.news_id = outcomes[row.id]
     db.commit()
 
     # 6. ⑤ 索引：整轮末尾一次性 upsert（新增的 + 被改写的）
@@ -1054,6 +1137,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     # 而改动前是**每轮无条件**重建）。
     if new_news or changed:
         _rebuild_bm25(db)
+    acknowledge(db, outcomes)
     logger.info(f"[入库] 完成：新增 {len(new_news)}、合并 {len(to_merge) + url_merged}、"
                 f"改写重索引 {len(changed)}，耗时 {time.time() - _t_ingest:.0f}s")
 
@@ -1085,7 +1169,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     if result["classify_failed"]:
         logger.warning(
             f"⚠️ 本轮有 {result['classify_failed']} 条**未分类**（LLM 分类失败），"
-            f"这批条目未入库；水位线将不推进，下一轮重取同一窗口"
+            f"这批原文保留待重试；处理水位不推进，抓取进度独立保存"
         )
     if gray_failed:
         logger.warning(

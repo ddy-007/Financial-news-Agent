@@ -108,6 +108,11 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
 
     # 数据时效：基于陈旧数据时必须明示，不能冒充"今日研判"
     fr = c.get("data_freshness") or {}
+    if fr.get("coverage_incomplete"):
+        st.warning(
+            f"⚠️ **覆盖缺口提醒**：报告取数窗口仍有 {fr.get('pending_count', 0)} 条原文待处理、"
+            f"{fr.get('open_gap_count', 0)} 个历史覆盖缺口。普通增量成功不代表历史已经补齐。"
+        )
     if fr.get("round_overdue") or fr.get("collecting"):
         round_state = "采集仍在运行" if fr.get("collecting") else "最近采集未成功或已过期"
         st.warning(
@@ -157,6 +162,7 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
     if data.get("low_info"):
         info = c.get("info_level") or {}
         if (data.get("data_stale") or fr.get("stale") or fr.get("round_overdue")
+                or fr.get("coverage_incomplete")
                 or fr.get("collecting") or fr.get("readiness_scope") == "historical_unknown"):
             st.info("可用素材较少，采集覆盖尚不完整或未知，不能据此判断是否有重大消息。")
         else:
@@ -259,6 +265,8 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
                     "正常完成" if freshness.get("round_overdue") is False else "未知"
                 )
                 st.write(f"分析时点的采集轮状态：{round_status}")
+                st.write(f"窗口内待处理原文：{freshness.get('pending_count', '未知')}　"
+                         f"未解决历史缺口：{freshness.get('open_gap_count', '未知')}")
                 st.write(
                     f"上次成功：{freshness.get('last_round_at') or '未记录'}　"
                     f"本报告新闻截至：{freshness.get('newest_news_at') or freshness.get('newest_news_date') or '未知'}"

@@ -587,7 +587,8 @@ def _failure_logging():
     try:
         with patch.object(NS, "run_collection", return_value=([], [])), \
                 patch.object(DA, "run_data_agent", side_effect=failure), \
-                patch.object(NS, "save_states") as save:
+                patch.object(NS, "save_states") as save, \
+                patch.object(NS, "pending_items", return_value=[]):
             try:
                 NS.collect_and_store_news(db)
             except IntegrityError:

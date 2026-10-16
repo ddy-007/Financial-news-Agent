@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import threading
+import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from loguru import logger
 from sqlalchemy import func
@@ -18,17 +21,20 @@ from app.rag import vector_store
 from app.rag.embeddings import embed_documents
 from app.rag.retriever import get_retriever
 from app.services.info_level import is_round_overdue
+from app.services.news_archive import coverage_counts, pending_items, save_capture
 
 
 # ================= 增量水位线 =================
 def load_states(db: Session) -> dict[str, Anchor]:
-    """读取各源水位线，返回 `{源名: Anchor}`。
+    """读取各源原文抓取水位；迁移前回退旧处理水位，返回 `{源名: Anchor}`。
 
     表为空（首次运行）或缺某个源时**不报错** —— 缺锚点的源会在采集层自动
     回退成「距现在 `news_lookback_days` 天」。
     """
     return {
-        s.source: Anchor(last_ts=s.last_ts, last_id=s.last_id)
+        s.source: Anchor(last_ts=max(t for t in (s.fetched_ts, s.last_ts) if t is not None)
+                        if s.fetched_ts or s.last_ts else None,
+                         last_id=s.last_id if s.fetched_ts is None else None)
         for s in db.query(CollectorState).all()
     }
 
@@ -49,7 +55,7 @@ def _oldest(result: SourceResult) -> datetime | None:
 
 
 def save_states(db: Session, results: list[SourceResult],
-                classify_failed: int) -> None:
+                classify_failed: int, *, processing_pending: int = 0) -> None:
     """按设计 §11 的规则表推进各源水位线。**必须在链路全部成功后调用。**
 
     规则（按序判定，先命中先决定）：
@@ -85,6 +91,10 @@ def save_states(db: Session, results: list[SourceResult],
             logger.warning(f"[采集] 本轮有 {classify_failed} 条分类失败，"
                            f"条目未入库 → {r.source} 水位线**不推进**，下轮重取")
             continue
+        if processing_pending > 0:
+            logger.warning(f"[采集] 尚有 {processing_pending} 条原文待处理，"
+                           f"{r.source} 处理水位线不推进；抓取进度已独立保存")
+            continue
 
         latest, latest_id = _newest(r)
         if latest is None:
@@ -111,8 +121,8 @@ def save_states(db: Session, results: list[SourceResult],
                 # 会得出「9/23 06:44 到 9/22 22:29 之间丢了新闻」这种矛盾区间。
                 # （首次运行时 prev=None，恰好落在右端，掩盖了这个 bug。）
                 f"本轮取到的最旧一条 {oldest}，区间 [{prev}, {oldest}) 的新闻本轮"
-                f"**未取到**。跑 scripts/catchup.py 可补回约 8~10 小时以内的区段"
-                f"（它同样受 {settings.news_max_pages} 页上限）；更早的那段补不回来"
+                f"**未取到**。历史覆盖缺口独立保留，请用 scripts/backfill_news.py 预览区间补采；"
+                f"普通增量成功不代表历史缺口已补齐"
             )
     db.commit()
 
@@ -195,6 +205,44 @@ def rebuild_bm25_index(db: Session, days: int = 7) -> None:
 _COLLECT_LOCK = threading.Lock()
 
 
+def _try_process_lock():
+    """普通采集与独立补采脚本共用文件锁；进程退出由操作系统释放。"""
+    path = Path(__file__).resolve().parents[2] / "data" / "news_ingest.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    if handle.seek(0, 2) == 0:
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+@contextmanager
+def collection_guard():
+    """CLI 与后台共用互斥；获取失败不排队。"""
+    if not _COLLECT_LOCK.acquire(blocking=False):
+        yield False
+        return
+    handle = None
+    try:
+        handle = _try_process_lock()
+        yield handle is not None
+    finally:
+        if handle is not None:
+            handle.close()
+        _COLLECT_LOCK.release()
+
+
 def news_readiness(db: Session, *, now: datetime | None = None) -> dict:
     """新闻轮的**就绪状态** —— 研判取数前判断「本窗口的新闻是否已落地」（H1，2026-09-24）。
 
@@ -220,19 +268,20 @@ def news_readiness(db: Session, *, now: datetime | None = None) -> dict:
         "seconds_since": secs,
         "collecting": _COLLECT_LOCK.locked(),
         "overdue": is_round_overdue(secs, settings.news_interval_minutes),
+        **coverage_counts(db),
     }
 
 
 def run_collection(db: Session) -> tuple[list[NewsItem], list[SourceResult]]:
     """读取水位线 → 采集全部源 → 返回 (全部条目, 各源结果)。
 
-    **刻意不在这里写水位线**：此刻条目还只是一堆内存对象，分类与入库都没发生。
-    推进水位线的唯一时机是 `save_states`，而它由 `collect_and_store_news`
-    在整条链路跑完之后才调用 —— 这个顺序是"不丢新闻"的最后一道保险。
+    先原子保存原文、抓取进度和历史缺口，再交给后续处理。
+    处理水位仍由 `save_states` 在处理完成后推进，抓取不再受模型失败牵制。
     """
     anchors = load_states(db)
     logger.info(f"[采集] 水位线：{ {k: str(v.last_ts) for k, v in anchors.items()} }")
     results = collect_all_news(anchors)
+    save_capture(db, results, anchors)
     items = [it for r in results for it in r.items]
     return items, results
 
@@ -240,10 +289,8 @@ def run_collection(db: Session) -> tuple[list[NewsItem], list[SourceResult]]:
 def collect_and_store_news(db: Session) -> int:
     """采集 + 过滤 + 去重合并 + 索引（走数据采集 Agent），返回新增条数。
 
-    **水位线在最后一步才推进**（见 `save_states`）—— 顺序是
-    「采集 → 分类 → 入库 → 才推进水印」，任何一环不完整都不推进。
-    这个顺序是整条链路里最要紧的一处：提前推进 = 那批新闻还没入库就把
-    水位线划过去，下一轮不会再取，**永久丢失**。
+    「采集 → 原文/抓取进度落库 → 处理待办 → 入库/索引 → 处理水位」。
+    原文与抓取水位同事务，后续失败由持久化队列重试，不依赖源站再次保留新闻。
 
     **同一时刻只允许一次采集**（见 `_COLLECT_LOCK`）。拿不到锁就跳过并返回 0 ——
     调用方靠日志区分"跳过了"与"真的没新增"。
@@ -259,10 +306,18 @@ def collect_and_store_news(db: Session) -> int:
             "而一轮可能跑更久，两者会撞上"
         )
         return 0
+    process_lock = None
     try:
+        process_lock = _try_process_lock()
+        if process_lock is None:
+            logger.warning("[采集] 另一个进程正在采集或补采，本次跳过")
+            return 0
         items, results = run_collection(db)
-        res = run_data_agent(db, raw=items)
-        save_states(db, results, res.get("classify_failed", 0))
+        # run_collection 已将原文与抓取进度原子保存；处理队列跨进程保留失败条目。
+        res = run_data_agent(db, raw=pending_items(db))
+        remaining = coverage_counts(db)["pending_count"]
+        # 旧 last_ok_at 继续表示处理完成；fetched_ts 独立表示已保存原文。
+        save_states(db, results, res.get("classify_failed", 0), processing_pending=remaining)
         # P3 源健康巡检。**必须带本轮上下文**（results / classify_failed）——
         # 只看 collector_state 的话，「LLM 故障导致水位线不推进」会被误报成
         # 「源失效」，把排查引向错误方向（见 collector_health 的模块 docstring）。
@@ -288,7 +343,9 @@ def collect_and_store_news(db: Session) -> int:
                   and getattr(exc, "orig", None) is not None
                   else describe_exception(exc))
         frames = "".join(traceback.format_tb(exc.__traceback__))
-        logger.error(f"[采集] 流程失败，未保存本轮水位线：{detail}\n{frames}")
+        logger.error(f"[采集] 处理失败，处理水位线未推进；若原文已提交则保留抓取进度待重试：{detail}\n{frames}")
         raise
     finally:
+        if process_lock is not None:
+            process_lock.close()
         _COLLECT_LOCK.release()

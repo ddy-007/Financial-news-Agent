@@ -144,7 +144,7 @@ def backfill_reports(db, diag: dict) -> dict:
     return {"done": done, "failed": failed, "skipped": skip_news + skip_market}
 
 
-def main() -> int:
+def _main() -> int:
     from app.db import SessionLocal
 
     _sep("第一步：跑之前的现状")
@@ -227,6 +227,16 @@ def main() -> int:
     finally:
         db.close()
     return 0
+
+
+def main() -> int:
+    from app.services.news_service import collection_guard
+
+    with collection_guard() as acquired:
+        if not acquired:
+            print("[SKIP] 另一次采集或补采仍在运行，本次未执行")
+            return 2
+        return _main()
 
 
 if __name__ == "__main__":

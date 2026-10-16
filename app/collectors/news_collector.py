@@ -88,6 +88,9 @@ class SourceResult:
     ok: bool                       # **本轮是否完整取到**：无失败页才算 True（见 fetch 内注释）
     failed_pages: int = 0          # 本轮失败的页数（逐页容错，已得的页保留）
     truncated: bool = False        # 是否撞页上限（true 时更旧的新闻本轮没取到）
+    requested_since: datetime | None = None
+    reached_since: bool = False    # 观察到窗口下界之前的记录；空页不作完整覆盖证明
+    stop_reason: str = "unknown"
 
 
 def _ts_to_dt(ts) -> datetime | None:
@@ -231,19 +234,29 @@ class SinaCollector(BaseCollector):
            "?page={page}&page_size=50&zhibo_id=152&tag_id=0")
 
     def fetch(self, client: httpx.Client | None = None,
-              anchor: Anchor | None = None) -> SourceResult:
+              anchor: Anchor | None = None, *, since: datetime | None = None,
+              max_pages: int | None = None, request_interval: float = 0.0,
+              max_seconds: float | None = None) -> SourceResult:
         from app.config import settings
 
-        cutoff = _cutoff(anchor)
-        max_pages = max(1, int(settings.news_max_pages))
+        cutoff = since if since is not None else _cutoff(anchor)
+        max_pages = max(1, int(settings.news_max_pages if max_pages is None else max_pages))
         items: list[NewsItem] = []
         rejected: list[RejectedItem] = []
         seen: set[str] = set()
         failed_pages = 0
         truncated = False
         consecutive_fails = 0
+        reached_since = False
+        stop_reason = "exhausted"
+        deadline = time.monotonic() + max_seconds if max_seconds is not None else None
 
         for page in range(1, max_pages + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                truncated, stop_reason = True, "time_limit"
+                break
+            if request_interval > 0:
+                time.sleep(request_interval)
             try:
                 data = self._get_json(self.API.format(page=page), client=client)
             except Exception as e:  # noqa: BLE001
@@ -255,6 +268,7 @@ class SinaCollector(BaseCollector):
                     f"{describe_exception(e)}"
                 )
                 if consecutive_fails >= MAX_CONSECUTIVE_PAGE_FAILS:
+                    stop_reason = "failed"
                     logger.error(
                         f"[{self.source_name}] 连续 {consecutive_fails} 页失败，"
                         f"判定本源整体不可用，提前停止（已得的 {len(items)} 条保留）"
@@ -295,9 +309,12 @@ class SinaCollector(BaseCollector):
 
             last_dt = _parse_dt(lst[-1].get("create_time"))
             if last_dt and last_dt < cutoff:
+                reached_since = True
+                stop_reason = "reached_since"
                 break
             if page == max_pages:                # guard ④ 跑满上限 → 截断（不抛错）
                 truncated = True
+                stop_reason = "page_limit"
 
         for r in rejected:
             _log_rejected(r)
@@ -309,7 +326,9 @@ class SinaCollector(BaseCollector):
                     f"{f'（失败 {failed_pages} 页）' if failed_pages else ''}"
                     f"{'（⚠️ 触页上限，已截断）' if truncated else ''}")
         return SourceResult(source=self.source_name, items=items, rejected=rejected,
-                            ok=ok, failed_pages=failed_pages, truncated=truncated)
+                            ok=ok, failed_pages=failed_pages, truncated=truncated,
+                            requested_since=cutoff, reached_since=reached_since,
+                            stop_reason=stop_reason)
 
 
 class EastmoneyCollector(BaseCollector):
@@ -317,19 +336,29 @@ class EastmoneyCollector(BaseCollector):
     COLUMN = 102  # 全球财经快讯栏目
 
     def fetch(self, client: httpx.Client | None = None,
-              anchor: Anchor | None = None) -> SourceResult:
+              anchor: Anchor | None = None, *, since: datetime | None = None,
+              max_pages: int | None = None, request_interval: float = 0.0,
+              max_seconds: float | None = None) -> SourceResult:
         from app.config import settings
 
-        cutoff = _cutoff(anchor)
-        max_pages = max(1, int(settings.news_max_pages))
+        cutoff = since if since is not None else _cutoff(anchor)
+        max_pages = max(1, int(settings.news_max_pages if max_pages is None else max_pages))
         items: list[NewsItem] = []
         rejected: list[RejectedItem] = []
         seen: set[str] = set()
         failed_pages = 0
         truncated = False
         sort_end = ""
+        reached_since = False
+        stop_reason = "exhausted"
+        deadline = time.monotonic() + max_seconds if max_seconds is not None else None
 
         for page in range(1, max_pages + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                truncated, stop_reason = True, "time_limit"
+                break
+            if request_interval > 0:
+                time.sleep(request_interval)
             ts = int(time.time() * 1000)
             url = (
                 "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
@@ -344,6 +373,7 @@ class EastmoneyCollector(BaseCollector):
                 # （设计 §9.2 的「继续下一页」只对页面型（新浪 `page=N`）成立，
                 #  2026-09-22 实测发现并写回文档。）
                 failed_pages += 1
+                stop_reason = "failed"
                 logger.warning(
                     f"[{self.source_name}] 第 {page} 页失败："
                     f"{describe_exception(e)}；"
@@ -379,6 +409,8 @@ class EastmoneyCollector(BaseCollector):
 
             new_cursor = d.get("sortEnd") or ""
             if new_cursor == sort_end:            # guard ③ 游标没前进 → 再翻也是同一批
+                truncated = True
+                stop_reason = "cursor_stalled"
                 logger.warning(f"[{self.source_name}] 游标未前进（{sort_end!r}），"
                                f"第 {page} 页后停止翻页")
                 break
@@ -386,9 +418,12 @@ class EastmoneyCollector(BaseCollector):
 
             last_dt = _parse_dt(rows[-1].get("showTime"))
             if last_dt and last_dt < cutoff:
+                reached_since = True
+                stop_reason = "reached_since"
                 break
             if page == max_pages:                 # guard ④ 跑满上限 → 截断（不抛错）
                 truncated = True
+                stop_reason = "page_limit"
 
         for r in rejected:
             _log_rejected(r)
@@ -398,7 +433,9 @@ class EastmoneyCollector(BaseCollector):
                     f"{f'（失败 {failed_pages} 页）' if failed_pages else ''}"
                     f"{'（⚠️ 触页上限，已截断）' if truncated else ''}")
         return SourceResult(source=self.source_name, items=items, rejected=rejected,
-                            ok=ok, failed_pages=failed_pages, truncated=truncated)
+                            ok=ok, failed_pages=failed_pages, truncated=truncated,
+                            requested_since=cutoff, reached_since=reached_since,
+                            stop_reason=stop_reason)
 
 
 class ClsCollector(BaseCollector):
@@ -419,19 +456,29 @@ class ClsCollector(BaseCollector):
         return hashlib.md5(sha1.encode()).hexdigest()
 
     def fetch(self, client: httpx.Client | None = None,
-              anchor: Anchor | None = None) -> SourceResult:
+              anchor: Anchor | None = None, *, since: datetime | None = None,
+              max_pages: int | None = None, request_interval: float = 0.0,
+              max_seconds: float | None = None) -> SourceResult:
         from app.config import settings
 
-        cutoff = _cutoff(anchor)
-        max_pages = max(1, int(settings.news_max_pages))
+        cutoff = since if since is not None else _cutoff(anchor)
+        max_pages = max(1, int(settings.news_max_pages if max_pages is None else max_pages))
         items: list[NewsItem] = []
         rejected: list[RejectedItem] = []
         seen: set[str] = set()
         failed_pages = 0
         truncated = False
         last_time = 0
+        reached_since = False
+        stop_reason = "exhausted"
+        deadline = time.monotonic() + max_seconds if max_seconds is not None else None
 
         for page in range(1, max_pages + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                truncated, stop_reason = True, "time_limit"
+                break
+            if request_interval > 0:
+                time.sleep(request_interval)
             params = {
                 "app": "CailianpressWeb", "os": "web", "sv": "8.7.9",
                 "name": "telegraph", "refresh_type": "1", "rn": "20",
@@ -443,6 +490,7 @@ class ClsCollector(BaseCollector):
             except Exception as e:  # noqa: BLE001
                 # 同东财：游标型分页跳不过失败页（游标未推进），在此停止。
                 failed_pages += 1
+                stop_reason = "failed"
                 logger.warning(
                     f"[{self.source_name}] 第 {page} 页失败："
                     f"{describe_exception(e)}；"
@@ -477,6 +525,8 @@ class ClsCollector(BaseCollector):
 
             new_last = rows[-1].get("ctime") or 0
             if new_last == last_time:             # guard ③ 游标没前进 → 再翻也是同一批
+                truncated = True
+                stop_reason = "cursor_stalled"
                 logger.warning(f"[{self.source_name}] 游标未前进（{last_time}），"
                                f"第 {page} 页后停止翻页")
                 break
@@ -484,9 +534,12 @@ class ClsCollector(BaseCollector):
 
             last_dt = _ts_to_dt(last_time)
             if last_dt and last_dt < cutoff:
+                reached_since = True
+                stop_reason = "reached_since"
                 break
             if page == max_pages:                 # guard ④ 跑满上限 → 截断（不抛错）
                 truncated = True
+                stop_reason = "page_limit"
 
         for r in rejected:
             _log_rejected(r)
@@ -496,7 +549,9 @@ class ClsCollector(BaseCollector):
                     f"{f'（失败 {failed_pages} 页）' if failed_pages else ''}"
                     f"{'（⚠️ 触页上限，已截断）' if truncated else ''}")
         return SourceResult(source=self.source_name, items=items, rejected=rejected,
-                            ok=ok, failed_pages=failed_pages, truncated=truncated)
+                            ok=ok, failed_pages=failed_pages, truncated=truncated,
+                            requested_since=cutoff, reached_since=reached_since,
+                            stop_reason=stop_reason)
 
 
 _COLLECTORS: list[BaseCollector] = [

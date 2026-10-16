@@ -230,6 +230,9 @@ def prepare_node(state: AnalystState) -> dict:
             "last_round_at": None, "seconds_since": None,
             "collecting": None, "overdue": None,
         })
+        from app.services.news_archive import coverage_counts
+        coverage = (coverage_counts(db, since=analyzed_at - timedelta(days=1), until=analyzed_at)
+                    if as_of is None else {"pending_count": None, "open_gap_count": None})
         collecting = ready["collecting"]
         freshness = classify_freshness(today_count, collecting=collecting)
 
@@ -254,6 +257,8 @@ def prepare_node(state: AnalystState) -> dict:
             "newest_news_at": newest.isoformat() if newest else None,
             "analyzed_at": analyzed_at.isoformat(),
             "readiness_scope": "historical_unknown" if as_of is not None else "snapshot",
+            **coverage,
+            "coverage_incomplete": bool(coverage["pending_count"] or coverage["open_gap_count"]),
             # 补跑时"今天"应指截止时点那一天，而不是真正的今天
             "today": (as_of.date() if as_of else date.today()).isoformat(),
             # ---- H2 / H1（2026-09-23 新增）----

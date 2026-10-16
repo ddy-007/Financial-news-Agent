@@ -416,8 +416,8 @@ def _cluster():
     chain, chain_log = _logged(
         np.stack([v(1, 0), v(0.87, 0.4931), v(0.5736, 0.8192)]),
         ["甲文", "乙文", "丙文"])
-    check("三条被并成一簇（链条两头其实不像）",
-          sorted(sorted(c) for c in chain), [[0, 1, 2]])
+    check("链条两端不再因传递闭包自动合并",
+          sorted(sorted(c) for c in chain), [[0], [1, 2]])
     check("且被计成「1 个簇里存在低于灰区下限的一对」",
           f"{DA.GRAY_LOW} 的一对" in chain_log and "链式合并可疑：1 个合并簇" in chain_log,
           True,

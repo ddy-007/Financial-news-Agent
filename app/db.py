@@ -28,7 +28,23 @@ def init_db() -> None:
     from app import models  # noqa: F401  触发模型注册
 
     Base.metadata.create_all(bind=engine)
+    init_news_ingest_schema(engine)
     _migrate()
+
+
+def init_news_ingest_schema(bind) -> None:
+    """仅为新闻恢复增加表和可空字段；CLI 不触发无关的历史报告迁移。"""
+    from sqlalchemy import inspect, text
+    from app.models.collector_state import CollectorState
+    from app.models.news_ingest import CollectionGap, RawNews
+
+    for table in (CollectorState.__table__, RawNews.__table__, CollectionGap.__table__):
+        table.create(bind=bind, checkfirst=True)
+    columns = {c["name"] for c in inspect(bind).get_columns("collector_state")}
+    with bind.begin() as conn:
+        for column in ("fetched_ts", "fetched_at"):
+            if column not in columns:
+                conn.execute(text(f"ALTER TABLE collector_state ADD COLUMN {column} DATETIME"))
 
 
 def _migrate() -> None:

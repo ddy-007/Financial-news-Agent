@@ -292,7 +292,8 @@ def _never_breaks_collection():
 
         got = None
         try:
-            got = NS.collect_and_store_news(None)   # 上面全是 stub，db 不会被真正用到
+            with fresh_db() as db:
+                got = NS.collect_and_store_news(db)
         except Exception as e:  # noqa: BLE001
             print(f"        · 巡检异常穿透到了采集流程：{type(e).__name__}: {e}")
         check("巡检抛错时采集仍返回正常结果", got, 7,

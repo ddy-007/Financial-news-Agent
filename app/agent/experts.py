@@ -479,6 +479,7 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
     info = quant.get("info_level") or {}
     fr = quant.get("data_freshness") or {}
     coverage_uncertain = (fr.get("stale") or fr.get("round_overdue")
+                          or fr.get("coverage_incomplete")
                           or fr.get("collecting")
                           or fr.get("readiness_scope") == "historical_unknown")
     if info.get("low_info") and coverage_uncertain:
@@ -530,6 +531,13 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
             )
     else:
         data_hint = ""
+
+    if fr.get("coverage_incomplete"):
+        data_hint += (
+            f"\n【覆盖缺口提示】本报告取数窗口仍有 {fr.get('pending_count', 0)} 条原文未完成处理、"
+            f"{fr.get('open_gap_count', 0)} 个历史覆盖缺口。最近增量成功不能证明历史完整，"
+            "请在 market_summary 中说明覆盖限制，不得据未收录新闻作事件未发生的否定结论。"
+        )
 
     if fr.get("round_overdue") or fr.get("collecting"):
         state = "采集仍在运行" if fr.get("collecting") else "最近采集未成功或已超过一个采集间隔"

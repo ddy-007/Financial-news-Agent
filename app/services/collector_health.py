@@ -45,10 +45,13 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.collector_state import CollectorState
+from app.models.news_ingest import CollectionGap, RawNews
+from sqlalchemy import func
 
 # 一条源可能同时命中多条判据，按此挑「主状态」（数字越小越严重）
 _SEVERITY = {"fetch_failed": -2, "classification_failed": -1,
-             "never": 0, "stale": 1, "empty": 2, "truncated": 3}
+             "never": 0, "stale": 1, "empty": 2, "truncated": 3,
+             "pending": 4, "gap": 5}
 
 
 @dataclass
@@ -65,6 +68,8 @@ class SourceHealth:
     fetch_status: str = "unknown"
     failure_stage: str | None = None
     data_stale: bool = False
+    pending_count: int = 0
+    open_gap_count: int = 0
 
     @property
     def healthy(self) -> bool:
@@ -88,7 +93,7 @@ def _reason_for(source: str, *, results, classify_failed: int) -> str:
         return "该源本轮**成功但 0 条** —— 通常是源改版或参数失效的前兆"
     if r.truncated:
         return ("该源**上次成功推进的那一轮**被页上限截断 —— 更旧的新闻没取到、"
-                "且不会自动回补。跑 scripts/catchup.py 可补回约 8~10 小时以内")
+                "且不会自动回补。请用 scripts/backfill_news.py 预览定向补采")
     return "该源本轮正常推进了水位线"
 
 
@@ -108,8 +113,12 @@ def evaluate(db: Session, *, results=None, classify_failed: int = 0,
     out: list[SourceHealth] = []
     states = {st.source: st for st in db.query(CollectorState).all()}
     current = {r.source: r for r in results} if results is not None else {}
+    pending = dict(db.query(RawNews.source, func.count(RawNews.id)).filter(
+        RawNews.status != "processed").group_by(RawNews.source).all())
+    gaps = dict(db.query(CollectionGap.source, func.count(CollectionGap.id)).filter(
+        CollectionGap.status != "resolved").group_by(CollectionGap.source).all())
     # 首轮失败也必须可见，即使该源尚未有持久化状态。
-    for source in sorted(states.keys() | current.keys()):
+    for source in sorted(states.keys() | current.keys() | pending.keys() | gaps.keys()):
         st = states.get(source) or CollectorState(source=source, empty_streak=0)
         flags: list[str] = []
         stale_minutes: float | None = None
@@ -124,6 +133,10 @@ def evaluate(db: Session, *, results=None, classify_failed: int = 0,
             flags.append("empty")
         if st.truncated_at is not None:
             flags.append("truncated")
+        if pending.get(source):
+            flags.append("pending")
+        if gaps.get(source):
+            flags.append("gap")
 
         r = current.get(source)
         fetch_status = "unknown"
@@ -133,6 +146,9 @@ def evaluate(db: Session, *, results=None, classify_failed: int = 0,
             fetch_status = ("success" if r.ok else
                             "partial_failure" if r.items else "failed")
             execution_status = fetch_status
+            if r.ok and pending.get(source):
+                execution_status = "partial_failure"
+                failure_stage = "processing"
             if not r.ok:
                 flags.append("fetch_failed")
                 failure_stage = "collection"
@@ -154,10 +170,15 @@ def evaluate(db: Session, *, results=None, classify_failed: int = 0,
             fetch_status=fetch_status,
             failure_stage=failure_stage,
             data_stale=any(f in flags for f in ("never", "stale")),
+            pending_count=pending.get(source, 0),
+            open_gap_count=gaps.get(source, 0),
         )
         if flags:
             h.reason = _reason_for(st.source, results=results,
                                    classify_failed=classify_failed)
+            if h.pending_count or h.open_gap_count:
+                h.reason += (f"；尚有 {h.pending_count} 条原文未处理、"
+                             f"{h.open_gap_count} 个历史覆盖缺口，普通增量成功不会清除缺口")
         out.append(h)
 
     unhealthy = [h for h in out if not h.healthy]

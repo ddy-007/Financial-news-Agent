@@ -24,12 +24,16 @@ class CollectorState(Base):
     source: Mapped[str] = mapped_column(String(50), primary_key=True)
 
     # 上轮**完整成功**采集到的源站发布时间最大值。
-    # 语义是「比它更新的都已经取过了」—— 所以**采集/分类/入库任一环不完整时都不推进**，
-    # 否则会永久跳过中间那段（见设计 §11 的推进规则表）。
+    # 这是处理水位：分类/入库/索引未完成时不推进。抓取改用 fetched_ts，
+    # 前提是所有已得原文已持久化；历史未覆盖段独立记 collection_gap。
     last_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # 边界兜底：同一秒有多条时用 id 区分（当前仅东财的 realSort 用到；未用到则为 None）
     last_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    # 仅表示原文已持久化；与后续分类/索引是否完成分开。迁移不回填旧值。
+    fetched_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # 上次成功时间。P3 监控靠它判断"这个源多久没成功了"
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
