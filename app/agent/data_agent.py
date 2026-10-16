@@ -164,6 +164,51 @@ def _extract_json(text: str):
 
 
 # ================= 步骤①：LLM 相关性分类 =================
+def _parse_classification(response, batch: list[NewsItem]) -> list[dict]:
+    """整批校验成功才接收，避免漏项、重复 ID 或字段异常绕开备用。"""
+    if not isinstance(response.content, str):
+        raise ValueError("LLM 分类输出非文本")
+    data = _extract_json(response.content)
+    if not isinstance(data, list):
+        raise ValueError("LLM 分类输出非数组")
+    results: list[dict] = []
+    covered: set[int] = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            raise ValueError("LLM 分类条目非对象")
+        raw_id = entry.get("id")
+        if (isinstance(raw_id, bool)
+                or not isinstance(raw_id, (int, str))
+                or not str(raw_id).isdigit()):
+            raise ValueError("LLM 分类 ID 非整数")
+        idx = int(raw_id) - 1
+        if not 0 <= idx < len(batch) or idx in covered:
+            raise ValueError("LLM 分类 ID 越界或重复")
+        if not isinstance(entry.get("relevant"), bool):
+            raise ValueError("LLM 分类 relevant 非布尔值")
+        for key in ("category", "market"):
+            value = entry.get(key)
+            if ((entry["relevant"] and not isinstance(value, str))
+                    or (value is not None and not isinstance(value, str))):
+                raise ValueError(f"LLM 分类 {key} 非字符串")
+        themes = entry.get("themes") or []
+        if isinstance(themes, str):
+            themes = [themes]
+        if not isinstance(themes, list) or any(not isinstance(t, str) for t in themes):
+            raise ValueError("LLM 分类 themes 非字符串数组")
+        covered.add(idx)
+        results.append({
+            "item": batch[idx],
+            "relevant": entry["relevant"],
+            "category": _normalize_category(entry.get("category")),
+            "market": _normalize_market(entry.get("market")),
+            "themes": themes,
+        })
+    if len(covered) != len(batch):
+        raise ValueError(f"LLM 分类漏项 {len(batch) - len(covered)}/{len(batch)} 条")
+    return results
+
+
 def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
     """LLM 批量分类。返回 `(成功分类的结果, 失败批次的原始条目)`。
 
@@ -176,7 +221,6 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
     """
     if not items:
         return [], []
-    llm = get_llm(temperature=0.0, part="news")
     # 逐批打印进度：分类整批可能跑十几分钟，不打日志的话外部完全看不到进展
     total_batches = (len(items) + BATCH_SIZE - 1) // BATCH_SIZE
     logger.info(f"[分类] 共 {len(items)} 条，分 {total_batches} 批")
@@ -191,46 +235,13 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
         )
         prompt = CLASSIFY_PROMPT.format(news_list=news_list)
 
-        def _classify(p: str) -> list:
-            d = _extract_json(llm.invoke(p).content)
-            if not isinstance(d, list):
-                raise ValueError("LLM 分类输出非数组")
-            return d
-
         try:
-            data = call_with_retry(_classify, prompt, retry_label="新闻分类",
-                                   retry_times=llm_retry_times(part="news"))
-            # 先攒在 batch_ok 里，成功走完才并入 results ——
-            # 否则「循环中途抛异常」时，已 append 进 results 的条目会在 except 里
-            # 被整批再算一次 failed，同一条既算成功又算失败。
-            batch_ok: list[dict] = []
-            covered: set[int] = set()
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
-                idx = int(entry.get("id", -1)) - 1
-                if 0 <= idx < len(batch) and idx not in covered:
-                    covered.add(idx)
-                    themes = entry.get("themes") or []
-                    if isinstance(themes, str):
-                        themes = [themes]
-                    batch_ok.append({
-                        "item": batch[idx],
-                        "relevant": bool(entry.get("relevant", False)),
-                        "category": _normalize_category(entry.get("category")),
-                        "market": _normalize_market(entry.get("market")),
-                        "themes": [str(t) for t in themes],
-                    })
+            # 每批重取链，上一批主模型失败后的冷却才能在本批生效。
+            llm = get_llm(temperature=0.0, part="news",
+                          output_parser=lambda response: _parse_classification(response, batch))
+            batch_ok = call_with_retry(llm.invoke, prompt, retry_label="新闻分类",
+                                       retry_times=llm_retry_times(part="news"))
             results.extend(batch_ok)
-            # ⚠️ **只堵「整批异常」是不够的**（2026-09-22 巡检发现）：
-            # LLM 完全可能返回一个**合法但条目变少**的列表（漏项、id 越界、id 重复），
-            # 那些没被覆盖到的条目若不在这里交出来，就既不进 results 也不进 failed
-            # → `classify_failed` 仍是 0 → 水位线照常推进 → **永久丢失**。
-            missed = [it for i, it in enumerate(batch) if i not in covered]
-            if missed:
-                failed.extend(missed)
-                logger.warning(f"LLM 分类**漏项** {len(missed)}/{len(batch)} 条"
-                               f"（输出条目不全，非异常）—— 已计入分类失败")
         except Exception as e:  # noqa: BLE001
             # 交出来而不是丢掉 —— 上层要据此拒绝推进水位线（详见函数 docstring）
             failed.extend(batch)
@@ -286,14 +297,10 @@ def classify_news(items: list[NewsItem]) -> tuple[list[dict], list[NewsItem]]:
             # 模型名是判断「这批是否悄悄走了备用」的唯一线索 ——
             # `with_fallbacks` 默认静默切换，只在切走时打一条 WARNING，
             # 而成功的批次原先完全看不出用的是谁。
-            # ⚠️ 「成功 / 漏项」必须按 `covered` 计数，**不能用 `len(batch_ok)`** ——
-            # LLM 返回重复 id 时 `batch_ok` 会照收多条（同一 id 反复追加），
-            # 于是 `len(batch) - len(batch_ok)` 会少报甚至**为负**，还会与同一批
-            # 那条 `len(missed)/len(batch)` 的 warning 自相矛盾。
-            # 实测（巡检复现）：批 2 条、LLM 返回 3 条 `id=1` → 日志「成功 3 / 漏项 -1」。
+            # 解析器保证 ID 唯一且完整；全部模型失败时不接收部分结果。
             logger.info(
                 f"[分类] 第 {batch_idx}/{total_batches} 批："
-                f"成功 {len(covered)} / 漏项 {len(missed)}"
+                f"成功 {len(batch_ok)} / 漏项 0"
                 f" / 模型 {get_llm_model_name(part='news')}"
             )
     return results, failed

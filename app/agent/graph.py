@@ -148,6 +148,7 @@ def prepare_node(state: AnalystState) -> dict:
     """
     raw_as_of = state.get("as_of")
     as_of = datetime.fromisoformat(raw_as_of) if raw_as_of else None
+    analyzed_at = as_of or datetime.now()
     db = SessionLocal()
     try:
         since = (as_of or datetime.now()) - timedelta(days=1)
@@ -202,7 +203,7 @@ def prepare_node(state: AnalystState) -> dict:
             "综合": (comprehensive, st4),
         }
         used = [r for rows, _ in groups.values() for r in rows]
-        newest = max((n.publish_time for n in used if n.publish_time), default=None)
+        newest = max((n.publish_time for n in used + all_news if n.publish_time), default=None)
 
         # ---- H2（2026-09-23）：当日条数判据 ----
         # 原判据只看「近 1 天有没有新闻」→ 当天 0 条也判「新鲜」。
@@ -224,7 +225,11 @@ def prepare_node(state: AnalystState) -> dict:
         # 日报据此写出「今日无重大消息」）。这里如实记录，让下游能区分
         # 「今天真没消息」与「今天的新闻还没落地」。
         from app.services.news_service import news_readiness
-        ready = news_readiness(db)
+        # 状态表只存最近一次成功，不能重建历史分析时点的采集轮状态。
+        ready = (news_readiness(db, now=analyzed_at) if as_of is None else {
+            "last_round_at": None, "seconds_since": None,
+            "collecting": None, "overdue": None,
+        })
         collecting = ready["collecting"]
         freshness = classify_freshness(today_count, collecting=collecting)
 
@@ -246,6 +251,9 @@ def prepare_node(state: AnalystState) -> dict:
                 max(stale_dates).date().isoformat() if stale_dates else None
             ),
             "newest_news_date": newest.date().isoformat() if newest else None,
+            "newest_news_at": newest.isoformat() if newest else None,
+            "analyzed_at": analyzed_at.isoformat(),
+            "readiness_scope": "historical_unknown" if as_of is not None else "snapshot",
             # 补跑时"今天"应指截止时点那一天，而不是真正的今天
             "today": (as_of.date() if as_of else date.today()).isoformat(),
             # ---- H2 / H1（2026-09-23 新增）----

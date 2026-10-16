@@ -19,6 +19,7 @@
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -333,7 +334,7 @@ def _classify_fallback():
                       publish_time=datetime(2026, 9, 22, 12, i)) for i in range(3)]
     orig_llm, orig_retry = DA.get_llm, DA.call_with_retry
     try:
-        DA.get_llm = lambda **kw: None
+        DA.get_llm = lambda **kw: SimpleNamespace(invoke=lambda prompt: None)
         DA.call_with_retry = lambda *a, **kw: (_ for _ in ()).throw(
             ValueError("LLM 分类输出非数组"))
         ok_res, failed = DA.classify_news(batch)
@@ -352,7 +353,7 @@ def _classify_fallback():
     orig_retry = DA.call_with_retry
     calls: list[int] = []
     try:
-        DA.get_llm = lambda **kw: None
+        DA.get_llm = lambda **kw: SimpleNamespace(invoke=lambda prompt: None)
 
         def _fail(*a, **kw):
             calls.append(1)

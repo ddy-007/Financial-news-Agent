@@ -108,6 +108,17 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
 
     # 数据时效：基于陈旧数据时必须明示，不能冒充"今日研判"
     fr = c.get("data_freshness") or {}
+    if fr.get("round_overdue") or fr.get("collecting"):
+        round_state = "采集仍在运行" if fr.get("collecting") else "最近采集未成功或已过期"
+        st.warning(
+            f"⚠️ **采集覆盖提醒**：按本报告分析时点（{fr.get('analyzed_at') or generated_at}），"
+            f"{round_state}，**本窗口新闻尚未完整落地**。"
+            f"上次成功：{fr.get('last_round_at') or '从未成功或未记录'}；"
+            f"本报告新闻截至：{fr.get('newest_news_at') or fr.get('newest_news_date') or '未知'}。"
+            "请勿将未收录的新闻理解为事件未发生。"
+        )
+    elif fr.get("readiness_scope") == "historical_unknown":
+        st.info("历史补录报告：分析时点的采集执行状态未留存，覆盖完整性未知。")
     if data.get("data_stale") or fr.get("stale"):
         cats = "、".join(fr.get("stale_categories") or [])
         if cats:
@@ -145,7 +156,11 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
     # 信息量标记：当天市场平静时如实说明，而不是硬凑内容
     if data.get("low_info"):
         info = c.get("info_level") or {}
-        st.info(f"💤 **今日无重大消息**　（{info.get('reason', '三个信号均未触发')}）")
+        if (data.get("data_stale") or fr.get("stale") or fr.get("round_overdue")
+                or fr.get("collecting") or fr.get("readiness_scope") == "historical_unknown"):
+            st.info("可用素材较少，采集覆盖尚不完整或未知，不能据此判断是否有重大消息。")
+        else:
+            st.info(f"💤 **今日无重大消息**　（{info.get('reason', '三个信号均未触发')}）")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("市场情绪", data.get("sentiment", "中性"))
@@ -236,7 +251,17 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
             if freshness:
                 st.write(
                     f"最新新闻日期：{freshness.get('newest_news_date') or '未知'}　"
-                    f"数据状态：{freshness.get('freshness') or ('陈旧' if freshness.get('stale') else '正常')}"
+                    f"当日数据覆盖：{freshness.get('freshness') or ('陈旧' if freshness.get('stale') else '未知')}"
+                )
+                round_status = (
+                    "采集中，本窗口新闻尚未完整落地" if freshness.get("collecting") else
+                    "最近采集未成功或已过期" if freshness.get("round_overdue") else
+                    "正常完成" if freshness.get("round_overdue") is False else "未知"
+                )
+                st.write(f"分析时点的采集轮状态：{round_status}")
+                st.write(
+                    f"上次成功：{freshness.get('last_round_at') or '未记录'}　"
+                    f"本报告新闻截至：{freshness.get('newest_news_at') or freshness.get('newest_news_date') or '未知'}"
                 )
 
     st.markdown("#### 大盘综述")

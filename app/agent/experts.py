@@ -477,7 +477,16 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
 
     # 信息量偏低时，明确提示"低调处理"——既不硬凑字数，也不假装有大行情
     info = quant.get("info_level") or {}
-    if info.get("low_info"):
+    fr = quant.get("data_freshness") or {}
+    coverage_uncertain = (fr.get("stale") or fr.get("round_overdue")
+                          or fr.get("collecting")
+                          or fr.get("readiness_scope") == "historical_unknown")
+    if info.get("low_info") and coverage_uncertain:
+        info_hint = (
+            "\n【今日信息量提示】可用素材较少且覆盖不完整，不能据此断言「今日无重大消息」。"
+            "请说明数据限制，不要为凑字数而堆砌内容；风险提示仍须完整保留。"
+        )
+    elif info.get("low_info"):
         info_hint = (
             f"\n【今日信息量提示】当日三个信号均未触发（{info.get('reason', '')}），"
             "市场信息量较低。请在 market_summary 中如实说明「今日无重大消息」，"
@@ -498,7 +507,6 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
         fail_hint = ""
 
     # 数据陈旧：不得把旧闻表述为"今日"消息
-    fr = quant.get("data_freshness") or {}
     if fr.get("stale"):
         cats = "、".join(fr.get("stale_categories") or [])
         if cats:
@@ -522,6 +530,25 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
             )
     else:
         data_hint = ""
+
+    if fr.get("round_overdue") or fr.get("collecting"):
+        state = "采集仍在运行" if fr.get("collecting") else "最近采集未成功或已超过一个采集间隔"
+        data_hint += (
+            f"\n【采集覆盖提示】截至分析时点 {fr.get('analyzed_at') or fr.get('today') or '未知'}，"
+            f"{state}，本窗口新闻尚未完整落地。"
+            f"上次成功：{fr.get('last_round_at') or '从未成功或未记录'}；"
+            f"本报告新闻截至：{fr.get('newest_news_at') or fr.get('newest_news_date') or '未知'}。"
+            "请在 market_summary 中明确说明未覆盖窗口；"
+            "不能把未收录的新闻当作事件未发生，也不要据此写「今日无重大消息」"
+            "或「未出现某项政策/事件」等否定性结论。"
+        )
+    elif fr.get("readiness_scope") == "historical_unknown":
+        data_hint += (
+            f"\n【历史采集覆盖提示】本次按 {fr.get('analyzed_at') or fr.get('today')} 分析，"
+            "该时点的采集执行状态未留存，不能据当前采集状态推断当时覆盖完整。"
+            f"本报告新闻截至：{fr.get('newest_news_at') or fr.get('newest_news_date') or '未知'}。"
+            "请说明覆盖限制，不要据缺失新闻作否定性结论。"
+        )
 
     prompt = CHIEF_PROMPT.format(
         market_snapshot=ctx.get("market_snapshot", "无"),

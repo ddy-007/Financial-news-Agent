@@ -5,8 +5,10 @@
 行为与拆分前完全一致**。
 """
 from datetime import datetime, timedelta
+from typing import Callable
 
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from loguru import logger
 from openai import (
@@ -271,7 +273,8 @@ def llm_retry_times(*, part: str) -> int:
     return 1 if fallback_enabled(part) else 3
 
 
-def get_llm(temperature: float = 0.0, *, part: str):
+def get_llm(temperature: float = 0.0, *, part: str,
+            output_parser: Callable | None = None):
     """取某个分组的 LLM 客户端。
 
     `part` **必填**——故意不给默认值。给了默认值（如 "expert"）的话，
@@ -279,7 +282,10 @@ def get_llm(temperature: float = 0.0, *, part: str):
     （比如新闻采集悄悄走了研判的模型），只有看账单才发现。
     现在漏写当场 `TypeError`，在写代码时就暴露。
 
-    **未配备用模型时返回 `ChatOpenAI`**（类型与行为同改动前）；
+    `output_parser` 非空时，每个模型分别执行「调用 + 解析校验」，
+    解析异常也在备用切换边界内；返回值为解析结果。其他调用方保持消息返回值。
+
+    未传解析器且未配备用模型时返回 `ChatOpenAI`（类型与行为同改动前）；
     配了备用才返回 `RunnableWithFallbacks`，主模型在
     `_FALLBACK_EXCEPTIONS` 命中的错误上失败时，**按配置顺序逐个尝试备用**
     （顺序由 `effective_fallback_models` 定义，剔除规则也只写在那里），直到有一个成功。
@@ -292,11 +298,14 @@ def get_llm(temperature: float = 0.0, *, part: str):
     """
     api_key, base_url, model = resolve(part)
 
+    def parsed(client):
+        return client | RunnableLambda(output_parser) if output_parser else client
+
     # 备用的顺序即尝试顺序（见 effective_fallback_models）；
     # 与主模型三项全同的备用已在里面剔除，全被剔除就退回"不启用"
-    fallbacks = _build_fallbacks(temperature, part)
+    fallbacks = [parsed(client) for client in _build_fallbacks(temperature, part)]
     if not fallbacks:
-        return _make_client(api_key, base_url, model, temperature, part)
+        return parsed(_make_client(api_key, base_url, model, temperature, part))
 
     cooling = _primary_cooling(part)
     if cooling is not None:
@@ -318,7 +327,7 @@ def get_llm(temperature: float = 0.0, *, part: str):
             rest, exceptions_to_handle=_FALLBACK_EXCEPTIONS
         ).with_config(callbacks=[_ModelRecorder(part, model)])
 
-    primary = _make_client(api_key, base_url, model, temperature, part)
+    primary = parsed(_make_client(api_key, base_url, model, temperature, part))
     return primary.with_fallbacks(
         fallbacks, exceptions_to_handle=_FALLBACK_EXCEPTIONS
     ).with_config(callbacks=[_ModelRecorder(part, model)])

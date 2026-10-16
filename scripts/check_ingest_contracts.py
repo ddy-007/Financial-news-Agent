@@ -173,6 +173,14 @@ class FakeUpsertStore:
 def patched(**kw):
     old = {k: getattr(DA, k) for k in kw}
     for k, v in kw.items():
+        if k == "get_llm":
+            def fake_get_llm(*args, output_parser=None, _factory=v, **kwargs):
+                from langchain_core.runnables import RunnableLambda
+
+                client = _factory(*args, **kwargs)
+                return (RunnableLambda(client.invoke) | RunnableLambda(output_parser)
+                        if output_parser else client)
+            v = fake_get_llm
         setattr(DA, k, v)
     try:
         yield
@@ -908,7 +916,7 @@ def _log_contracts():
 
     # ---- ④ 重复 id 不能让「漏项」变成负数 ----
     class _DupLLM:
-        """故意返回重复 id —— `batch_ok` 会照收多条，`covered` 才是去重集合。"""
+        """故意返回重复 ID，整批应拒收。"""
 
         def invoke(self, prompt):
             one = {"id": 1, "relevant": True, "category": "综合",
@@ -918,16 +926,14 @@ def _log_contracts():
     sink4 = _Sink()
     hid = logger.add(sink4.write, level="INFO", format="{message}")
     try:
-        with patched(get_llm=lambda **k: _DupLLM()):
+        with patched(get_llm=lambda **k: _DupLLM(), llm_retry_times=lambda **k: 1):
             duplicate_results, duplicate_failed = DA.classify_news([item("T0"), item("T1")])
     finally:
         logger.remove(hid)
-    check("LLM 返回重复 id → 「漏项」不为负，且与同批 warning 一致",
-          "漏项 1" in sink4.text and "漏项 -1" not in sink4.text, True,
-          "按 len(batch_ok) 算会得「成功 3 / 漏项 -1」（批只有 2 条）—— "
-          "巡检已复现；也与那条 len(missed)/len(batch) 的 warning 自相矛盾")
-    check("LLM 重复 ID 只接收一次，漏项仍交回失败列表",
-          (len(duplicate_results), len(duplicate_failed)), (1, 1))
+    check("LLM 重复 ID → 明确报校验失败，不产生负漏项",
+          "ID 越界或重复" in sink4.text and "漏项 -1" not in sink4.text, True)
+    check("全部输出不合格 → 整批交回失败列表，不接收部分结果",
+          (len(duplicate_results), len(duplicate_failed)), (0, 2))
 
 
 def _result_shape():
