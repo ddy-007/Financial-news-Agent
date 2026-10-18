@@ -10,8 +10,9 @@ from datetime import date, datetime, time, timedelta
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from app.agent.experts import extract_json
-from app.agent.llm import get_llm, get_llm_model_name
+from app.agent.experts import _require_dict
+from app.agent.llm import get_llm, get_llm_model_name, llm_retry_times, with_output_parser
+from app.retry import call_with_retry
 from app.config import settings
 from app.models.market import MarketData
 from app.models.report import MarketReport
@@ -204,7 +205,16 @@ def generate_weekly_report(db: Session,
         risks=_dedup_merge(parsed, "risks"),
     )
     try:
-        data = extract_json(llm.invoke(prompt).content)
+        def parse(response):
+            data = _require_dict(response.content, "周报")
+            for key in ("risks", "key_drivers", "sector_opportunities"):
+                if data.get(key) is not None and not isinstance(data[key], list):
+                    raise ValueError(f"周报 {key} 必须为数组")
+            return data
+
+        parsed_llm = with_output_parser(llm, parse)
+        data = call_with_retry(parsed_llm.invoke, prompt, retry_label="周报",
+                               retry_times=llm_retry_times(part="weekly"))
     except Exception as e:  # noqa: BLE001
         logger.warning(f"周报 LLM 生成失败: {e}")
         data = None

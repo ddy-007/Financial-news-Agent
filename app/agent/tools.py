@@ -1,5 +1,6 @@
 """Agent 工具集：RAG 检索 + 行情查询 + 新闻浏览 + 历史报告 + 联网搜索 + 板块排行。"""
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
+import re
 
 import httpx
 from langchain_core.tools import tool
@@ -13,13 +14,56 @@ from app.models.report import MarketReport
 from app.rag import get_retriever
 
 
+def _search_window(query: str, start: str = "", end: str = "", *, now=None):
+    """显式日期优先；今日/昨日可直接约束，其他默认近 7 天。"""
+    now = now or datetime.now()
+    if start or end:
+        def parse(value, *, upper=False):
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is not None:
+                raise ValueError("请使用北京时间，无需时区后缀")
+            if len(value) == 10:
+                dt = datetime.combine(dt.date(), time.max if upper else time.min)
+            return dt
+        since = parse(start) if start else None
+        cutoff = min(parse(end, upper=True), now) if end else now
+    else:
+        cutoff = now
+        day = datetime.combine(now.date(), time.min)
+        if (any(word in query for word in ("昨天", "昨日"))
+                and any(word in query for word in ("今天", "今日"))):
+            since = day - timedelta(days=1)
+        elif any(word in query for word in ("昨天", "昨日")):
+            since, cutoff = day - timedelta(days=1), day - timedelta(microseconds=1)
+        elif any(word in query for word in ("今天", "今日")):
+            since = day
+        else:
+            dates = re.findall(r"\d{4}-\d{2}-\d{2}", query)
+            if dates:
+                since = datetime.combine(datetime.fromisoformat(dates[0]).date(), time.min)
+                cutoff = min(datetime.combine(datetime.fromisoformat(dates[-1]).date(), time.max), now)
+            else:
+                since = now - timedelta(days=7)
+    if since is not None and since > cutoff:
+        raise ValueError("起始时间不得晚于截止时间")
+    return since, cutoff
+
+
 @tool
-def search_news(query: str) -> str:
-    """语义检索相关金融新闻。输入自然语言查询（如"今天降准相关消息"），返回相关新闻的来源、时间与内容。"""
-    hits = get_retriever().hybrid_search(query, top_k=5)
+def search_news(query: str, start: str = "", end: str = "") -> str:
+    """语义检索金融新闻并返回来源、时间、正文。默认近7天；今天/昨天及YYYY-MM-DD按日期过滤。
+
+    查询历史须提供 start/end（YYYY-MM-DD 或本地 ISO 时间）；可仅给 end 查询此前历史。
+    """
+    try:
+        since, cutoff = _search_window(query, start, end)
+    except ValueError as exc:
+        return f"检索日期无效：{exc}"
+    hits = get_retriever().hybrid_search(query, top_k=5, since=since, until=cutoff)
+    window = f"检索范围：{since.isoformat() if since else '历史记录'} 至 {cutoff.isoformat()}"
     if not hits:
-        return "未检索到相关新闻。"
-    lines = []
+        return window + "\n该时间范围内未检索到相关新闻。"
+    lines = [window]
     for h in hits:
         meta = h.metadata
         lines.append(
@@ -83,13 +127,12 @@ def get_recent_news(keyword: str = "", category: str = "", limit: int = 10) -> s
     """按关键词或分类查询最近新闻。category 取 宏观/政策/行业/公司/国际/资金 之一（可空）。"""
     db = SessionLocal()
     try:
-        q = (db.query(News).order_by(News.publish_time.desc())
-             .limit(_clamp_limit(limit)))
+        q = db.query(News)
         if keyword:
             q = q.filter(News.title.contains(keyword))
         if category:
             q = q.filter(News.category == category)
-        rows = q.all()
+        rows = q.order_by(News.publish_time.desc()).limit(_clamp_limit(limit)).all()
         lines = [
             f"- [{r.source}][{r.category}] {r.title}（{r.publish_time}）" for r in rows
         ]

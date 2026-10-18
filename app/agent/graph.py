@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import math
 import operator
 from datetime import date, datetime, time, timedelta
 from typing import Annotated, TypedDict
@@ -28,7 +29,7 @@ from app.agent.experts import (
     run_technical_expert,
 )
 from app.agent.indicators import compute_indicators, format_indicators
-from app.agent.llm import get_llm, get_llm_model_name
+from app.agent.llm import get_llm, get_llm_model_name, with_output_parser
 from app.agent.prompts import REPORT_PROMPT_TEMPLATE
 from app.agent.schemas import ExpertOpinion, RiskOpinion
 from app.config import settings
@@ -36,9 +37,10 @@ from app.db import SessionLocal
 from app.models.market import MarketData
 from app.models.news import News
 from app.models.report import MarketReport
+from app.services.news_selection import distinct_source_count, select_news
 
-NEWS_PER_CATEGORY = 8   # 每位专家读取的新闻条数
-ALL_NEWS_LIMIT = 40     # 给风险官的全部新闻条数
+NEWS_PER_CATEGORY = settings.news_per_category
+ALL_NEWS_LIMIT = settings.news_all_limit
 CONF_LADDER = ["low", "medium", "high"]
 
 # 专家权重（风险官不参与方向加权）
@@ -70,7 +72,7 @@ class AnalystState(TypedDict, total=False):
 def _fmt_news(rows) -> str:
     if not rows:
         return "无"
-    return "\n".join(f"- [{r.source}] {r.title}（{r.source_count}源）" for r in rows)
+    return "\n".join(f"- [{r.source}] {r.title}（{distinct_source_count(r)}源）" for r in rows)
 
 
 def _fetch_news(db: Session, cats: list[str], limit: int,
@@ -84,13 +86,16 @@ def _fetch_news(db: Session, cats: list[str], limit: int,
     `until` 不为空时只取该时点**及之前**的新闻（补跑用）。
     **回退分支同样受 `until` 约束**——否则补跑时会捞到"未来"的新闻。
     """
+    cutoff = until or datetime.now()
+
     def _query(with_since: bool):
         q = db.query(News).filter(News.category.in_(cats))
         if with_since:
             q = q.filter(News.publish_time >= since)
-        if until is not None:
-            q = q.filter(News.publish_time <= until)
-        return q.order_by(News.publish_time.desc()).limit(limit).all()
+        q = q.filter(News.publish_time <= cutoff)
+        if with_since:
+            return select_news(q.all(), limit, since, cutoff)
+        return q.order_by(News.publish_time.desc(), News.id).limit(limit).all()
 
     rows = _query(with_since=True)
     if rows:
@@ -151,21 +156,19 @@ def prepare_node(state: AnalystState) -> dict:
     analyzed_at = as_of or datetime.now()
     db = SessionLocal()
     try:
-        since = (as_of or datetime.now()) - timedelta(days=1)
-        macro, st1 = _fetch_news(db, ["宏观", "政策"], NEWS_PER_CATEGORY, since, as_of)
-        industry, st2 = _fetch_news(db, ["行业", "公司"], NEWS_PER_CATEGORY, since, as_of)
-        capital, st3 = _fetch_news(db, ["资金", "市场"], NEWS_PER_CATEGORY, since, as_of)
-        comprehensive, st4 = _fetch_news(db, ["综合"], 10, since, as_of)
+        since = analyzed_at - timedelta(days=1)
+        macro, st1 = _fetch_news(db, ["宏观", "政策"], NEWS_PER_CATEGORY, since, analyzed_at)
+        industry, st2 = _fetch_news(db, ["行业", "公司"], NEWS_PER_CATEGORY, since, analyzed_at)
+        capital, st3 = _fetch_news(db, ["资金", "市场"], NEWS_PER_CATEGORY, since, analyzed_at)
+        comprehensive, st4 = _fetch_news(db, ["综合"], 10, since, analyzed_at)
 
         q = db.query(News).filter(News.publish_time >= since)
-        if as_of is not None:
-            q = q.filter(News.publish_time <= as_of)
-        all_news = q.order_by(News.publish_time.desc()).limit(ALL_NEWS_LIMIT).all()
+        q = q.filter(News.publish_time <= analyzed_at)
+        all_news = select_news(q.all(), ALL_NEWS_LIMIT, since, analyzed_at)
         if not all_news:
             # 回退分支同样要受 as_of 约束，否则补跑会捞到"未来"的新闻
             q2 = db.query(News)
-            if as_of is not None:
-                q2 = q2.filter(News.publish_time <= as_of)
+            q2 = q2.filter(News.publish_time <= analyzed_at)
             all_news = (
                 q2.order_by(News.publish_time.desc()).limit(ALL_NEWS_LIMIT).all()
             )
@@ -217,8 +220,7 @@ def prepare_node(state: AnalystState) -> dict:
             News.publish_time >= datetime.combine(_today, time.min),
             News.publish_time <= datetime.combine(_today, time.max),
         )
-        if as_of is not None:
-            _q_today = _q_today.filter(News.publish_time <= as_of)
+        _q_today = _q_today.filter(News.publish_time <= analyzed_at)
         today_count = _q_today.count()
         # ---- H1（2026-09-23）：采集轮是否还在跑 ----
         # 两者时间相近时，本轮日报**拿不到这一轮的新闻**（09-23 实测缺口 6 分 9 秒，
@@ -497,21 +499,29 @@ def _fallback_report(db: Session, as_of: datetime | None = None) -> dict:
     """
     logger.warning("触发降级：使用单次生成模式")
     a_share, _ = _market_snapshot(db, as_of)
-    from app.agent.experts import extract_json
+    from app.agent.experts import _require_dict
 
-    q = db.query(News)
-    if as_of is not None:
-        q = q.filter(News.publish_time <= as_of)
+    cutoff = as_of or datetime.now()
+    q = db.query(News).filter(News.publish_time <= cutoff)
     news_rows = q.order_by(News.publish_time.desc()).limit(20).all()
     news_text = _fmt_news(news_rows)
     llm = get_llm(temperature=0.2, part="expert")
-    resp = llm.invoke(REPORT_PROMPT_TEMPLATE.format(
-        date=(as_of.date() if as_of else datetime.now().date()),
+
+    def parse(response):
+        data = _require_dict(response.content, "降级报告")
+        try:
+            data["score"] = float(data.get("score", 0.0) or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("降级报告 score 非数值") from exc
+        if not math.isfinite(data["score"]):
+            raise ValueError("降级报告 score 非有限数值")
+        return data
+
+    parsed = with_output_parser(llm, parse)
+    data = parsed.invoke(REPORT_PROMPT_TEMPLATE.format(
+        date=cutoff.date(),
         market_data=a_share, news_context=news_text,
     ))
-    data = extract_json(resp.content) or {}
-    if not isinstance(data, dict):
-        data = {}
     return {
         "title": str(data.get("title", "")).strip(),
         "market_summary": str(data.get("market_summary", "")),

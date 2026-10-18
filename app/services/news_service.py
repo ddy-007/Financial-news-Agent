@@ -128,12 +128,14 @@ def save_states(db: Session, results: list[SourceResult],
 
 
 def _item_to_news(item: NewsItem) -> News:
+    if item.publish_time is None:
+        logger.warning("[入库] 新闻发布时间未知，保留空值，不以当前时间替代")
     return News(
         title=item.title,
         content=item.content or "",
         source=item.source,
         url=item.url or None,  # 空字符串转 None，避免 UNIQUE 冲突
-        publish_time=item.publish_time or datetime.now(),
+        publish_time=item.publish_time,
         category=item.category,
     )
 

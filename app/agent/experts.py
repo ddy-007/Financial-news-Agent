@@ -7,33 +7,14 @@
 """
 from __future__ import annotations
 
-import json
-import re
-
 from loguru import logger
 
 from app.agent.schemas import ExpertOpinion, RiskOpinion
+from app.agent.json_output import extract_json
+from app.agent.llm import with_output_parser
 from app.config import settings
 
 # ================= 公共工具 =================
-def extract_json(text: str):
-    """从 LLM 输出中容错提取 JSON（数组或对象）。"""
-    text = (text or "").strip()
-    text = re.sub(r"```(?:json)?", "", text).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    for pat in (r"\{.*\}", r"\[.*\]"):
-        m = re.search(pat, text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                continue
-    return None
-
-
 def _as_list(v) -> list[str]:
     if v is None:
         return []
@@ -107,7 +88,7 @@ def _to_opinion(name: str, data: dict) -> ExpertOpinion:
 
 def _require_dict(text: str, who: str) -> dict:
     """解析 LLM 输出并要求为 dict，否则抛错（供重试）。"""
-    data = extract_json(text)
+    data = extract_json(text, expected_type=dict)
     if not isinstance(data, dict):
         raise ValueError(f"{who}输出无法解析为 JSON")
     return data
@@ -288,7 +269,7 @@ RISK_PROMPT = """你是一位专职风险官。{intensity_instruction}
 
 你的价值在于找出其他人忽略的风险，而**不是附和**。
 
-【全部今日新闻】
+【本次选取的新闻摘要】
 {all_news}
 
 【其他分析师的结论】
@@ -343,14 +324,12 @@ def _invoke_expert(llm, name: str, prompt: str, *, part: str) -> ExpertOpinion:
     from app.agent.llm import llm_retry_times
     from app.retry import call_with_retry
 
-    def _attempt() -> ExpertOpinion:
-        resp = llm.invoke(prompt)
-        data = extract_json(resp.content)
-        if not isinstance(data, dict):
-            raise ValueError(f"{name}分析师输出无法解析为 JSON")
+    def parse(resp) -> ExpertOpinion:
+        data = _require_dict(resp.content, f"{name}分析师")
         return _to_opinion(name, data)
 
-    op = call_with_retry(_attempt, retry_label=f"{name}分析师",
+    parsed = with_output_parser(llm, parse)
+    op = call_with_retry(parsed.invoke, prompt, retry_label=f"{name}分析师",
                          retry_times=llm_retry_times(part=part))
     logger.info(f"[{name}] {op.stance} score={op.score:.2f} conf={op.confidence}")
     return op
@@ -404,14 +383,12 @@ def run_risk_officer(llm, ctx: dict, *, part: str) -> RiskOpinion:
     from app.agent.llm import llm_retry_times
     from app.retry import call_with_retry
 
-    def _attempt() -> RiskOpinion:
-        resp = llm.invoke(prompt)
-        data = extract_json(resp.content)
-        if not isinstance(data, dict):
-            raise ValueError("风险官输出无法解析为 JSON")
+    def parse(resp) -> RiskOpinion:
+        data = _require_dict(resp.content, "风险官")
         return _to_risk_opinion(data)
 
-    risk = call_with_retry(_attempt, retry_label="风险官",
+    parsed = with_output_parser(llm, parse)
+    risk = call_with_retry(parsed.invoke, prompt, retry_label="风险官",
                            retry_times=llm_retry_times(part=part))
     logger.info(f"[风险官] 风险等级={risk.risk_level} 风险点={len(risk.risks)}")
     return risk
@@ -574,8 +551,9 @@ def run_chief(llm, ctx: dict, opinions: list[ExpertOpinion],
     from app.agent.llm import llm_retry_times
     from app.retry import call_with_retry
 
+    parsed = with_output_parser(llm, lambda resp: _require_dict(resp.content, "首席策略师"))
     data = call_with_retry(
-        lambda: _require_dict(llm.invoke(prompt).content, "首席策略师"),
+        parsed.invoke, prompt,
         retry_label="首席策略师",
         retry_times=llm_retry_times(part=part),
     )

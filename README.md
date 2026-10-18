@@ -188,6 +188,21 @@ CLI 更新共享的持久化向量索引并重建本进程 BM25。常驻后端�
 .venv/Scripts/python.exe -B scripts/check_news_recovery_contracts.py
 ```
 
+## 日报选取与问答时间范围
+
+日报从分析时点前 24 小时的完整候选池选取新闻，默认按四段时间配额及重要性排序，
+每类最多 20 条、风险官最多 60 条；综合类最多 10 条。来源数量重新按名称去重，仅用于弱排序，
+不直接改变综合评分，也不代表独立信源印证。可通过 `.env.example` 中的 `NEWS_PER_CATEGORY`、
+`NEWS_ALL_LIMIT`、`NEWS_SELECTION_SEGMENTS`、`NEWS_RECENCY_GRAVITY`、`NEWS_SOURCE_WEIGHT` 配置。
+
+问答语义检索默认近 7 天；“今天”“昨天”及 `YYYY-MM-DD` 查询限定相应日期。
+历史问题可由工具提供 start/end，显式日期优先。向量和关键词两路都先限制到相同数据库时间窗，
+避免旧闻挤占近期候选；较大的历史范围会增加临时 BM25 的构建开销。日期未知的新闻保留空值，
+不会冒充今日消息。专家、风险官、首席与周报输出格式错误也会获得备用模型机会；多个不同
+JSON 候选会明确失败，不由程序猜选。前端主风险清单完整保留，风险官抽屉避免重复展示。
+
+离线回归：`.venv/Scripts/python.exe -B scripts/check_document_bugfix_contracts.py`。
+
 ## 免责声明
 
 本项目仅供学习与研究，输出不构成投资建议。股市有风险，投资需谨慎。

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import Runnable, RunnableBinding, RunnableLambda, RunnableWithFallbacks
 from langchain_openai import ChatOpenAI
 from loguru import logger
 from openai import (
@@ -271,6 +271,20 @@ def llm_retry_times(*, part: str) -> int:
     日报有约 20 次 LLM 调用，N 大了最坏耗时会成倍放大。
     """
     return 1 if fallback_enabled(part) else 3
+
+
+def with_output_parser(llm, parser: Callable):
+    """把注入客户端的解析步骤推入每级备用，保留绑定配置、回调和异常策略。"""
+    if isinstance(llm, RunnableBinding):
+        return llm.model_copy(update={"bound": with_output_parser(llm.bound, parser)})
+    if isinstance(llm, RunnableWithFallbacks):
+        return llm.model_copy(update={
+            "runnable": with_output_parser(llm.runnable, parser),
+            "fallbacks": [with_output_parser(fallback, parser) for fallback in llm.fallbacks],
+        })
+    # 简单 invoke 替身也能保持专家函数原有的客户端注入契约。
+    runnable = llm if isinstance(llm, Runnable) else RunnableLambda(llm.invoke)
+    return runnable | RunnableLambda(parser)
 
 
 def get_llm(temperature: float = 0.0, *, part: str,

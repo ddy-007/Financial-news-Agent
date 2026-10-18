@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from loguru import logger
 
@@ -76,9 +77,21 @@ class HybridRetriever:
         logger.info(f"BM25 索引已重建，共 {len(chunks)} 条")
 
     # ---- dense 召回 ----
-    def _dense_search(self, query: str, top_k: int) -> list[Hit]:
+    def _dense_search(self, query: str, top_k: int, *, ids: list[str] | None = None) -> list[Hit]:
+        if ids == []:
+            return []
+        collection = get_collection()
+        if ids is not None:
+            # Chroma.query(ids=...) 遇到库内不存在的任一 ID 会报错。
+            # SQL 可见但尚未索引的记录仍可走本次窗口的 BM25。
+            ids = collection.get(ids=ids, include=[]).get("ids") or []
+            if not ids:
+                return []
         emb = embed_query(query)
-        res = get_collection().query(query_embeddings=[emb], n_results=top_k)
+        kwargs = {"ids": ids} if ids is not None else {}
+        res = collection.query(query_embeddings=[emb],
+                               n_results=min(top_k, len(ids)) if ids is not None else top_k,
+                               **kwargs)
         ids = (res.get("ids") or [[]])[0]
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
@@ -132,9 +145,46 @@ class HybridRetriever:
         return [doc_map[cid] for cid, _ in ranked]
 
     # ---- 对外主入口 ----
-    def hybrid_search(self, query: str, top_k: int = 5, candidate_k: int = 20) -> list[Hit]:
-        dense = self._dense_search(query, candidate_k)
-        sparse = self._sparse_search(query, candidate_k)
+    def hybrid_search(self, query: str, top_k: int = 5, candidate_k: int = 20, *,
+                      since: datetime | None = None, until: datetime | None = None) -> list[Hit]:
+        if top_k < 1 or candidate_k < 1:
+            return []
+        if since is None and until is None:
+            # 保留底层无窗口调用的旧行为；问答工具会明确传入时间边界。
+            dense = self._dense_search(query, candidate_k)
+            sparse = self._sparse_search(query, candidate_k)
+        else:
+            from app.db import SessionLocal
+            from app.models.news import News
+
+            cutoff = until or datetime.now()
+            if cutoff.tzinfo is not None or (since is not None and since.tzinfo is not None):
+                raise ValueError("检索时间请使用本地无时区 datetime")
+            if since is not None and since > cutoff:
+                raise ValueError("检索起点不得晚于截止时间")
+            with SessionLocal() as db:
+                q = db.query(News).filter(News.publish_time <= cutoff)
+                if since is not None:
+                    q = q.filter(News.publish_time >= since)
+                chunks = [{"id": row.id, "text": f"{row.title}\n{row.content or ''}", "metadata": {
+                    "news_id": row.id, "title": row.title, "source": row.source,
+                    "publish_time": row.publish_time.isoformat(), "category": row.category or "",
+                }} for row in q.order_by(News.id).all()]
+            if not chunks:
+                return []
+            # 按主键限制 Chroma，无需迁移其旧字符串时间元数据，且在 top-k 之前过滤。
+            allowed = {chunk["id"]: chunk for chunk in chunks}
+            try:
+                dense = self._dense_search(query, candidate_k, ids=list(allowed))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[检索] 窗口内向量召回失败，使用同窗关键词召回：{type(exc).__name__}")
+                dense = []
+            local = HybridRetriever()
+            local.build_bm25_index(chunks)
+            sparse = local._sparse_search(query, candidate_k)
+            # 两路都以数据库正文/日期为准，过期索引或替身也不能把窗口外 ID 带回来。
+            dense = [Hit(id=h.id, text=allowed[h.id]["text"], metadata=allowed[h.id]["metadata"],
+                         score=h.score) for h in dense if h.id in allowed]
         fused = self._rrf([dense, sparse])[:candidate_k]
         if not fused:
             return []

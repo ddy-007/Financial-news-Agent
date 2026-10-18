@@ -217,8 +217,15 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
         lvl = risk.get("risk_level", "中")
         emoji = {"高": "🔴", "中": "🟠", "低": "🟢"}.get(lvl, "⚪")
         with st.expander(f"{emoji} 风险官意见（风险等级：{lvl}）", expanded=(lvl == "高")):
+            main_risks = c.get("risks") or []
+            hidden = 0
             for r in risk.get("risks", []):
-                st.markdown(f"- ⚠️ {r}")
+                if r in main_risks:
+                    hidden += 1
+                else:
+                    st.markdown(f"- ⚠️ {r}")  # 历史主清单若遗漏，仍保留可见性
+            if hidden:
+                st.caption(f"{hidden} 条风险已纳入下方“风险提示”，此处不重复展示。")
             if risk.get("counter_arguments"):
                 st.markdown("**🔍 反驳意见**")
                 for x in risk["counter_arguments"]:

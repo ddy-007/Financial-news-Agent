@@ -27,6 +27,7 @@ from loguru import logger
 from sqlalchemy.orm import Session
 
 from app.agent.llm import get_llm, get_llm_model_name, llm_retry_times
+from app.agent.json_output import extract_json
 from app.agent.prompts import CLASSIFY_PROMPT, DEDUP_PROMPT
 from app.collectors.news_collector import NewsItem, collect_all_news
 from app.models.news import News
@@ -149,20 +150,8 @@ def _normalize_market(mkt) -> str:
 
 
 def _extract_json(text: str):
-    """从 LLM 输出中容错提取 JSON（优先整个解析，失败则抓 [..] 片段）。"""
-    text = (text or "").strip()
-    text = re.sub(r"```(?:json)?", "", text).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
-    return None
+    """分类只接受数组；与专家链共用 JSON 边界解析。"""
+    return extract_json(text, expected_type=list)
 
 
 # ================= 步骤①：LLM 相关性分类 =================
@@ -690,15 +679,19 @@ def _nearest_existing(db: Session, cands: list[Candidate],
 
     out: list[tuple[News, float] | None] = []
     for idx, c in enumerate(cands):
-        ref = c.item.publish_time or datetime.now()
+        ref = c.item.publish_time
+        if ref is None:
+            logger.warning("[去重] 候选发布时间未知，不参与时间窗口合并")
+            out.append(None)
+            continue
         ids = id_lists[idx] if idx < len(id_lists) else []
         dists = dist_lists[idx] if idx < len(dist_lists) else []
         best: tuple[News, float] | None = None
         for k, nid in enumerate(ids):
             news = rows.get(nid)
-            if news is None:
+            if news is None or news.publish_time is None:
                 continue
-            if abs((news.publish_time or ref) - ref) > window:
+            if abs(news.publish_time - ref) > window:
                 continue                    # 窗口外 → 不是同一事件，继续看下一个近邻
             sim = 1.0 - float(dists[k]) if k < len(dists) else 0.0
             if best is None or sim > best[1]:
@@ -830,6 +823,8 @@ def _insert_new(db: Session, cand: Candidate, cls: dict) -> News:
     """插入新新闻（带分类标签 + 候选携带的全部来源）。"""
     pairs = [(src, u) for src, u in _dedup_sources(cand.sources) if u]
     item = cand.item
+    if item.publish_time is None:
+        logger.warning("[入库] 新闻发布时间未知，保留空值，不以当前时间替代")
     n = News(
         title=item.title,
         content=item.content or "",
@@ -837,7 +832,7 @@ def _insert_new(db: Session, cand: Candidate, cls: dict) -> News:
         # 代表条目未必带 url（同指纹里正文最长的那个可能是无 url 的），
         # 从候选的来源对里取第一个有 url 的，别让前端的「原文」链接凭空消失
         url=next((u for _s, u in pairs if u), None),
-        publish_time=item.publish_time or datetime.now(),
+        publish_time=item.publish_time,
         category=cls["category"],
         market=cls["market"],
         themes=json.dumps(cls["themes"], ensure_ascii=False),
@@ -1004,6 +999,14 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
         )
     # 传 texts 只为让「近阈值对示例」能打出标题 —— 那正是标定阈值时最该被看见的东西
     clusters = _cluster_by_similarity(vecs, texts=[c.text for c in cands])
+    # 未知发布时间不能靠语义相似推定是同一时刻的事件。
+    bounded_clusters = []
+    for group in clusters:
+        known = [i for i in group if cands[i].item.publish_time is not None]
+        if known:
+            bounded_clusters.append(known)
+        bounded_clusters.extend([i] for i in group if cands[i].item.publish_time is None)
+    clusters = bounded_clusters
     within_round = 0
     if len(clusters) != len(cands):
         before = len(cands)

@@ -2,7 +2,7 @@
 import re
 
 from loguru import logger
-from pydantic import ValidationInfo, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HHMM = re.compile(r"^\d{1,2}:\d{2}$")
@@ -155,6 +155,13 @@ class Settings(BaseSettings):
     # 另一处判「中性」—— 自己跟自己打架。统一后由这两项一处控制。
     score_neutral_band: float = 0.15   # |综合分| < 此值 → 中性（无明确方向）
     score_strong_band: float = 0.5     # |综合分| > 此值 → 强多 / 强空
+
+    # 新闻选取：扩大窗口候选池后分时配额，源数仅为弱重要性信号。
+    news_per_category: int = Field(default=20, ge=1, le=100)
+    news_all_limit: int = Field(default=60, ge=1, le=300)
+    news_selection_segments: int = Field(default=4, ge=1, le=24)
+    news_recency_gravity: float = Field(default=0.5, ge=0, le=3, allow_inf_nan=False)
+    news_source_weight: float = Field(default=0.5, ge=0, le=2, allow_inf_nan=False)
 
     # ---- 信息量门槛（任一满足即视为「有料」）----
     # **三个**信号全不满足 → low_info=True（仍生成报告，仅标记 + 精简）
