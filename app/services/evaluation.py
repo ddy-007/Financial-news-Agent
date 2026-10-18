@@ -39,7 +39,7 @@ GROUNDING_THRESHOLD = 0.5   # S6：单条风险的落地阈值
 EXPERT_NAMES = ["宏观", "行业", "资金面", "技术面"]
 BULL_WORDS = ["上涨", "反弹", "利好", "机会", "走强", "回暖", "乐观", "企稳", "向好"]
 BEAR_WORDS = ["下跌", "回调", "风险", "承压", "走弱", "悲观", "下行", "抛售", "谨慎"]
-EVALUATION_METHOD_VERSION = "2026-10-18.1"
+EVALUATION_METHOD_VERSION = "2026-10-19.1"
 
 
 def _safe(check_name: str):
@@ -684,13 +684,15 @@ def _resolve_subject(summary: str, pos: int) -> str | None:
 def _numeric_direction(summary: str, start: int, token: str) -> tuple[float, str | None]:
     token = token.replace("−", "-")
     val = float(token)
-    prefix = summary[:start]
-    suffix = r"\s*(?:了|为|达|至)?\s*(?:约|近|超过|逾|超)?\s*$"
+    # 冒号可以分隔方向与数字；逗号、句号等则不能跨越到另一个标的。
+    prefix = re.split(r"[，,。；;\n]", summary[:start])[-1]
+    if re.search(r"未|并非|不再|没有|不是|不", prefix):
+        return val, "局部语句存在否定，无法确认数字方向"
+    suffix = r"\s*(?:了|为|达|至)?\s*[:：]?\s*(?:约|近|超过|逾|超)?\s*$"
     # 「涨跌幅」是中性字段名，不能后缀匹配成「跌幅」。
-    if re.search(r"涨跌(?:幅)?" + suffix, prefix):
-        return val, None
-    direction = re.search(r"(上涨|下跌|上行|下行|走高|走低|回落|涨|跌|升|降)"
-                          r"(?:幅)?" + suffix, prefix)
+    neutral = re.search(r"涨跌(?:幅度|幅)?" + suffix, prefix)
+    direction = (None if neutral else re.search(
+        r"(上涨|下跌|上行|下行|走高|走低|回落|涨|跌|升|降)(?:幅度|幅)?" + suffix, prefix))
     sign = (-1 if direction[1] in ("下跌", "下行", "走低", "回落", "跌", "降")
             else 1) if direction else None
     if token[0] in "+-":
@@ -698,6 +700,8 @@ def _numeric_direction(summary: str, start: int, token: str) -> tuple[float, str
             return val, "符号与涨跌措辞冲突"
     elif sign is not None:
         val = sign * abs(val)
+    else:
+        return val, "无显式符号且局部涨跌方向不明确"
     return val, None
 
 

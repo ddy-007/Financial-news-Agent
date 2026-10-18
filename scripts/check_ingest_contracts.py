@@ -431,7 +431,8 @@ def _cluster():
     check("候选规模与最终结果分别记录",
           "最差候选簇 3 条" in chain_log and "最终分组：2 组" in chain_log, True)
     check("最终合并组满足实际阈值",
-          all(np.all(chain_vecs[c] @ chain_vecs[c].T >= DA.DUP_THRESHOLD - 1e-7)
+          all(np.all(chain_vecs[c] @ chain_vecs[c].T
+                     >= float(np.asarray(DA.DUP_THRESHOLD, dtype=chain_vecs.dtype)))
               for c in chain), True)
 
     angles = np.radians([0, 10, 20])
@@ -456,6 +457,32 @@ def _cluster():
           "否则这条告警会因为天天出现而失效（与 P3 陈旧告警同一个道理）")
     check("但仍报告这一簇（供基线）", "合并簇 1 个" in clean_log, True)
     check("正常合并无WARNING", "WARNING|" in clean_log, False)
+
+    print("\n[3g] 阈值在数组、完整链接及最终检查之间保持相同精度")
+    for dtype in (np.float32, np.float64):
+        for threshold in (0.85, 0.9):
+            boundary = dtype(threshold)
+            effective = float(boundary)
+            neighbors = [("前一值", np.nextafter(boundary, dtype(-np.inf)), False),
+                         ("阈值", boundary, True),
+                         ("后一值", np.nextafter(boundary, dtype(np.inf)), True)]
+            for label, x, merge in neighbors:
+                for size in (2, 3):
+                    # 第一向量为坐标轴，使点积精确取x；三条时必须经过完整链接。
+                    boundary_vecs = np.asarray([[1, 0]] + [[x, np.sqrt(1 - x * x)]] * (size - 1),
+                                               dtype=dtype)
+                    want = [list(range(size))] if merge else [[0], list(range(1, size))]
+                    for chunk in (1, 7, 256):
+                        groups, logs = _logged(boundary_vecs, threshold=threshold, chunk=chunk)
+                        pairs_ok = all(np.all((boundary_vecs[g] @ boundary_vecs[g].T)[
+                            np.triu_indices(len(g), k=1)] >= effective) for g in groups)
+                        check(f"{dtype.__name__} {threshold} {label} {size}条 chunk={chunk}",
+                              (groups, pairs_ok, "WARNING|" in logs), (want, True, False),
+                              "不使用人为epsilon：前一可表示值拒绝，阈值及后一值接受")
+                        if dtype is np.float32 and threshold == 0.9 and label == "阈值" and size == 2 and chunk == 1:
+                            check("日志同时给出请求和有效阈值",
+                                  "请求阈值 0.9" in logs and f"有效阈值 {effective:.17g}" in logs,
+                                  True, "边界解释必须与真实比较值一致")
 
 
 # ============ ② 时间窗 ============

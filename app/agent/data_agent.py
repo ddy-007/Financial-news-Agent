@@ -441,6 +441,10 @@ def _cluster_by_similarity(vecs: np.ndarray,
     n = len(vecs)
     if n <= 1:
         return [[i] for i in range(n)]
+    # 按向量精度只转换一次；数组与Python标量的比较共用同一可表示值。
+    # 例如float32(0.9)略小于Python的0.9，不能只在最终检查转成float再比原阈值。
+    requested_threshold = threshold
+    threshold = float(np.asarray(threshold, dtype=vecs.dtype))
     parent = list(range(n))
 
     def find(x: int) -> int:
@@ -537,6 +541,7 @@ def _cluster_by_similarity(vecs: np.ndarray,
         # 经传递闭包已并进同一簇、但彼此直接相似度偏低的那些对也会被计入
         # （A–B、B–C 都 ≥0.85 时，A–C 可能只有 0.83）。巡检 2026-09-24 指出。
         f"[去重] 阈值余量：近阈值对 {nm_count} 对"
+        f"｜请求阈值 {requested_threshold:.8g}，有效阈值 {threshold:.17g}（{vecs.dtype}）"
         f"（**直接**相似度 ≥{NEAR_MISS_LOW:.2f} 且 <{threshold:.2f}）"
         + (f"，最高的那对 {nm_max:.4f}（距阈值还差 {threshold - nm_max:.4f}）"
            if nm_max is not None else "")

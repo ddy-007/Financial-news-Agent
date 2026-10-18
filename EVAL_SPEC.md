@@ -287,7 +287,7 @@
 
 **返回**：
 ```json
-{"check":"internal_consistency","status":"ok","method_version":"2026-10-18.1",
+{"check":"internal_consistency","status":"ok","method_version":"2026-10-19.1",
  "method":"lexical_heuristic","metric_scope":"lexical_agreement","semantic_verdict":"not_determined",
  "reports_scanned":3,"checked":2,"consistent":1,"consistency_rate":0.5,"undetermined":1,
  "needs_review":true,"inconsistent":[{"date":"...","sentiment":"偏空","tone":"偏多",
@@ -441,6 +441,10 @@
 **数字提取**：
 - 涨跌幅型：`([+\-−]?\d+(?:\.\d+)?)\s*%`；先尊重显式符号，无符号时才从紧邻涨跌措辞确定方向。
 - `下跌-3.1%` 不重复取反；符号与措辞冲突（如 `上涨-3.1%`）计为不可验证。
+- 涨跌方向限于数字前的局部分句；冒号可连接方向与数值，逗号、句号、分号和换行不能跨越。
+  支持 `下跌：1.59%`、`下跌幅度为1.59%` 等常见格式；否定语句保守计为不可验证。
+- `涨跌幅/涨跌幅度` 为中性标签，不从其末尾的“跌”字推断方向。
+  无显式符号且无可确认方向（含 `涨跌幅1.59%`）计为不可验证，不能默认上涨。
 - 点位型：`(\d{3,5}(?:\.\d+)?)\s*点`
 
 **排除项**：`(?:19|20)\d{2}\s*年`（年份）、`第\s*\d+`（序数）、既无 `%` 又无"点"的整数。
@@ -469,13 +473,17 @@
 结果带 `comparisons`（最多20条）、`mismatched`（最多10条）与 `unverifiable_samples`（最多10条），
 记录截止时点、时间依据、实际行情日期及原因。`availability_scope=session_close_approximation_not_input_snapshot`。
 
-**版本与归档**：S5/A2 结果均带 `method_version=2026-10-18.1`；旧 `eval_log.jsonl` 保留，后续仍按原流程追加。
+**版本与归档**：S5/A2 结果均带 `method_version=2026-10-19.1`；旧 `eval_log.jsonl` 保留，后续仍按原流程追加。
+该版本补齐方向含糊时的拒绝判断；`2026-10-18.1` 及更早版本不改写。
 本次不重写历史日报与评估日志，不改变风险官、首席、prompt、回测或模型配置。
 不同版本的比率/分母口径不能直接合并比较。
 
 **聚类诊断口径**：候选连通簇与最终完整链接分组分别记录；链式候选及成功拆分为INFO。
-最终两两相似度按实际 `threshold` 检查，失效或非有限值时WARNING并拒绝该组合并、退回逐条；
-超规模候选的独立WARNING保留。正常输入分组与原算法一致。
+入口先计算 `effective_threshold = float(np.asarray(threshold, dtype=vecs.dtype))`，候选连接、完整链接拆分、
+最终检查及诊断共用此值；日志同时列出请求阈值、有效阈值和向量类型。业务请求阈值不变，
+不使用人为epsilon或 `isclose` 放宽合并条件。float32阈值边界的意外拆分得到修复，
+不保证不同矩阵乘法形状/平台的浮点运算逐位相同。
+最终两两相似度低于有效阈值或非有限值时WARNING并拒绝该组合并、退回逐条；超规模候选的独立WARNING保留。
 
 > 已知覆盖局限：点位型正则要求 `\s*点`，而当前综述写作「至3888.111」（无"点"字），
 > 故点位检查基本不触发。**不为此放宽正则**（放宽会引入误判）。
