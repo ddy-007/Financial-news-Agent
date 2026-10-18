@@ -324,12 +324,12 @@ def _cluster():
     # `"近阈值对 0 对" in text and "合并簇 0 个" in text` 是**跨用例的子串与** ——
     # 两个子串分别来自 `dup` 与 `near` 两次调用，于是 `far` 无论怎么错都照样 PASS。
     # 「看上去在验、实际没验」正是这套脚本最该防的毛病。
-    def _logged(vecs, texts=None):
+    def _logged(vecs, texts=None, **kwargs):
         """跑一次并**单独**捕获它自己的日志，返回 `(簇, 该次调用的日志文本)`。"""
         s = _Sink()
-        hid = logger.add(s.write, level="INFO", format="{message}")
+        hid = logger.add(s.write, level="INFO", format="{level.name}|{message}")
         try:
-            clusters = DA._cluster_by_similarity(vecs, texts=texts)
+            clusters = DA._cluster_by_similarity(vecs, texts=texts, **kwargs)
         finally:
             logger.remove(hid)
         return clusters, s.text
@@ -413,24 +413,41 @@ def _cluster():
     print("\n[3e] 链式合并取证：A–B、B–C ≥0.85 但 A–C < 0.70")
     # 造一个**真的链**：A·B=0.87、B·C=0.9029、A·C=0.5736（< GRAY_LOW=0.70）。
     # 这正是生产日志里「簇内最不像的一对 0.6921」的形态。
-    chain, chain_log = _logged(
-        np.stack([v(1, 0), v(0.87, 0.4931), v(0.5736, 0.8192)]),
-        ["甲文", "乙文", "丙文"])
+    chain_vecs = np.stack([v(1, 0), v(0.87, 0.4931), v(0.5736, 0.8192)])
+    chain, chain_log = _logged(chain_vecs, ["甲文", "乙文", "丙文"])
     check("链条两端不再因传递闭包自动合并",
           sorted(sorted(c) for c in chain), [[0], [1, 2]])
-    check("且被计成「1 个簇里存在低于灰区下限的一对」",
-          f"{DA.GRAY_LOW} 的一对" in chain_log and "链式合并可疑：1 个合并簇" in chain_log,
+    check("链式风险明确属于候选层",
+          "候选链式连接：1 个候选簇" in chain_log,
           True,
-          "判据用现成的 `GRAY_LOW`（直接比对会判「不重复」那条线），"
-          "**不引入任何新的魔法数字**")
-    check("告警说清「直接比对本会判不重复」",
-          "直接比对本会判「不重复」" in chain_log, True,
-          "否则读者会以为这是普通的低相似度合并，而它恰恰是**传递闭包造出来的**")
+          "候选连通分量不代表最终合并结果")
+    check("安全拆分后不留误报WARNING",
+          "WARNING|" in chain_log, False,
+          "候选链式连接和安全拆分均为INFO")
     check("**带出最不像那一对的两条标题**（甲文 / 丙文）",
           "甲文" in chain_log and "丙文" in chain_log, True,
           "只报数值证明不了合得对不对 —— 同一事件的「长文 + 短快讯」也可能只有 0.70，"
           "必须交出标题让人判（2026-09-24 生产日志实测触发）")
-    check("最差那簇的规模也报了（3 条）", "最差那簇 3 条" in chain_log, True)
+    check("候选规模与最终结果分别记录",
+          "最差候选簇 3 条" in chain_log and "最终分组：2 组" in chain_log, True)
+    check("最终合并组满足实际阈值",
+          all(np.all(chain_vecs[c] @ chain_vecs[c].T >= DA.DUP_THRESHOLD - 1e-7)
+              for c in chain), True)
+
+    angles = np.radians([0, 10, 20])
+    custom, custom_log = _logged(np.column_stack((np.cos(angles), np.sin(angles))), threshold=0.97)
+    check("自定义阈值也拆分链式连接", len(custom), 2,
+          "A-C相似度0.9397虽高于灰区，也低于实际0.97合并阈值")
+    check("诊断使用传入阈值并区分前后结果",
+          "合并阈值 0.97" in custom_log and "最终簇内最小相似度 0.9848" in custom_log
+          and "WARNING|" not in custom_log, True)
+
+    # 注入最终统计的坏值，证明异常约束会拒绝合并，而不是只换日志文案。
+    from unittest.mock import patch
+    with patch.object(DA.np, "min", return_value=0.8):
+        rejected, rejected_log = _logged(np.stack([v(1, 0), v(0.95, 0.3122)]), threshold=0.9)
+    check("最终约束异常时保留各条原文", rejected, [[0], [1]])
+    check("真实约束异常仍发WARNING", "WARNING|[去重] 最终分组约束失效" in rejected_log, True)
 
     print("\n[3f] 对照组：正常合并**不该**报链式可疑")
     clean, clean_log = _logged(
@@ -438,6 +455,7 @@ def _cluster():
     check("两条直接相似度 0.95 → 不报可疑", "链式合并可疑" in clean_log, False,
           "否则这条告警会因为天天出现而失效（与 P3 陈旧告警同一个道理）")
     check("但仍报告这一簇（供基线）", "合并簇 1 个" in clean_log, True)
+    check("正常合并无WARNING", "WARNING|" in clean_log, False)
 
 
 # ============ ② 时间窗 ============

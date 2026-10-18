@@ -512,7 +512,7 @@ def _cluster_by_similarity(vecs: np.ndarray,
     # 若在保护前算，一个 2000 条的巨型簇就是 4M 个浮点。
     dup_min: float | None = None
     dup_clusters = 0
-    chain_suspects = 0                                # 簇内最小两两 < GRAY_LOW 的簇数
+    chain_suspects = 0  # 候选簇不满足完整链接阈值；不代表最终误合并
     worst: tuple[float, list[int], int, int] | None = None   # 最差那簇：(值, 成员, 局部 i, j)
     for c in out:
         if len(c) < 2:
@@ -524,9 +524,7 @@ def _cluster_by_similarity(vecs: np.ndarray,
         # 同一事件的「长文 + 短快讯」也可能只有 0.70。要有标题才能人工判。
         li, lj = np.unravel_index(int(np.argmin(sub)), sub.shape)
         m = float(sub[li, lj])
-        if m < GRAY_LOW:
-            # 直接比对会判「不重复」（< GRAY_LOW），却因传递闭包被并进同一簇 ——
-            # 这是链式漂移最硬的判据，**不需要引入任何新的魔法数字**。
+        if m < threshold:
             chain_suspects += 1
         if dup_min is None or m < dup_min:
             dup_min = m
@@ -543,26 +541,22 @@ def _cluster_by_similarity(vecs: np.ndarray,
         + (f"，最高的那对 {nm_max:.4f}（距阈值还差 {threshold - nm_max:.4f}）"
            if nm_max is not None else "")
         + f"｜候选合并簇 {dup_clusters} 个"
-        + (f"，簇内最不像的一对 {dup_min:.4f}（高出阈值 {dup_min - threshold:+.4f}"
-           + (f"；**{chain_suspects} 个簇里存在低于灰区下限 {GRAY_LOW} 的一对**"
+        + (f"，候选簇内最不像的一对 {dup_min:.4f}（高出阈值 {dup_min - threshold:+.4f}"
+           + (f"；{chain_suspects} 个候选簇需要完整链接拆分"
               if chain_suspects else "")
            + "）"
            if dup_min is not None else "")
     )
-    # ⚠️ **链式合并取证**（2026-09-24，实测数据触发）：只在真出现可疑簇时打，
-    # 且**带标题**。生产日志已出现「簇内最不像的一对 0.6921」—— 合并只发生在
-    # 直接相似度 ≥0.85 的对上，所以那是 A–B–C 链条而 A–C 只有 0.69。
-    # 但**那不等于合错了**：同一事件的「长文 + 短快讯」也可能只有 0.70。
-    # 所以这一行的用途是**交出证据让人判**，不是自动改判定。
+    # 此时仅是候选连通分量，下面的完整链接尚未运行，不能报最终误合并。
     if chain_suspects and worst is not None:
         _m, _members, _li, _lj = worst
         _a, _b = _members[_li], _members[_lj]
         _peek_a = _peek(texts[_a]) if texts and _a < len(texts) else f"#{_a}"
         _peek_b = _peek(texts[_b]) if texts and _b < len(texts) else f"#{_b}"
-        logger.warning(
-            f"[去重] ⚠️ 链式合并可疑：{chain_suspects} 个合并簇内存在相似度低于 "
-            f"{GRAY_LOW} 的一对（**直接比对本会判「不重复」**）｜最差那簇 {len(_members)} 条，"
-            f"{_m:.4f}「{_peek_a}」≈「{_peek_b}」—— 请人工确认这两条是否同一事件"
+        logger.info(
+            f"[去重] 候选链式连接：{chain_suspects} 个候选簇内存在相似度低于 "
+            f"合并阈值 {threshold:.2f} 的一对，将进行完整链接拆分｜最差候选簇 {len(_members)} 条，"
+            f"{_m:.4f}「{_peek_a}」≈「{_peek_b}」"
         )
     # 示例单独一行、**只在真有近阈值对时打** —— 安静轮次不该多出一行。
     if nm_top and texts:
@@ -598,7 +592,26 @@ def _cluster_by_similarity(vecs: np.ndarray,
         if len(groups) > 1:
             logger.info(f"[去重] 完整链接保护：{len(c)} 条候选拆为 {len(groups)} 组，"
                         f"每组两两相似度均 ≥{threshold:.2f}")
-    return refined
+    # 最终诊断以返回组为准。若约束意外失效，拒绝该组自动合并，保留每条原文。
+    checked: list[list[int]] = []
+    final_min = None
+    final_clusters = 0
+    for c in refined:
+        if len(c) > 1:
+            sub = vecs[c] @ vecs[c].T
+            pairs = sub[np.triu_indices(len(c), k=1)]
+            minimum = float(np.min(pairs))
+            if not np.all(np.isfinite(pairs)) or minimum < threshold:
+                logger.warning(f"[去重] 最终分组约束失效：{len(c)} 条，最小相似度 {minimum:.4f} "
+                               f"低于阈值 {threshold:.2f} 或存在非有限值；拒绝合并，降级逐条")
+                checked.extend([i] for i in c)
+                continue
+            final_clusters += 1
+            final_min = minimum if final_min is None else min(final_min, minimum)
+        checked.append(c)
+    logger.info(f"[去重] 最终分组：{len(checked)} 组｜最终合并簇 {final_clusters} 个"
+                + (f"｜最终簇内最小相似度 {final_min:.4f}" if final_min is not None else ""))
+    return checked
 
 
 def _collapse_clusters(cands: list[Candidate],

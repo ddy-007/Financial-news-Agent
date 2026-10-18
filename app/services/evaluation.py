@@ -19,8 +19,10 @@ from __future__ import annotations
 import difflib
 import functools
 import json
+import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 from sqlalchemy import inspect
@@ -37,6 +39,7 @@ GROUNDING_THRESHOLD = 0.5   # S6：单条风险的落地阈值
 EXPERT_NAMES = ["宏观", "行业", "资金面", "技术面"]
 BULL_WORDS = ["上涨", "反弹", "利好", "机会", "走强", "回暖", "乐观", "企稳", "向好"]
 BEAR_WORDS = ["下跌", "回调", "风险", "承压", "走弱", "悲观", "下行", "抛售", "谨慎"]
+EVALUATION_METHOD_VERSION = "2026-10-18.1"
 
 
 def _safe(check_name: str):
@@ -84,6 +87,7 @@ def _load_reports(db: Session, limit: int = 90) -> list[dict]:
             experts = []
         out.append({
             "date": r.date,
+            "report_day": r.report_day,
             "sentiment": r.sentiment,
             "confidence": r.confidence,
             "score": r.score,
@@ -95,13 +99,40 @@ def _load_reports(db: Session, limit: int = 90) -> list[dict]:
     return out
 
 
-def _latest_market_map(db: Session) -> dict:
-    """每个 symbol 的最新一条行情。"""
-    rows = db.query(MarketData).order_by(MarketData.date.desc()).all()
+def _latest_market_map(db: Session, *, as_of: datetime) -> dict:
+    """截止分析时点已收盘的最近日线；不等于源站当时实际可用的快照。"""
+    rows = (db.query(MarketData).filter(MarketData.date <= as_of)
+            .order_by(MarketData.date.desc()).all())
     latest: dict = {}
     for r in rows:
+        if r.symbol.startswith("."):
+            closed = datetime.combine(r.date.date(), time(16), ZoneInfo("America/New_York"))
+            closed = closed.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        else:
+            closed = datetime.combine(r.date.date(), time(15))
+        if closed > as_of:
+            continue
         latest.setdefault(r.symbol, r)
     return latest
+
+
+def _evaluation_cutoff(report: dict) -> tuple[datetime | None, str]:
+    """新报告用分析时点；旧报告只有业务日与记录日期相同时才可回退。"""
+    freshness = report["content"].get("data_freshness") or {}
+    raw = freshness.get("analyzed_at") if isinstance(freshness, dict) else None
+    basis = "analyzed_at" if raw is not None else "legacy_report_date"
+    try:
+        cutoff = datetime.fromisoformat(raw) if raw is not None else report["date"]
+        if not isinstance(cutoff, datetime):
+            return None, "invalid_cutoff"
+        if cutoff.tzinfo is not None:
+            cutoff = cutoff.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        day = report.get("report_day")
+        if day is not None and str(day) != cutoff.date().isoformat():
+            return None, "report_day_conflict"
+        return cutoff, basis
+    except (ValueError, TypeError):
+        return None, "invalid_cutoff"
 
 
 def _next_day_stats(db: Session, date: datetime) -> dict | None:
@@ -397,37 +428,44 @@ def check_chief_faithfulness(db: Session, limit: int = 90) -> dict:
 
 @_safe("internal_consistency")
 def check_internal_consistency(db: Session, limit: int = 90) -> dict:
-    """S5 内部一致性：市场综述措辞倾向 vs 代码定调。"""
+    """S5 词频倾向提示：不据此认定正文与定调存在语义矛盾。"""
     reports = _load_reports(db, limit)
-    checked, consistent, bad = 0, 0, []
+    checked, consistent, bad, undetermined = 0, 0, [], 0
 
     for r in reports:
         sentiment = r.get("sentiment")
         summary = str(r["content"].get("market_summary", "") or "")
-        if not sentiment or not summary:
+        if sentiment not in ("偏多", "偏空") or not summary.strip():
+            undetermined += 1
+            continue
+        bull_hits = [w for w in BULL_WORDS if w in summary]
+        bear_hits = [w for w in BEAR_WORDS if w in summary]
+        tone = len(bull_hits) - len(bear_hits)
+        tone_dir = 1 if tone > 0 else (-1 if tone < 0 else 0)
+        if tone_dir == 0:
+            undetermined += 1
             continue
         checked += 1
-        tone = sum(w in summary for w in BULL_WORDS) - sum(w in summary for w in BEAR_WORDS)
-        tone_dir = 1 if tone > 0 else (-1 if tone < 0 else 0)
         sent_dir = 1 if sentiment == "偏多" else (-1 if sentiment == "偏空" else 0)
-        # 仅在方向明确相反时判为不一致（保守，避免误报）
-        ok = not (tone_dir != 0 and sent_dir != 0 and tone_dir != sent_dir)
+        ok = tone_dir == sent_dir
         consistent += int(ok)
         if not ok:
             bad.append({"date": str(r["date"].date()), "sentiment": sentiment,
-                        "tone": "偏多" if tone_dir > 0 else "偏空"})
+                        "tone": "偏多" if tone_dir > 0 else "偏空",
+                        "verdict": "needs_review", "evidence_type": "lexical_candidate",
+                        "bull_hits": bull_hits, "bear_hits": bear_hits})
 
-    if checked == 0:
-        return {"check": "internal_consistency", "status": "skipped",
-                "reason": "无可用报告（缺 sentiment 或 market_summary）"}
-
-    rate = round(consistent / checked, 3)
-    result = {"check": "internal_consistency", "status": "ok",
+    rate = round(consistent / checked, 3) if checked else None
+    result = {"check": "internal_consistency", "status": "ok" if checked else "skipped",
+              "method_version": EVALUATION_METHOD_VERSION, "method": "lexical_heuristic",
+              "metric_scope": "lexical_agreement", "semantic_verdict": "not_determined",
               "reports_scanned": len(reports), "checked": checked,
               "consistent": consistent, "consistency_rate": rate,
-              "inconsistent": bad}
-    if rate < 0.7:
-        result["flag"] = "市场综述措辞与定调不一致"
+              "inconsistent": bad, "needs_review": bool(bad), "undetermined": undetermined}
+    if not checked:
+        result["reason"] = "无可判断的词频方向；不代表正文一致"
+    if bad:
+        result["review_note"] = "词频倾向与定调相反，仅供人工复核，不代表语义矛盾"
     return result
 
 
@@ -614,7 +652,7 @@ def check_reference_traceability(db: Session, limit: int = 90) -> dict:
     return result
 
 
-PCT_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*%")
+PCT_RE = re.compile(r"([+\-−]?\d+(?:\.\d+)?)\s*%")
 POINT_RE = re.compile(r"(\d{3,5}(?:\.\d+)?)\s*点")
 YEAR_RE = re.compile(r"(?:19|20)\d{2}\s*年")
 ORD_RE = re.compile(r"第\s*\d+")
@@ -643,91 +681,124 @@ def _resolve_subject(summary: str, pos: int) -> str | None:
     return best_sym
 
 
+def _numeric_direction(summary: str, start: int, token: str) -> tuple[float, str | None]:
+    token = token.replace("−", "-")
+    val = float(token)
+    prefix = summary[:start]
+    suffix = r"\s*(?:了|为|达|至)?\s*(?:约|近|超过|逾|超)?\s*$"
+    # 「涨跌幅」是中性字段名，不能后缀匹配成「跌幅」。
+    if re.search(r"涨跌(?:幅)?" + suffix, prefix):
+        return val, None
+    direction = re.search(r"(上涨|下跌|上行|下行|走高|走低|回落|涨|跌|升|降)"
+                          r"(?:幅)?" + suffix, prefix)
+    sign = (-1 if direction[1] in ("下跌", "下行", "走低", "回落", "跌", "降")
+            else 1) if direction else None
+    if token[0] in "+-":
+        if val and sign is not None and (1 if val > 0 else -1) != sign:
+            return val, "符号与涨跌措辞冲突"
+    elif sign is not None:
+        val = sign * abs(val)
+    return val, None
+
+
+def _number_time_reason(summary: str, pos: int, cutoff: datetime) -> str | None:
+    """无逐数字历史日期解析时，明确的其他时段不与当前快照硬比。"""
+    sentence = (re.split(r"[。；;\n]", summary[:pos])[-1]
+                + re.split(r"[。；;\n]", summary[pos:], maxsplit=1)[0])
+    if re.search(r"昨日|昨天|前日|前天|上周|上月|去年|前一交易日|上一交易日", sentence):
+        return "数字引用其他时段，未重建该时段快照"
+    dates = list(re.finditer(r"(?:(\d{4})[-/](\d{1,2})[-/](\d{1,2})|"
+                             r"(\d{1,2})月(\d{1,2})日)", sentence))
+    for m in dates:
+        year, month, day = ((int(m[1]), int(m[2]), int(m[3])) if m[1]
+                            else (cutoff.year, int(m[4]), int(m[5])))
+        if (year, month, day) != (cutoff.year, cutoff.month, cutoff.day):
+            return "数字引用日期与分析日不同"
+    return None
+
+
 @_safe("fact_consistency")
 def check_fact_consistency(db: Session, limit: int = 90) -> dict:
-    """A2 数字一致性：检测首席在 market_summary 中编造数字。"""
+    """A2 数字与对应分析时点行情的比对；不直接判定编造。"""
     reports = _load_reports(db, limit)
-    market = _latest_market_map(db)
-
     found, matched, unspecified, unverifiable = 0, 0, 0, 0
     mismatched = []
     unverifiable_samples = []
+    comparisons = []
+    snapshots = {}
 
     for r in reports:
         summary = str(r["content"].get("market_summary", "") or "")
         if not summary:
             continue
+        cutoff, basis = _evaluation_cutoff(r)
+        if cutoff is not None and cutoff not in snapshots:
+            snapshots[cutoff] = _latest_market_map(db, as_of=cutoff)
+        market = snapshots.get(cutoff, {})
         nums = []
         for m in PCT_RE.finditer(summary):
-            nums.append(("pct", float(m.group(1)), m.start(), m.end()))
+            nums.append(("pct", m.group(1), m.start(), m.end()))
         for m in POINT_RE.finditer(summary):
-            nums.append(("point", float(m.group(1)), m.start(), m.end()))
+            nums.append(("point", m.group(1), m.start(), m.end()))
 
-        for kind, val, s, e in nums:
+        for kind, token, s, e in nums:
             ctx_text = summary[max(0, s - 10):min(len(summary), e + 10)]
             if YEAR_RE.search(ctx_text) or ORD_RE.search(ctx_text):
                 continue
-
-            # 方向：中文用"涨/跌"字表意，取其符号
-            prefix = summary[max(0, s - 6):s]
-            signed = val
-            if kind == "pct":
-                if any(w in prefix for w in DOWN_WORDS) and not any(w in prefix for w in UP_WORDS):
-                    signed = -val
+            signed, reason = (_numeric_direction(summary, s, token) if kind == "pct"
+                              else (float(token), None))
 
             hedged = any(h in summary[max(0, s - 5):s] for h in HEDGE)
             tol = 0.5 if (kind == "pct" and hedged) else (0.15 if kind == "pct" else 2.0)
-
-            # 解析主语（取子句内离数字最近的标的词）
             symbol = _resolve_subject(summary, s)
-
-            def _hit(sym: str) -> bool:
-                row = market.get(sym)
-                if row is None:
-                    return False
-                target = row.change_pct if kind == "pct" else row.close
-                if target is None:
-                    return False
-                return abs(float(target) - signed) <= tol
-
-            if symbol is not None:
-                # 主语明确 → 计入校验（对错都算）
-                found += 1
-                if _hit(symbol):
-                    matched += 1
-                else:
-                    mismatched.append({
-                        "date": str(r["date"].date()), "text": ctx_text.strip()[:60],
-                        "value": signed, "kind": kind, "subject": symbol,
-                    })
-            else:
-                # 主语未解析 → 先试全部标的；命中算过，未命中记为"不可校验"而非错
+            row = market.get(symbol)
+            target = (row.change_pct if kind == "pct" else row.close) if row else None
+            sample = {"date": str(r["date"].date()), "text": ctx_text.strip()[:60],
+                      "value": signed, "kind": kind, "subject": symbol,
+                      "cutoff": cutoff.isoformat() if cutoff else None,
+                      "cutoff_basis": basis,
+                      "market_date": row.date.isoformat() if row else None}
+            if symbol is None:
                 unspecified += 1
-                if any(_hit(s) for s in market):
-                    found += 1
-                    matched += 1
-                else:
-                    unverifiable += 1
-                    unverifiable_samples.append({
-                        "date": str(r["date"].date()),
-                        "text": ctx_text.strip()[:60], "value": signed, "kind": kind,
-                    })
+                reason = reason or "标的未明确，不能以其他标的碰巧命中算通过"
+            if cutoff is None:
+                reason = reason or "无法确认分析截止时点"
+            elif reason is None:
+                reason = _number_time_reason(summary, s, cutoff)
+            if row is None or target is None:
+                reason = reason or "缺少截止时点已收盘行情或对应指标"
+            elif not math.isfinite(float(target)) or not math.isfinite(signed):
+                reason = reason or "数值不是有限数"
+            elif (not symbol.startswith(".") and row.date.date() != cutoff.date()):
+                reason = reason or "缺少分析日A股行情，旧日线不能作为当日校验依据"
+            elif row.date < cutoff - timedelta(days=STALE_DAYS):
+                reason = reason or "行情过旧，无法确认对应交易时段"
+            if reason:
+                unverifiable += 1
+                unverifiable_samples.append({**sample, "reason": reason})
+                continue
+            found += 1
+            ok = abs(float(target) - signed) <= tol
+            comparisons.append({**sample, "expected": float(target), "matched": ok})
+            if ok:
+                matched += 1
+            else:
+                mismatched.append({**sample, "expected": float(target), "tolerance": tol})
 
-    if found == 0:
-        return {"check": "fact_consistency", "status": "skipped",
-                "reason": "未提取到可校验（主语明确）的数字",
-                "unverifiable": unverifiable}
-
-    rate = round(matched / found, 3)
-    result = {"check": "fact_consistency", "status": "ok",
+    rate = round(matched / found, 3) if found else None
+    result = {"check": "fact_consistency", "status": "ok" if found else "skipped",
+              "method_version": EVALUATION_METHOD_VERSION, "method": "market_as_of",
+              "availability_scope": "session_close_approximation_not_input_snapshot",
               "reports_scanned": len(reports), "numbers_found": found,
               "matched": matched, "match_rate": rate,
               "unspecified_subject": unspecified,
               "unverifiable": unverifiable,
-              "unverifiable_samples": unverifiable_samples[:5],
-              "mismatched": mismatched[:10]}
-    if rate < 0.9:
-        result["flag"] = "存在编造数字风险"
+              "unverifiable_samples": unverifiable_samples[:10],
+              "mismatched": mismatched[:10], "comparisons": comparisons[:20]}
+    if not found:
+        result["reason"] = "无可校验数字；缺失或含糊信息不计为通过"
+    elif rate < 0.9:
+        result["flag"] = "数字与对应行情不一致，需复核"
     return result
 
 

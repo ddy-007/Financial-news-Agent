@@ -1,4 +1,4 @@
-"""评估层判定契约自检：把 A3 / B2 的判定规则从「文档描述」变成「可执行断言」。
+"""评估层判定契约自检：S5 / A2 / A3 / B2 / S8。
 
 用法：`.venv/Scripts/python.exe scripts/check_eval_contracts.py`
 退出码 0 = 全绿；非 0 = 有契约被改动或破坏。
@@ -13,13 +13,15 @@
 对叙述性理由是盲的）。
 
 **诚实边界**：
-- 测的是**判定分支**，不测 `_load_reports` 的 SQL、不测与真实库的交互
+- S5/A2 使用内存 SQLite 验证 SQL 与判定；A3/B2/S8 用假数据验证分支
 - 用 `monkeypatch` 替换私有函数，所以若 `_load_reports` 的**返回结构**变了，
   断言会照过 —— 这正是末尾「结构哨兵」存在的原因
 """
 import sys
-from datetime import datetime
+import json
+from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 # 确保项目根目录在 sys.path，使 `from app...` 可导入（同 verify.py）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -311,6 +313,134 @@ def _sqlite_path(url: str) -> Path | None:
     return Path(url[len(prefix):]).resolve()
 
 
+def _s5_a2():
+    """真实 SQL 走内存库；不调用模型、不联网、不写业务库。"""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from app.models.base import Base
+    from app.models.market import MarketData
+    from app.models.report import MarketReport
+
+    print("\nS5/A2 分析时点、缺失数据及词频复核")
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db, patch.object(ev, "_load_reports", _REAL_LOAD_REPORTS):
+        report = MarketReport(date=datetime(2026, 10, 15, 18, 30), report_day=date(2026, 10, 15),
+                              report_type="daily", title="测试", sentiment="偏空",
+                              content=json.dumps({"market_summary": "上证指数-1.59%。"}))
+        db.add_all([report,
+                    MarketData(symbol="sh000001", date=datetime(2026, 10, 15),
+                               close=3800, change_pct=-1.59),
+                    MarketData(symbol="sh000001", date=datetime(2026, 10, 16),
+                               close=3900, change_pct=0.24),
+                    MarketData(symbol=".INX", date=datetime(2026, 10, 14),
+                               close=6000, change_pct=-1.11),
+                    MarketData(symbol=".INX", date=datetime(2026, 10, 15),
+                               close=6100, change_pct=0.33)])
+        db.commit()
+
+        def evaluate(text, *, freshness=None):
+            content = {"market_summary": text}
+            if freshness is not None:
+                content["data_freshness"] = freshness
+            report.content = json.dumps(content, ensure_ascii=False)
+            db.commit()
+            return ev.check_fact_consistency(db)
+
+        r = evaluate("上证指数-1.59%。")
+        check("历史日报用历史行情", (r["matched"], r["numbers_found"]), (1, 1),
+              "不能拿全库最新行情比较旧日报")
+        check("旧报告注明时间回退", r["comparisons"][0]["cutoff_basis"], "legacy_report_date",
+              "旧报告没有输入快照，不能声称精确复原")
+        baseline = r
+        db.add(MarketData(symbol="sh000001", date=datetime(2026, 10, 19), change_pct=9))
+        db.commit()
+        check("新增未来行情不改变历史结果", evaluate("上证指数-1.59%。"), baseline,
+              "未来行情不得污染历史校验")
+        r = evaluate("标普500下跌1.11%。")
+        check("美股使用中国分析时点之前已收盘的交易日", r["matched"], 1,
+              "10/15 18:30中国时间不能使用10/15美股收盘")
+        check("美股实际日期可追溯", r["comparisons"][0]["market_date"][:10], "2026-10-14",
+              "A股与美股不能强制同一自然日")
+        db.add(MarketData(symbol=".INX", date=datetime(2026, 1, 5), close=5000, change_pct=1))
+        db.commit()
+        for hour, available in ((4, False), (5, True)):
+            snapshot = ev._latest_market_map(db, as_of=datetime(2026, 1, 6, hour, 30))
+            check(f"美股冬令时收盘边界 {hour}:30", ".INX" in snapshot, available,
+                  "纽约冬令时16:00对应北京时间次日05:00，不能固定偏移")
+        r = evaluate("上证指数+0.24%。", freshness={"analyzed_at": "2026-10-15T18:30:00"})
+        check("分析时点优先于后来行情", len(r["mismatched"]), 1,
+              "不能用未来行情中相同的值放行历史报告")
+        r = evaluate("上证指数-1.59%。", freshness={"analyzed_at": "2026-10-15T13:00:00"})
+        check("盘中不得用当天收盘日线", (r["status"], r["numbers_found"], r["match_rate"]),
+              ("skipped", 0, None), "日线日期零点不代表收盘数据零点已可用")
+        for raw in ("bad", 4, "2026-10-16T18:30:00"):
+            r = evaluate("上证指数-1.59%。", freshness={"analyzed_at": raw})
+            check(f"坏时点或业务日冲突 {raw!r} 不算通过", (r["status"], r["matched"]),
+                  ("skipped", 0), "无法还原的时点不能静默回退当前时间")
+        r = evaluate("上证指数-1.59%。", freshness={"analyzed_at": "2026-10-15T10:30:00+00:00"})
+        check("带时区时间转中国本地口径", r["matched"], 1, "UTC 10:30 等于北京时间18:30")
+
+        for text in ("上证指数下跌-1.59%。", "上证指数下跌1.59%。", "上证指数−1.59%。",
+                     "上证指数跌幅为1.59%。", "上证指数下跌了1.59%。", "上证指数下跌约 1.59%。"):
+            check(f"负号正确 {text}", evaluate(text)["matched"], 1, "负号不能再次取反")
+        r = evaluate("上证指数上涨-1.59%。")
+        check("符号与文字冲突不下结论", (r["unverifiable"], r["numbers_found"]), (1, 0),
+              "冲突文本不能强行判对或判错")
+        for text in ("上证指数涨跌幅+1.59%。", "上证指数涨跌幅1.59%。",
+                     "上证指数涨跌幅约1.59%。", "上证指数涨跌幅约+1.59%。"):
+            row = db.query(MarketData).filter_by(symbol="sh000001", date=datetime(2026, 10, 15)).one()
+            row.change_pct = 1.59
+            db.commit()
+            check(f"中性涨跌幅字段不反转 {text}", evaluate(text)["matched"], 1,
+                  "涨跌幅字段名不表示下跌方向")
+            row.change_pct = -1.59
+            db.commit()
+        for text in ("深证成指-1.59%。", "未知指标-1.59%。", "上证指数昨日-1.59%。",
+                     "2026-10-14上证指数-1.59%。", "上证指数下跌1.59%（昨日收盘）。",
+                     "上证指数下跌1.59%，为昨日表现。", "上证指数下跌1.59%（10月14日）。"):
+            r = evaluate(text)
+            check(f"缺数据或引用不明确 {text}", (r["status"], r["matched"]), ("skipped", 0),
+                  "缺行情、无主语或其他日期不能靠数值碰巧命中算通过")
+        r = evaluate("上证指数-0.88%。")
+        check("错误数字仍被发现", (len(r["mismatched"]), r.get("flag")),
+              (1, "数字与对应行情不一致，需复核"), "消除误报不能把真实不一致过滤掉")
+        row = db.query(MarketData).filter_by(symbol="sh000001", date=datetime(2026, 10, 15)).one()
+        for missing in (None, float("inf")):
+            row.change_pct = missing
+            db.commit()
+            r = evaluate("上证指数-1.59%。")
+            check(f"缺指标/非有限值 {missing} 不计分母", (r["unverifiable"], r["numbers_found"]),
+                  (1, 0), "没有可比较值就不能判不一致")
+        row.change_pct = -1.59
+        db.commit()
+        report.report_day = date(2026, 10, 14)
+        r = evaluate("上证指数-1.59%。")
+        check("旧补跑日期歧义不推算配置时间", r["status"], "skipped", "当前REPORT_TIME不能冒充历史配置")
+        report.report_day = date(2026, 10, 15)
+        row.date = datetime(2026, 10, 14)
+        db.commit()
+        r = evaluate("上证指数-1.59%。")
+        check("只有旧日线不能验证当日A股", r["numbers_found"], 0, "向后匹配不能放行过期当日数据")
+
+        report.content = json.dumps({"market_summary": "利好未传导，人民币走强；最终防守等待。"})
+        db.commit()
+        r = ev.check_internal_consistency(db)
+        check("词频相反仅要求复核", (r["needs_review"], r["inconsistent"][0]["verdict"], "flag" in r),
+              (True, "needs_review", False), "词频不理解否定和转折，不能确定语义矛盾")
+        check("保留旧字段但说明指标口径", (r["metric_scope"], r["semantic_verdict"]),
+              ("lexical_agreement", "not_determined"), "旧字段名不再代表已确认语义一致率")
+        for text in ("", "市场分化，等待确认。", "上涨与下跌并存。"):
+            report.content = json.dumps({"market_summary": text})
+            db.commit()
+            r = ev.check_internal_consistency(db)
+            check(f"词频方向不明 {text!r} 不算通过", (r["status"], r["checked"], r["consistency_rate"]),
+                  ("skipped", 0, None), "空文本、零命中或多空打平均不计入分母")
+        check("方法版本进入结果", r["method_version"], ev.EVALUATION_METHOD_VERSION,
+              "新旧评估口径不可直接混用")
+    engine.dispose()
+
+
 def _sentinel():
     """确认真实 `_load_reports` 的返回结构与假数据同构。
 
@@ -372,6 +502,7 @@ def _sentinel():
 
 
 def main() -> int:
+    _s5_a2()
     _a3()
     _b2()
     _s8()

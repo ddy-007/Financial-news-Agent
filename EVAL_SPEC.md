@@ -270,23 +270,28 @@
 
 ## S5 `check_internal_consistency(db, limit=90)` → dict
 
-**目的**：首席**自身输出**是否自洽——「说一套、单据一套」。
+**目的**：提供词频倾向与定调相反的人工复核线索，不直接判定正文语义矛盾。
 
-**方法**：用**情感词表**（不调 LLM，零成本）判断 `market_summary` 的措辞倾向，
-与代码算出的 `sentiment` 比对。
+**方法**：用**情感词表**（不调 LLM，零成本）统计 `market_summary` 的词频倾向，
+与代码算出的 `sentiment` 比对。词表不理解否定、转折及局部利好与整体结论的区别。
 
 - 看多词表：`上涨/反弹/利好/机会/走强/回暖/乐观/企稳/向好`
 - 看空词表：`下跌/回调/风险/承压/走弱/悲观/下行/抛售/谨慎`
 
 **计算**：`tone = 看多词数 - 看空词数`，与 `sentiment`（偏多/中性/偏空）方向比对。
 
-**判定**：`consistency_rate < 0.7` → 追加 `"flag":"市场综述措辞与定调不一致"`
+**判定**：方向相反时 `needs_review=true`，记录命中词和 `verdict=needs_review`，不再输出确定矛盾的 `flag`。
+保留 `consistent/consistency_rate/inconsistent` 兼容字段，但口径明确为 `metric_scope=lexical_agreement`；
+`semantic_verdict=not_determined`，不能将词频同向当作语义一致。缺文本、零方向或中性定调计入 `undetermined`，
+不计词频比较分母；全部不可判断时 `status=skipped`、`consistency_rate=null`，不当作通过。
 
 **返回**：
 ```json
-{"check":"internal_consistency","status":"ok","reports_scanned":3,
- "checked":3,"consistent":3,"consistency_rate":1.0,
- "inconsistent":[{"date":"...","sentiment":"偏空","tone":"偏多"}]}
+{"check":"internal_consistency","status":"ok","method_version":"2026-10-18.1",
+ "method":"lexical_heuristic","metric_scope":"lexical_agreement","semantic_verdict":"not_determined",
+ "reports_scanned":3,"checked":2,"consistent":1,"consistency_rate":0.5,"undetermined":1,
+ "needs_review":true,"inconsistent":[{"date":"...","sentiment":"偏空","tone":"偏多",
+ "verdict":"needs_review","evidence_type":"lexical_candidate","bull_hits":["利好"],"bear_hits":[]}]}
 ```
 
 ---
@@ -430,10 +435,12 @@
 
 ## A2 `check_fact_consistency(db, limit=90)` → dict
 
-**目的**：检测首席在 `market_summary` 中编造数字。
+**目的**：检查首席 `market_summary` 中可确认标的、日期及方向的数字与相应日线是否一致。
+数字不一致仅提示复核，不能直接认定编造。
 
 **数字提取**：
-- 涨跌幅型：`(-?\d+(?:\.\d+)?)\s*%`
+- 涨跌幅型：`([+\-−]?\d+(?:\.\d+)?)\s*%`；先尊重显式符号，无符号时才从紧邻涨跌措辞确定方向。
+- `下跌-3.1%` 不重复取反；符号与措辞冲突（如 `上涨-3.1%`）计为不可验证。
 - 点位型：`(\d{3,5}(?:\.\d+)?)\s*点`
 
 **排除项**：`(?:19|20)\d{2}\s*年`（年份）、`第\s*\d+`（序数）、既无 `%` 又无"点"的整数。
@@ -443,14 +450,32 @@
   `上证`→`sh000001`｜`深证|成指`→`sz399001`｜`创业板`→`sz399006`｜
   `沪深300`→`sh000300`｜`标普`→`.INX`｜`纳斯达克`→`.IXIC`｜`道琼斯`→`.DJI`
 - **解析成功** → **只与该标的比对**（消除"7 次机会"的宽松问题）
-- **解析失败** → 与全部标的比对，命中即算，但标记 `"subject_unspecified": true`
+- **解析失败** → 计入 `unspecified_subject` 和 `unverifiable`，不尝试其他标的碰巧命中。
 
 **容差**：
 - 涨跌幅 ±0.15 个百分点；数字附近 5 字内含「约/近/左右/超过/逾/超」→ 放宽至 ±0.5
 - 点位 ±2.0
-- 同日 `market_data` 取 `date <= report.date` 的最近一条
+- 优先取报告持久化的 `content.data_freshness.analyzed_at`，统一为中国本地时间；旧报告回退 `date`，
+  标注 `cutoff_basis=legacy_report_date`。无效时点或与 `report_day` 冲突时不可验证，不使用当前配置推算旧时点。
+- 按标的取截止时点之前已收盘的最近日线，A股按15:00、中国时区，美股按纽约16:00转换（含夏令时）。
+  提前收盘日保守延后到常规收盘时点；这只是日线可用时间近似，**不能证明源站数据当时已入库**。
+- A股缺分析日的收盘数据、行情超过7天、缺对应字段、非有限值均不可验证。
+  美股按实际最近已收盘交易日独立选择，结果记录 `market_date`。
+- 数字所在句明确指向昨日/其他日期时，暂记不可验证，不将其强配到分析日快照。
 
-**判定**：`match_rate < 0.9` → 追加 `"flag":"存在编造数字风险"`。
+**判定**：仅可校验的数字进入 `numbers_found`；`match_rate = matched / numbers_found`。
+低于0.9时提示 `"flag":"数字与对应行情不一致，需复核"`。
+没有可校验数字时 `status=skipped`、`match_rate=null`；缺失或含糊信息不算通过。
+结果带 `comparisons`（最多20条）、`mismatched`（最多10条）与 `unverifiable_samples`（最多10条），
+记录截止时点、时间依据、实际行情日期及原因。`availability_scope=session_close_approximation_not_input_snapshot`。
+
+**版本与归档**：S5/A2 结果均带 `method_version=2026-10-18.1`；旧 `eval_log.jsonl` 保留，后续仍按原流程追加。
+本次不重写历史日报与评估日志，不改变风险官、首席、prompt、回测或模型配置。
+不同版本的比率/分母口径不能直接合并比较。
+
+**聚类诊断口径**：候选连通簇与最终完整链接分组分别记录；链式候选及成功拆分为INFO。
+最终两两相似度按实际 `threshold` 检查，失效或非有限值时WARNING并拒绝该组合并、退回逐条；
+超规模候选的独立WARNING保留。正常输入分组与原算法一致。
 
 > 已知覆盖局限：点位型正则要求 `\s*点`，而当前综述写作「至3888.111」（无"点"字），
 > 故点位检查基本不触发。**不为此放宽正则**（放宽会引入误判）。
