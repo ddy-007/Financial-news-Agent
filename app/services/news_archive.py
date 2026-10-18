@@ -28,6 +28,8 @@ def item_key(item: NewsItem) -> str:
 
 def decode_item(payload: str) -> NewsItem:
     data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("归档原文必须为JSON对象")
     data["publish_time"] = datetime.fromisoformat(data["publish_time"]) if data.get("publish_time") else None
     return NewsItem(**data)
 

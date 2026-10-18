@@ -45,6 +45,14 @@ def init_news_ingest_schema(bind) -> None:
         for column in ("fetched_ts", "fetched_at"):
             if column not in columns:
                 conn.execute(text(f"ALTER TABLE collector_state ADD COLUMN {column} DATETIME"))
+        if inspect(conn).has_table("news"):
+            news_columns = {c["name"] for c in inspect(conn).get_columns("news")}
+            if "dedup_policy" not in news_columns:
+                conn.execute(text("ALTER TABLE news ADD COLUMN dedup_policy VARCHAR(32)"))
+    # create_all 不会为已有表补建新索引；CLI 的专用迁移也必须覆盖此项。
+    for index in RawNews.__table__.indexes:
+        if index.name == "ix_raw_news_news_id":
+            index.create(bind=bind, checkfirst=True)
 
 
 def _migrate() -> None:

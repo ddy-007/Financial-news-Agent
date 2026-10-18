@@ -155,6 +155,11 @@ frontend/
 健康接口额外返回每源 `pending_count` / `open_gap_count`；报告按取数时的窗口保存覆盖提示。
 本轮内语义去重采用完整链接约束，每个自动合并组两两相似度均须达到 0.85。
 
+跨轮也检查目标的完整原文成员：同轮新接纳成员立即参与后续检查；原文不全的旧记录不自动认证，
+超限、成员不一致或向量故障时保守地转为独立分类。确切URL身份更新保留；历史数据不重写。
+迁移新增可空 `news.dedup_policy` 和 `raw_news.news_id` 索引，旧值保持未知。
+低于0.85不再调用单条灰区复核绕过约束；因此重复新闻和分类条数可能增加，费用需按实际轮次观察。
+
 先生成指定区间的本地预览（联网抓取、只读业务库，不调用模型）：
 
 ```powershell
@@ -202,6 +207,10 @@ CLI 更新共享的持久化向量索引并重建本进程 BM25。常驻后端�
 JSON 候选会明确失败，不由程序猜选。前端主风险清单完整保留，风险官抽屉避免重复展示。
 
 离线回归：`.venv/Scripts/python.exe -B scripts/check_document_bugfix_contracts.py`。
+
+分析师非法分数（如NaN、Infinity）在截断前拒收并切备用，全部失败则按专家缺席处理；
+不会把无效分数变成满分看多。对应离线回归：
+`.venv/Scripts/python.exe -B scripts/check_semantic_guard_contracts.py`。
 
 ## 免责声明
 

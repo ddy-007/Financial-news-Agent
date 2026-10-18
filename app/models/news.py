@@ -26,6 +26,8 @@ class News(Base):
     category: Mapped[str | None] = mapped_column(String(50), index=True, nullable=True)
     market: Mapped[str | None] = mapped_column(String(20), index=True, nullable=True)
     themes: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON 数组
+    # 新策略下原文成员可完整检查。旧记录默认未知，禁止据此猜测历史覆盖完整。
+    dedup_policy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # 多源佐证（专家研判不据此加权，但 `assess_info_level` 的信号②用它）。
     # ⚠️ 口径 = **去重后的源数**（不是「(源, url) 对数」）—— 2026-09-22 修正：
     # 原先数来源对，导致同一家挂两个 url 就成了「2源」（实测库里 332 行如此）。

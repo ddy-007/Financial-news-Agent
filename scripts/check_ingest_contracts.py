@@ -52,6 +52,8 @@ import app.agent.data_agent as DA  # noqa: E402
 from app.collectors.news_collector import NewsItem  # noqa: E402
 from app.models.base import Base  # noqa: E402
 from app.models.news import News  # noqa: E402
+from app.models.news_ingest import RawNews  # noqa: E402
+from app.services.semantic_merge import PAIRWISE_POLICY  # noqa: E402
 
 _RESULTS: list[tuple[bool, str]] = []
 
@@ -216,8 +218,14 @@ def item(title, content="", source="新浪财经", url=None, pt=None) -> NewsIte
 def add_news(db, title, content, source="新浪财经", pt=None, url=None) -> News:
     n = News(title=title, content=content, source=source, url=url,
              publish_time=pt or datetime.now(), source_count=1,
-             source_urls="[]")
+             source_urls="[]", dedup_policy=PAIRWISE_POLICY)
     db.add(n)
+    db.commit()
+    # 这些用例的“已有记录”有完整可验证原文；未知历史记录另由恢复契约验证拒绝准入。
+    original = NewsItem(title=title, content=content, source=source, url=url, publish_time=n.publish_time)
+    DA.archive_items(db, [original])
+    raw = db.get(RawNews, DA.item_key(original))
+    raw.news_id, raw.status = n.id, "processed"
     db.commit()
     return n
 
@@ -749,10 +757,10 @@ def _p2_p3_failopen():
                  classify_news=classify, _llm_is_duplicate=lambda *a: None,
                  _rebuild_bm25=lambda *a, **k: None, _upsert_index=lambda *a, **k: None):
         res = DA.run_data_agent(db, raw=[item("灰区事件", "灰区正文", pt=now)])
-    check("灰区 LLM 失败 → fail-open：按新条目入库", res["new"], 1,
+    check("灰区未达到完整成员阈值 → 按新条目入库", res["new"], 1,
           "宁可多一条重复，也不要把真新闻当重复吞掉 —— 后者不可逆")
-    check("灰区 LLM 失败 → 被如实计数", res["gray_check_failed"], 1,
-          "改动前这里是裸的 except: return False，连日志都没有")
+    check("灰区直接分类 → 没有额外判重调用失败", res["gray_check_failed"], 0,
+          "不支付无法绕过直径约束的判重调用费用")
 
     # ⚠️ 上面测的是**调用方**怎么处理 None —— 但 `_llm_is_duplicate` 是被 stub 掉的，
     # 所以「真函数到底会不会返回 None」根本没被测到。变异测试正是从这个缝里钻过去的。
@@ -837,6 +845,7 @@ def _duplicate_merge_target():
     vec = unit(1, 0)
     register("同事件A", "长" * 80, unit(1, 0.5))
     register("同事件B", "长" * 90, unit(1, -0.5))
+    register("同一事件", "短", vec)
 
     # ① `_upsert_index` 自己对重复 id 兜底
     db = fresh_db()
@@ -868,8 +877,10 @@ def _duplicate_merge_target():
                  _upsert_index=lambda rows: indexed.append([r.id for r in rows])):
         res = DA.run_data_agent(db, raw=[item("同事件A", "长" * 80, pt=now),
                                          item("同事件B", "长" * 90, pt=now)])
-    check("两个候选并进同一行 → upsert 列表里该 id 只出现一次", indexed, [[old.id]])
-    check("两个候选并进同一行 → merged = 2", res["merged"], 2)
+    check("共享目标链式反例 → 旧目标与独立新增均只索引一次",
+          len(indexed) == 1 and len(indexed[0]) == 2
+          and len(set(indexed[0])) == 2 and indexed[0].count(old.id) == 1, True)
+    check("彼此不像的候选不得同时并入目标", (res["merged"], res["new"]), (1, 1))
 
 
 class _Sink:

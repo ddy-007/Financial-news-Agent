@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from loguru import logger
 
 from app.agent.schemas import ExpertOpinion, RiskOpinion
@@ -26,10 +28,17 @@ def _as_list(v) -> list[str]:
 
 
 def _clamp(v, lo=-1.0, hi=1.0) -> float:
+    if v is None:
+        return 0.0  # 保留既有缺失分数默认值，显式非法值不得冒充中性或满分。
+    if isinstance(v, bool):
+        raise ValueError("分析师 score 不能为布尔值")
     try:
-        return max(lo, min(hi, float(v)))
-    except (TypeError, ValueError):
-        return 0.0
+        score = float(v)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("分析师 score 不是有效数值") from exc
+    if not math.isfinite(score):
+        raise ValueError("分析师 score 必须为有限数值")
+    return max(lo, min(hi, score))
 
 
 # 「单个分析师」层级的中性带边界，与 `_JSON_SPEC` 锚点里的 ±0.15 一致。

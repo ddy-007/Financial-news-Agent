@@ -20,7 +20,8 @@ from app.services.news_archive import (
 def known_urls(db: Session) -> dict[str, str]:
     """包含已合并来源链接，不能只检查 News.url。"""
     out = {}
-    for row in db.query(News).all():
+    # 只读预览须兼容尚未补dedup_policy列的旧库，不能ORM全列加载。
+    for row in db.query(News.id, News.url, News.source_urls).all():
         if row.url:
             out[row.url] = row.id
         for pair in json.loads(row.source_urls or "[]"):

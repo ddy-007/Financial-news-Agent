@@ -33,6 +33,7 @@ from app.collectors.news_collector import NewsItem, collect_all_news
 from app.models.news import News
 from app.models.news_ingest import RawNews
 from app.services.news_archive import acknowledge, archive_items, item_key
+from app.services.semantic_merge import PAIRWISE_POLICY, SemanticMergeGuard
 from app.retry import call_with_retry, is_retryable
 from app.rag import vector_store
 from app.rag.embeddings import embed_documents
@@ -1010,6 +1011,21 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     logger.info(f"[去重] 确定性去重：{len(raw)} 条 → {len(cands)} 个候选")
     _t_embed = time.time()
     vecs = _embed_candidates(cands)
+    guard = SemanticMergeGuard(db, embed_documents,
+        {cand.text: vec for cand, vec in zip(cands, vecs)}, threshold=DUP_THRESHOLD,
+        max_size=MAX_CLUSTER_SIZE, window_hours=DEDUP_WINDOW_HOURS)
+    # 指纹只比较正文前缀，不能据此认证所有完整原文都符合语义直径。
+    expanded = []
+    for cand in cands:
+        if len(cand.members) > 1 and not guard.consistent(cand.members):
+            expanded.extend(Candidate(item=it, sources=[(it.source, it.url)], members=[it])
+                            for it in cand.members)
+        else:
+            expanded.append(cand)
+    if len(expanded) != len(cands):
+        cands = expanded
+        vecs = _embed_candidates(cands)
+        guard.vectors.update({cand.text: vec for cand, vec in zip(cands, vecs)})
     if len(vecs) != len(cands):
         logger.warning(
             f"[去重] 嵌入返回 {len(vecs)} 条，与候选数 {len(cands)} 不一致 —— "
@@ -1022,7 +1038,8 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     for group in clusters:
         known = [i for i in group if cands[i].item.publish_time is not None]
         if known:
-            bounded_clusters.append(known)
+            members = [it for i in known for it in (cands[i].members or [cands[i].item])]
+            bounded_clusters.extend([known] if guard.consistent(members) else [[i] for i in known])
         bounded_clusters.extend([i] for i in group if cands[i].item.publish_time is None)
     clusters = bounded_clusters
     within_round = 0
@@ -1040,28 +1057,26 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
     matches = _nearest_existing(db, cands, vecs)
 
     to_merge: list[tuple[News, Candidate]] = list(url_matches)
+    for row, cand in url_matches:
+        guard.identity_update(row, cand.members or [cand.item])
     to_classify: list[Candidate] = []
     gray_failed = 0
     gray_calls = 0
     gray_secs = 0.0
     gray_merged = 0
-    for cand, m in zip(cands, matches):
-        if m is None or m[1] < GRAY_LOW:
+    # 同目标先接纳最相似候选，同分按原文身份稳定排序；接纳后即时更新成员集合。
+    ordered = sorted(zip(cands, matches), key=lambda pair: (
+        -(pair[1][1] if pair[1] else -1), item_key(pair[0].item)))
+    for cand, m in ordered:
+        if m is None or m[1] < DUP_THRESHOLD:
             to_classify.append(cand)
-        elif m[1] >= DUP_THRESHOLD:
-            to_merge.append((m[0], cand))      # 高置信重复：**不过 LLM**
+        elif guard.admit(m[0], cand.members or [cand.item]):
+            to_merge.append((m[0], cand))
         else:
-            gray_calls += 1
-            _t_gray = time.time()
-            verdict = _llm_is_duplicate(m[0], cand)  # 灰区
-            gray_secs += time.time() - _t_gray
-            if verdict is None:
-                gray_failed += 1
-            if verdict:
-                gray_merged += 1
-                to_merge.append((m[0], cand))
-            else:
-                to_classify.append(cand)
+            to_classify.append(cand)
+    logger.info(f"[去重] 跨轮成员准入拒绝 {guard.rejected} 个候选；低于自动阈值直接独立分类")
+    waiting = {id(c) for c in to_classify}
+    to_classify = [c for c in cands if id(c) in waiting]
 
     # L3：真实省下的分类量 = 「不去重会分类的量」−「实际分类的量」。
     # 三段贡献相加恰好等于它（2026-09-23 那轮实测：52 + 727 + 106 = 885）。
@@ -1128,6 +1143,7 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
         url = next((u for _, u in _dedup_sources(cand.sources) if u), None)
         existing = by_url.get(url)
         if existing is not None:
+            guard.identity_update(existing, cand.members or [cand.item])
             updated = _merge_into(db, existing, cand)
             if updated and existing.id is not None:
                 changed[existing.id] = existing
@@ -1136,8 +1152,12 @@ def run_data_agent(db: Session, raw: list[NewsItem] | None = None) -> dict:
             record(cand, existing.id)
             continue
         news = _insert_new(db, cand, r)
+        if guard.consistent(cand.members or [cand.item]):
+            news.dedup_policy = PAIRWISE_POLICY
         new_news.append(news)
         db.flush()
+        if news.dedup_policy == PAIRWISE_POLICY:
+            guard.targets[news.id] = guard.unique(cand.members or [cand.item])
         record(cand, news.id)
         if url:
             by_url[url] = news  # 同一事务尚未提交的新增记录也参与去重。

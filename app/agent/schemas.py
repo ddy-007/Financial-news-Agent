@@ -9,7 +9,7 @@ class ExpertOpinion(BaseModel):
 
     expert: str = ""                                     # 宏观/行业/资金面/技术面
     stance: Literal["看多", "中性", "看空"] = "中性"
-    score: float = 0.0                                   # -1(极空) ~ 1(极多)
+    score: float = Field(default=0.0, allow_inf_nan=False) # -1(极空) ~ 1(极多)
     confidence: Literal["high", "medium", "low"] = "medium"
     key_points: list[str] = Field(default_factory=list)   # 核心论据
     evidence: list[str] = Field(default_factory=list)     # 引用的新闻标题/数据点

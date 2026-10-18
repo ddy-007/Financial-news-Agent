@@ -58,6 +58,7 @@ def classified(items):
 def fake_pipeline(*, classifier=classified, vectors=None, index=None):
     with ExitStack() as stack:
         stack.enter_context(patch.object(DA, "classify_news", side_effect=classifier))
+        stack.enter_context(patch.object(DA, "embed_documents", side_effect=lambda texts: [[1.0] for _ in texts]))
         stack.enter_context(patch.object(DA, "_embed_candidates", side_effect=lambda c:
             np.eye(len(c), dtype=np.float32) if vectors is None else vectors[:len(c)]))
         stack.enter_context(patch.object(DA, "_nearest_existing", side_effect=lambda db, c, v: [None] * len(c)))

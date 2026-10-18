@@ -16,7 +16,7 @@ class RawNews(Base):
     publish_time: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     payload: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
-    news_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    news_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
