@@ -106,6 +106,17 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
         st.write(c["raw"])
         return
 
+    if c.get("is_passed") is False:
+        st.error(
+            f"🛑 **审计未通过**（状态：{c.get('critic_status', '未完成')}，"
+            f"已修正 {c.get('retry_count', 0)} 次）。本报告含未核验内容，请勿据此直接决策。"
+        )
+        if c.get("critic_feedback"):
+            with st.expander("查看审计批注"):
+                st.write(c["critic_feedback"])
+    elif c.get("is_passed") is True:
+        st.caption(f"Critic 审计通过 · 修正 {c.get('retry_count', 0)} 次（模型核验结果）")
+
     # 数据时效：基于陈旧数据时必须明示，不能冒充"今日研判"
     fr = c.get("data_freshness") or {}
     if fr.get("coverage_incomplete"):

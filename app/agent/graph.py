@@ -1,10 +1,11 @@
 """分析研判 Agent：LangGraph 多专家编排。
 
 流程：
-    prepare → [宏观|行业|资金面|技术面 四路并行] → 风险官(需看到分析师结论) → aggregate → 首席 → 报告
+    prepare → analyst → [宏观|行业|资金面|技术面] → 风险官 → aggregate → 首席 → critic
+    critic 驳回 → analyst（最多两次修正）；通过/修正用尽/无法审计 → END
 
 设计说明：
-- 4 位分析师**并行且互不可见**，保证观点独立
+- 4 位分析师并行，初稿互不可见；修正轮共享审计批注
 - 风险官在分析师之后运行（它的价值在于**反驳具体观点**，必须看到结论）
 - 定量结论（加权分/分歧度/置信度）由代码计算；LLM 只撰写叙述性内容
 """
@@ -17,9 +18,11 @@ from datetime import date, datetime, time, timedelta
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Overwrite
 from loguru import logger
 from sqlalchemy.orm import Session
 
+from app.agent.critic import load_news_evidence, run_critic
 from app.agent.experts import (
     _as_list,
     run_capital_expert,
@@ -76,6 +79,10 @@ class AnalystState(TypedDict, total=False):
     risk_opinion: dict
     quant: dict
     final: dict
+    is_passed: bool
+    critic_feedback: str
+    retry_count: int
+    critic_status: str
 
 
 # ================= 数据准备 =================
@@ -323,6 +330,8 @@ def prepare_node(state: AnalystState) -> dict:
 
         # 运行环境：交易日历降级（会按「工作日」猜测，节假日可能误判）
         env = {"calendar_degraded": _calendar_degraded()}
+        # 使用同一截止时点、同一批全文贯穿所有修正轮，避免循环时证据漂移。
+        news_fulltext, evidence_issues = load_news_evidence(db, used + all_news, analyzed_at)
     finally:
         db.close()
 
@@ -336,6 +345,8 @@ def prepare_node(state: AnalystState) -> dict:
         "market_snapshot": a_share,
         "us_market": us,
         "indicators": indicators,
+        "news_fulltext": news_fulltext,
+        "evidence_issues": evidence_issues,
     }
     stale_note = (
         f"；⚠️ 数据陈旧（最新新闻 {data_freshness['newest_news_date']}）"
@@ -366,10 +377,26 @@ def prepare_node(state: AnalystState) -> dict:
            if data_freshness.get("collecting") else "")
     )
     return {"ctx": ctx, "info_level": info_level,
-            "data_freshness": data_freshness, "env": env}
+            "data_freshness": data_freshness, "env": env,
+            "is_passed": False, "critic_feedback": "", "retry_count": 0,
+            "critic_status": "pending"}
 
 
 # ================= 专家节点 =================
+def analyst_node(state: AnalystState) -> dict:
+    """开始一轮完整分析，清空 reducer，防止上轮观点及失败记录重复累加。"""
+    ctx = dict(state.get("ctx", {}))
+    ctx["critic_feedback"] = state.get("critic_feedback", "")
+    retries = state.get("retry_count", 0)
+    if state.get("critic_status") == "rejected":
+        retries += 1
+    return {
+        "ctx": ctx, "opinions": Overwrite([]), "failed": Overwrite([]),
+        "retryable_failures": Overwrite([]), "risk_opinion": {}, "quant": {}, "final": {},
+        "retry_count": retries, "is_passed": False, "critic_status": "pending",
+    }
+
+
 def _expert_node(name: str, fn) -> callable:
     """构造一个专家节点（失败时降级跳过，不中断整个流程）。"""
 
@@ -529,11 +556,60 @@ def chief_node(state: AnalystState) -> dict:
                 "degraded": True,
             }
 
-    return {"final": {
+    final = {
         **narrative, **quant,
         "expert_opinions": [o.model_dump() for o in opinions],
         "risk_opinion": risk.model_dump(),
-    }}
+    }
+    # 修补也必须发生在审计之前，否则落库正文与通过审核的正文不一致。
+    if opinions and (_is_blank(final.get("market_summary"))
+                     or _is_placeholder_summary(final.get("market_summary"))):
+        final["market_summary"] = _summary_from_experts(final)
+        if _is_blank(final.get("title")) or _is_placeholder_title(final.get("title")):
+            final["title"] = "研判降级：首席综述缺失"
+        final.update(degraded=True, degraded_reason="chief_summary_missing")
+    return {"final": final}
+
+
+def critic_node(state: AnalystState) -> dict:
+    """严格审计整个报告；故障、缺少全文和重试耗尽均不得伪装成通过。"""
+    ctx = state.get("ctx", {})
+    final = dict(state.get("final", {}))
+    flaws: list[str] = []
+    passed = False
+    if not state.get("opinions"):
+        status, feedback = "skipped", "分析师未产出底稿，未完成审计。"
+    elif ctx.get("evidence_issues") or not ctx.get("news_fulltext"):
+        status = "incomplete_sources"
+        flaws = list(ctx.get("evidence_issues") or ["缺少归档新闻全文"])
+        feedback = "全文证据不完整，不能判定通过：\n" + "\n".join(flaws)
+    else:
+        try:
+            verdict = run_critic(get_llm(temperature=0.0, part="expert"), ctx, final)
+            passed = verdict.is_passed
+            status = "passed" if passed else "rejected"
+            flaws = verdict.flaws
+            feedback = "" if passed else "\n".join([
+                *flaws, "修订指令：" + verdict.revision_instructions,
+            ])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[Critic] 审计异常，禁止默认通过：{type(exc).__name__}")
+            status, feedback = "error", f"审计调用或结构校验失败（{type(exc).__name__}），本报告未通过核验。"
+    retries = state.get("retry_count", 0)
+    final.update(is_passed=passed, critic_status=status, critic_feedback=feedback,
+                 critic_flaws=flaws, retry_count=retries)
+    if not passed:
+        final["degraded"] = True
+    logger.info(f"[Critic] 状态={status} 修正次数={retries}/2 缺陷数={len(flaws)}")
+    return {"final": final, "is_passed": passed, "critic_status": status,
+            "critic_feedback": feedback}
+
+
+def route_after_critic(state: AnalystState) -> str:
+    if state.get("is_passed") or state.get("retry_count", 0) >= 2:
+        return END
+    # 原文不足/模型故障无法靠反复改稿解决，不额外浪费整轮分析请求。
+    return "analyst" if state.get("critic_status") == "rejected" else END
 
 
 # ================= 降级：单次生成 =================
@@ -602,6 +678,7 @@ def _fallback_report(db: Session, as_of: datetime | None = None) -> dict:
 def build_graph():
     g = StateGraph(AnalystState)
     g.add_node("prepare", prepare_node)
+    g.add_node("analyst", analyst_node)
     g.add_node("macro", _expert_node("宏观", run_macro_expert))
     g.add_node("industry", _expert_node("行业", run_industry_expert))
     g.add_node("capital", _expert_node("资金面", run_capital_expert))
@@ -609,15 +686,18 @@ def build_graph():
     g.add_node("risk", risk_node)
     g.add_node("aggregate", aggregate_node)
     g.add_node("chief", chief_node)
+    g.add_node("critic", critic_node)
 
     g.add_edge(START, "prepare")
+    g.add_edge("prepare", "analyst")
     # 四路并行 fan-out
     for n in ("macro", "industry", "capital", "technical"):
-        g.add_edge("prepare", n)
-        g.add_edge(n, "risk")      # fan-in 到风险官
+        g.add_edge("analyst", n)
+    g.add_edge(["macro", "industry", "capital", "technical"], "risk")
     g.add_edge("risk", "aggregate")
     g.add_edge("aggregate", "chief")
-    g.add_edge("chief", END)
+    g.add_edge("chief", "critic")
+    g.add_conditional_edges("critic", route_after_critic, {"analyst": "analyst", END: END})
     return g.compile()
 
 
@@ -960,7 +1040,9 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
     # 首席失败分支会填「（首席汇总失败）」这类**非空占位文案**，
     # 它同样不该被当成"有综述"（2026-10-23 审查发现 M3）。
     _summary_is_placeholder = _is_placeholder_summary(final.get("market_summary"))
+    _report_changed_after_graph = False
     if _has_opinions and not _all_experts_gone and (_summary_blank or _summary_is_placeholder):
+        _report_changed_after_graph = True
         logger.warning(
             "首席未产出有效 market_summary（%s）—— 仅补摘要，保留 %d 位专家观点与量化结果"
             "（score=%s, risk_veto=%s）"
@@ -978,6 +1060,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         final["degraded"] = True
         final["degraded_reason"] = "chief_summary_missing"
     elif _summary_blank or _summary_is_placeholder or _all_experts_gone:
+        _report_changed_after_graph = True
         # ⚠️ 兜底**必须先留档再替换**（2026-10-22 复审发现 M2）：
         # `_fallback_report` 返回的是全新 dict，`final` 被整体替换后，
         # `failed_experts` / `info_level` / `data_freshness` / `degraded`
@@ -1053,6 +1136,13 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
             # 所以只沿用**非占位**的标题。
             final["title"] = (_prev_title if _prev_title and not _is_placeholder_title(_prev_title)
                               else "研判降级：单次生成")
+
+    if _report_changed_after_graph:
+        # 图外兜底会重写正文并合并旧风险，不能继承此前某个版本的审核结论。
+        final.update(
+            is_passed=False, critic_status="not_reviewed", retry_count=0, critic_flaws=[],
+            critic_feedback="图外补写或单次生成兜底已改变正文，当前版本未经过全文审计。",
+        )
 
     opinions = final.get("expert_opinions", [])
 

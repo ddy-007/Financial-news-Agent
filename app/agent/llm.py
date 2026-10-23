@@ -383,6 +383,19 @@ def with_output_parser(llm, parser: Callable):
     return runnable | RunnableLambda(parser)
 
 
+def with_structured_output(llm, schema):
+    """在每级主备客户端内部约束结构，保留回调、冷却与异常策略。"""
+    if isinstance(llm, RunnableBinding):
+        return llm.model_copy(update={"bound": with_structured_output(llm.bound, schema)})
+    if isinstance(llm, RunnableWithFallbacks):
+        return llm.model_copy(update={
+            "runnable": with_structured_output(llm.runnable, schema),
+            "fallbacks": [with_structured_output(fallback, schema) for fallback in llm.fallbacks],
+        })
+    # function_calling 兼容现有 OpenAI 协议服务；None/拒答同样触发校验和备用。
+    return llm.with_structured_output(schema, method="function_calling") | RunnableLambda(schema.model_validate)
+
+
 def get_llm(temperature: float = 0.0, *, part: str,
             output_parser: Callable | None = None):
     """取某个分组的 LLM 客户端。

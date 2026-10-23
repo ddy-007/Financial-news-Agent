@@ -1,7 +1,28 @@
 """多专家分析的数据契约。"""
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class CriticVerdict(BaseModel):
+    """审计必须明确表态；矛盾或空白的驳回结果不能被当作通过。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    is_passed: bool = Field(description="所有事实与数据均有精确依据且未遗漏下行风险才为 true")
+    flaws: list[str] = Field(description="具体数据出入、遗漏风险或无依据结论；通过时为空")
+    revision_instructions: str = Field(description="要求分析师针对性删改的指令；通过时为空")
+
+    @model_validator(mode="after")
+    def coherent_verdict(self):
+        if self.is_passed and (self.flaws or self.revision_instructions.strip()):
+            raise ValueError("审核通过时不能同时存在缺陷或修订指令")
+        if not self.is_passed and (
+            not self.flaws or any(not flaw.strip() for flaw in self.flaws)
+            or not self.revision_instructions.strip()
+        ):
+            raise ValueError("审核驳回必须提供具体缺陷及修订指令")
+        return self
 
 
 class ExpertOpinion(BaseModel):
