@@ -1,4 +1,6 @@
 """FastAPI 入口：注册路由、初始化数据库、启动调度器。"""
+import logging
+import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,6 +24,90 @@ from app.db import init_db
 _LOG_SINK_ADDED = False
 
 
+class _InterceptHandler(logging.Handler):
+    """把**标准库 logging** 的记录转发给 loguru。
+
+    **为什么必须有**（2026-10-22 实测）：APScheduler 全程用 stdlib logging
+    （`apscheduler.executors.base` 打「Run time of job ... was missed by ...」、
+    `apscheduler.scheduler` 打「Job ... raised an exception」）。而本项目只给
+    loguru 挂了文件 sink，**没有这条桥** —— 于是这些消息在 root logger 上
+    无人接收，只剩 `logging.lastResort` 写到 stderr。后果：
+
+  · 2026-10-21 18:30 那次研判 misfire（迟到 2.04 秒被丢弃、当天没有日报），
+    关键证据只出现在用户的控制台窗口里，`logs/app.log` 一片空白 ——
+    事后翻日志只能看到「18:01 采集完成 → 18:53 重启」，中间完全查不出原因。
+
+    ⚠️ 这也解释了排查时的困境：**日志里没有痕迹，不等于没有发生**。
+
+    实现照抄 loguru 官方文档的 InterceptHandler，`depth` 用 6 是为了让
+    `{name}:{function}:{line}` 指向**真正的调用点**而不是本文件。
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level: str | int = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        # **找出真正的调用帧**，别用固定 depth（2026-10-23 审查发现 L1）。
+        #
+        # 固定 `depth=6` 对 `logging.warning/error/info` 恰好正确，但
+        # `logger.exception()` 内部先转调 `Logger.error`（多一层栈帧），
+        # 于是溯源会错到 `logging:exception:1524` —— 而 APScheduler 报
+        # 「Job raised an exception」用的正是 `logger.exception()`。
+        #
+        # ⚠️ 实测调用链（从 emit 往外，`is_logging_file` 表示该帧在 logging 包里）：
+        #   0 emit(self, 本文件, False)   ← **起点是 False**
+        #   1 handle        (True)
+        #   2 callHandlers  (True)
+        #   3 handle        (True)
+        #   4 _log          (True)
+        #   5 warning       (True)
+        #   6 real_caller   (False)       ← 真正想要的
+        #
+        # 所以**不能**用「从 currentframe 开始，遇到非 logging 帧就停」——
+        # 第 0 帧就是非 logging 帧，会立刻停住、得到 logging:callHandlers。
+        # 正确做法：先跳过**起点自身**（emit），再从下一个帧开始找
+        # 「第一个不在 logging 包内的帧」。
+        depth = 2
+        frame = logging.currentframe().f_back   # 跳过 emit 自身
+        while frame is not None:
+            if frame.f_code.co_filename != logging.__file__:
+                break
+            frame = frame.f_back
+            depth += 1
+        # 把异常信息一并带过去，否则 `logger.exception` 的内容会丢
+        logger.opt(depth=depth, exception=record.exc_info).log(
+            level, record.getMessage()
+        )
+
+
+def _bridge_stdlib_logging() -> None:
+    """把 stdlib logging 接到 loguru。**幂等**（可被 lifespan 反复调用）。
+
+    只为第三方库（APScheduler / uvicorn / httpx）服务 —— 本项目自己的代码
+    一律用 loguru。级别定在 WARNING：stdlib 的 INFO 大多是噪音
+    （uvicorn 的访问日志本项目已有自己的写法）。
+    """
+    root = logging.getLogger()
+    if any(isinstance(h, _InterceptHandler) for h in root.handlers):
+        return
+    logging.basicConfig(handlers=[_InterceptHandler()], level=logging.WARNING,
+                        force=True)
+    # APScheduler 与 uvicorn 都有自己的 logger，且 `propagate=False` 的话
+    # 上面那条 basicConfig 管不到它们，要逐个接。
+    for name in ("apscheduler", "uvicorn.error", "uvicorn.access"):
+        lg = logging.getLogger(name)
+        lg.handlers = [_InterceptHandler()]
+        lg.propagate = False
+        # ⚠️ **必须显式设 level**（2026-10-23 审查发现 M2）。
+        # uvicorn 自己的 `dictConfig` 把 `uvicorn.access` 设成 INFO(20)，
+        # 而本函数 docstring 说的是「级别定在 WARNING，访问日志是噪音」。
+        # 只换 handler 不降 level 的话，每条 HTTP 访问日志都会灌进 app.log
+        #（实测已累积 14 条 `GET /api/v1/health 200`），把 10MB 轮转撑快，
+        # 也会淹没真正有用的告警。
+        lg.setLevel(logging.WARNING)
+
+
 def _setup_file_logging() -> None:
     """把日志同时写一份到 `logs/app.log`。**幂等**。
 
@@ -36,9 +122,39 @@ def _setup_file_logging() -> None:
     global _LOG_SINK_ADDED
     if _LOG_SINK_ADDED:
         return
+    # 默认 stderr sink 也会展开变量；仅替换它，保留调用方的其他处理器。
+    # 默认 sink 被禁用时不重建。
+    try:
+        logger.remove(0)
+    except ValueError:
+        pass
+    else:
+        logger.add(sys.stderr, diagnose=False, backtrace=True)
     Path("logs").mkdir(exist_ok=True)
+    # ⚠️ **`diagnose=False` 不能省**（2026-10-23 审查发现，S1）。
+    #
+    # loguru 的 `diagnose` 默认是 **True**，它会把异常发生处**每一帧的局部变量**
+    # 展开成 `│ └ 值` 写进 sink。而本项目这轮改动新增了
+    # `_job_report` 的 `logger.opt(exception=True).error(...)` + stdlib→loguru 桥，
+    # 使 LLM 调用的 traceback **第一次真正落盘** —— 于是：
+    #
+    #   `_make_client(api_key="sk-...", base_url=...)` 在任何构造/调用失败时，
+    #   它的 `api_key` 形参会被完整展开写进 logs/app.log。
+    #
+    # 实测（2026-10-23，脱敏）：日志里出现
+    #   `{'model': ..., 'api_key': 'sk-***', 'base_url': ...}`
+    # 同一机制还让 `check_collector_contracts.py` 那条「失败日志不展开 SQL 参数」
+    # 的契约失效（新闻正文会被展开）。
+    #
+    # `backtrace` 保留 True：它只展开**调用链**（函数名/行号），不含变量值，
+    # 对排查有用且安全。
     logger.add("logs/app.log", rotation="10 MB", retention="14 days",
-               encoding="utf-8", enqueue=True)
+               encoding="utf-8", enqueue=True,
+               diagnose=False,   # 关键：不展开局部变量，防明文密钥/新闻正文入盘
+               backtrace=True)   # 保留完整调用链，只有函数名与行号
+    # 顺序不能反：**先**挂文件 sink，**再**架 stdlib 桥 ——
+    # 否则桥转发过来的第一批日志会落在没有文件 sink 的 loguru 上，仍然丢。
+    _bridge_stdlib_logging()
     _LOG_SINK_ADDED = True
 
 

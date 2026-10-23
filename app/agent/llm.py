@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from loguru import logger
 from openai import (
     APIConnectionError,
+    APIStatusError,
     AuthenticationError,
     InternalServerError,
     NotFoundError,
@@ -33,6 +34,88 @@ _GROUPS = {
     "weekly": ("weekly_api_key", "weekly_base_url", "weekly_model",
                "weekly_disable_thinking"),
 }
+
+
+class InsufficientBalanceError(Exception):
+    """402 Payment Required（余额不足 / 欠费）：**该切备用**的那一类。
+
+    **为什么不能直接把 APIStatusError 塞进 _FALLBACK_EXCEPTIONS**（2026-10-21）：
+    BadRequestError(400) 是 APIStatusError 的**子类**（实测
+    issubclass(BadRequestError, APIStatusError) is True）。把父类放进切换集，
+    等于把 400 也放进去 —— 而 400 是「请求本身有问题，换谁都会失败」，
+    正是本清单一开始就刻意排除的那一类，切了纯属白等。
+
+    402 则完全相反：它是**账号余额**的问题，与请求内容无关，
+    换一个服务商的 key 大概率立刻就好。实测 2026-10-20 那轮：
+    DeepSeek 余额耗尽 → 四位分析师 + 风险官 + 首席全部 402 落空 →
+    备用明明配好且可用，却因为 402 不在白名单里而一次都没被调用 →
+    最终落库一份「日报生成暂不可用」的占位行。
+
+    所以这里**只把 402 这一档单独译出来**，而不是放宽到整个 APIStatusError。
+    """
+
+    def __init__(self, message: str, *, status_code: int = 402) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _FallbackAwareChatOpenAI(ChatOpenAI):
+    """把「402 余额不足」译成 InsufficientBalanceError，让主备切换能接住。
+
+    只改**可切换判定**，不改请求内容、不改重试策略、不改其余异常的行为：
+    非 402 的 APIStatusError（含 400/422）仍按原样抛出 —— 它们不该切备用。
+    """
+
+    def _translate(self, exc: APIStatusError) -> None:
+        """只在 `status_code == 402` 时改写异常；其余原样抛出。"""
+        if getattr(exc, "status_code", None) == 402:
+            raise InsufficientBalanceError(str(exc)) from exc
+
+    # ⚠️ **四个入口都要覆写**：`invoke`/`ainvoke` 走 `_generate`/`_agenerate`，
+    # 而 `stream`/`astream` 走 `_stream`/`_astream` —— `_generate_with_cache`
+    # 在 `_should_stream()` 为真时**压根不调 `_generate`**。
+    #
+    # 2026-10-22 实测（httpx.MockTransport 构造 402，未联网）：
+    #   · 只覆写 `_generate`/`_agenerate` 时，`stream()` 抛出**裸** APIStatusError，
+    #     外层 `with_fallbacks` 连一次备用都不会试（请求序列只有主模型）。
+    #   · 补上 `_stream`/`_astream` 后流式路径同样会被翻译。
+    #
+    # 当前全仓没有流式调用点（全是 `invoke`），所以这是**潜伏缺陷**；
+    # 但"以后某个前端要逐字输出"是完全可能的需求，补这 12 行比留个坑便宜。
+    #
+    # 签名一律用 `*args, **kwargs` 透传：父类的 `_stream` 带**仅关键字**参数
+    # `stream_usage`，逐字抄签名会在 langchain 升级加参数时先炸。
+    def _generate(self, *args, **kwargs):
+        try:
+            return super()._generate(*args, **kwargs)
+        except APIStatusError as exc:
+            self._translate(exc)
+            raise
+
+    async def _agenerate(self, *args, **kwargs):
+        try:
+            return await super()._agenerate(*args, **kwargs)
+        except APIStatusError as exc:
+            self._translate(exc)
+            raise
+
+    def _stream(self, *args, **kwargs):
+        try:
+            # 生成器是**惰性**的：异常在迭代时才抛，所以 try 必须包住 `yield from`，
+            # 不能只包住 `super()._stream(...)` 的构造。
+            yield from super()._stream(*args, **kwargs)
+        except APIStatusError as exc:
+            self._translate(exc)
+            raise
+
+    async def _astream(self, *args, **kwargs):
+        try:
+            async for chunk in super()._astream(*args, **kwargs):
+                yield chunk
+        except APIStatusError as exc:
+            self._translate(exc)
+            raise
+
 
 # 触发切换到「备用模型」的异常类型。
 # 判定口径与 app/retry.py 同一立场：**按类型/状态码判定，绝不匹配错误消息文本**。
@@ -60,6 +143,16 @@ _FALLBACK_EXCEPTIONS = (
     # 而宽一点的代价只是"非解析类 ValueError 也会多切一次备用"——
     # 那既不会静默、也不会误判，最多多打一次请求。
     ValueError,
+    # **402 余额不足** —— 2026-10-21 补。
+    #
+    # 它不属于上面任何一个内置类型：402 抛的是**裸的** APIStatusError，
+    # 而 AuthenticationError(401) / PermissionDeniedError(403) 是它的**兄弟**、
+    # 不是父类（三者都直接继承 APIError）。于是 2026-10-20 那轮出现了最糟的组合：
+    # 备用配好且可用，却**一次都没被调用**，五位专家 + 首席全部落空。
+    #
+    # 这里放的是**自定义类**而不是 APIStatusError：后者会把 400 也带进来，
+    # 详见 InsufficientBalanceError 的 docstring。
+    InsufficientBalanceError,
 )
 
 
@@ -177,7 +270,10 @@ def _make_client(api_key: str, base_url: str, model: str,
     if part is not None and getattr(settings, _group_fields(part)[3]):
         # enable_thinking 是百炼 / qwen 系特有参数，只在开关打开时才发
         kwargs["extra_body"] = {"enable_thinking": False}
-    return ChatOpenAI(
+    # 用 _FallbackAwareChatOpenAI 而不是 ChatOpenAI：它只多一件事 ——
+    # 把 402 余额不足译成 InsufficientBalanceError，好让主备切换接住。
+    # 其余行为（模型名、超时、重试、extra_body）完全一致。
+    return _FallbackAwareChatOpenAI(
         model=model,
         api_key=api_key,
         base_url=base_url,

@@ -199,6 +199,25 @@ def _job_report() -> None:
     try:
         report = run_daily_pipeline(db)
         logger.info(f"[调度] 每日研判完成: {report.sentiment} score={report.score}")
+    except Exception:
+        # ⚠️ **这个 except 不能省**（2026-10-22 复审发现 S1-1）。
+        #
+        # 原来的写法只有 `try/finally`：日报流程一旦抛异常，它就一路冒到
+        # APScheduler，而 APScheduler 用的是 **stdlib logging**。本项目只给
+        # loguru 挂了文件 sink（`app/main.py:_setup_file_logging`），没有
+        # logging→loguru 的桥 —— 于是 root logger 无 handler，只剩
+        # `logging.lastResort` 把 traceback 打到 **stderr**。后果实测确认：
+        #   · `logs/app.log` 里**一个字都没有**（而人就是去这个文件查的）
+        #   · 库里也没有任何行（异常发生在 upsert 之前）
+        #   · `/api/v1/reports/today` 仍返回前一天的报告，前端看不出今天失败过
+        # 这正是两次事故的同一形态：当天没有日报，但系统看起来一切正常。
+        #
+        # 这里**记日志后重新抛出**（不吞）：吞掉会让 APScheduler 以为任务成功，
+        # 而"这个 job 到底成没成"是要能被调度器看见的。
+        logger.opt(exception=True).error(
+            "[调度] 每日研判失败 —— 今日可能没有日报（详见上方堆栈）"
+        )
+        raise
     finally:
         db.close()
 
@@ -305,31 +324,49 @@ def start_scheduler() -> bool:
             "若这不是你想要的，请用单进程启动（见 README 的部署约束）"
         )
         return False
+    # ⚠️ **`misfire_grace_time` 必须显式给**（2026-10-23 修事故③根因）。
+    #
+    # APScheduler 的默认值是 **1 秒**（实测 `BackgroundScheduler()._job_defaults`
+    # == `{'misfire_grace_time': 1, ...}`）。而 2026-10-21 那天：
+    #
+    #   18:30:00 触发点 → 调度线程 18:30:02.043 才来处理 →
+    #   「was missed by 0:00:02.043252」→ **超过 1 秒 → 整轮直接丢弃** →
+    #   当天没有任何日报，且当时的日志里连一个字都没有。
+    #
+    # 一分钟内的抖动（GC、磁盘 IO、日志线程、控制台 QuickEdit 选中文字）
+    # 在 Windows 桌面上太常见了。研判这种「晚几分钟跑完全无害」的任务，
+    # 用 1 秒当容忍度，代价是**整天没有报告** —— 这个默认真不该用。
+    #
+    # 600 秒 = 10 分钟：足够覆盖任何正常的调度抖动；而真超过 10 分钟
+    # （比如机器休眠），当天那份报告也已经意义不大了，放弃是合理的。
+    # `coalesce=True` 保证「晚到」时只补一次，不会把错过的多轮堆积起来连跑。
+    _JOB_DEFAULTS = {"misfire_grace_time": 600, "coalesce": True}
     # 新闻：按 NEWS_INTERVAL_MINUTES 增量采集（默认 60 分钟整点）
-    scheduler.add_job(_job_news, _news_trigger(), id="news_collect")
+    scheduler.add_job(_job_news, _news_trigger(), id="news_collect",
+                      **_JOB_DEFAULTS)
     # 行情：收盘后（工作日）
     h, m = _parse_hhmm(settings.market_collect_time)
     scheduler.add_job(
         _job_market, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
-        id="market_collect",
+        id="market_collect", **_JOB_DEFAULTS,
     )
     # 板块数据（工作日，且仅交易日实际执行）
     h, m = _parse_hhmm(settings.sector_collect_time)
     scheduler.add_job(
         _job_sector, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
-        id="sector_collect",
+        id="sector_collect", **_JOB_DEFAULTS,
     )
     # 每日研判（工作日，且仅交易日实际执行）
     h, m = _parse_hhmm(settings.report_time)
     scheduler.add_job(
         _job_report, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
-        id="daily_report",
+        id="daily_report", **_JOB_DEFAULTS,
     )
     # 周度综述（工作日，且仅本周最后一个交易日实际执行）
     h, m = _parse_hhmm(settings.weekly_report_time)
     scheduler.add_job(
         _job_weekly, CronTrigger(hour=h, minute=m, day_of_week="mon-fri"),
-        id="weekly_report",
+        id="weekly_report", **_JOB_DEFAULTS,
     )
     scheduler.start()
     logger.info(

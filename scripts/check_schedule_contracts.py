@@ -41,6 +41,7 @@ START = datetime(2026, 9, 22, 0, 0, tzinfo=LOCAL_TZ)  # 周二，覆盖完整一
 
 PASS = 0
 FAIL = 0
+SKIP = 0
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -51,6 +52,21 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     else:
         FAIL += 1
         print(f"  FAIL  {name}" + (f"  —— {detail}" if detail else ""))
+
+
+def skip(name: str, why: str) -> None:
+    """记一条**跳过（未验证）**。
+
+    为什么要这个类别（2026-10-22）：有些检查的前提是「环境干净」，
+    前提不成立时**无法验证**，但也不代表代码有问题。把它算作 FAIL，
+    每次后端开着跑脚本都会红一片，人就会开始无视 FAIL —— 那比没有检查更糟。
+
+    项目的既定立场见 `scheduler.scheduler_lock_available` 的 docstring：
+    「脚本装配不上 —— 那要报「跳过（未验证）」，不能报 FAIL（环境问题不是代码问题）」。
+    """
+    global SKIP
+    SKIP += 1
+    print(f"  SKIP  {name}  —— {why}")
 
 
 def fire_times(trigger: CronTrigger, days: int = HORIZON_DAYS) -> list[datetime]:
@@ -207,7 +223,12 @@ def main() -> int:
     # 不能报 FAIL：那是环境问题，不是代码问题。
     # （「结构哨兵」那次的教训：干净的 SKIP 比假 FAIL 可信得多。）
     if not S.scheduler_lock_available():
-        print("  ⏭ **跳过**：另一个进程持有调度器锁（后端正在跑？）—— 本次无法验证装配")
+        # ⚠️ 这行原先用 emoji「⏭」，在**默认 Windows GBK 控制台**下会抛
+        # UnicodeEncodeError 直接崩掉整个脚本（2026-10-23 实测 EXIT=1）——
+        # 而新增的 [7] 节 SKIP 支路排在它**之后**，于是「后端运行中不再误报
+        # FAIL」这个改动在默认控制台上根本没机会执行。改用 skip() 统一记账。
+        skip("调度器装配（3 条：起得来 / 返回 True / 注册 job）",
+             "另一个进程持有调度器锁（后端正在跑？）—— 本次无法验证装配")
     else:
         real_start = S.scheduler.start
         S.scheduler.start = lambda *a, **k: None  # 拦住真正的 start()
@@ -258,26 +279,39 @@ def main() -> int:
     # ---- ⑦ 跨进程调度器锁（2026-09-25，应巡检 H3）----
     print("\n[7] 调度器跨进程锁（巡检 H3）")
     _fd = S._acquire_scheduler_lock()
-    try:
-        check("持锁期间，别的「进程」抢不到（本进程用第二个 fd 模拟）",
-              S.scheduler_lock_available() is False,
-              "多 worker 下每个进程都会跑一遍 lifespan —— 进程内的 `scheduler.running` "
-              "挡不住它们各起一个调度器，采集与研判会**按进程数重复执行**"
-              "（重复的 LLM 花费 + SQLite 写竞争）")
-        check("抢不到锁 → `start_scheduler()` **返回 False 且不装配**",
-              S.start_scheduler() is False,
-              "返回布尔而不是 None：调用方与测试才分得清「起了」与「抢不到锁」")
-        check("抢不到锁时也不会把 job 注册进去",
-              S.scheduler.get_job("news_collect") is None)
-    finally:
-        if _fd is not None and _fd >= 0:
-            S._unlock_fd(_fd)        # 用局部引用释放：start_scheduler 可能已把模块变量置空
-    check("释放后别人又能抢到（锁不是一次性的）",
-          S.scheduler_lock_available() is True,
-          "锁靠「持有打开的文件描述符」维持，进程退出时内核自动释放 —— "
-          "不会因为崩溃留下死锁")
+    if _fd is None:
+        # ⚠️ **后端正在运行时必然走到这里**（2026-10-22 修）。
+        # 原实现没处理这一支：`_fd` 是 None → finally 里 `if _fd is not None`
+        # 不成立、什么都没释放 → 最后那条 `lock_available() is True` 必然
+        # False → 报 FAIL。于是**只要开着后端跑一次这个脚本就会红一条**，
+        # 而那不是代码问题，是「本进程抢不到锁」这件事实本身。
+        #
+        # 按项目既定立场（见 `scheduler.scheduler_lock_available` 的 docstring：
+        # 环境问题要报「跳过（未验证）」，不能报 FAIL），这里整节 SKIP。
+        skip("调度器跨进程锁的三条断言（持锁互斥 / 抢不到时返回 False / 不装配 job）",
+             "本进程抢不到锁 —— 说明**已有别的进程（后端）持有它**，本节前提不成立；"
+             "停掉后端再跑即可完整验证")
+    else:
+        try:
+            check("持锁期间，别的「进程」抢不到（本进程用第二个 fd 模拟）",
+                  S.scheduler_lock_available() is False,
+                  "多 worker 下每个进程都会跑一遍 lifespan —— 进程内的 `scheduler.running` "
+                  "挡不住它们各起一个调度器，采集与研判会**按进程数重复执行**"
+                  "（重复的 LLM 花费 + SQLite 写竞争）")
+            check("抢不到锁 → `start_scheduler()` **返回 False 且不装配**",
+                  S.start_scheduler() is False,
+                  "返回布尔而不是 None：调用方与测试才分得清「起了」与「抢不到锁」")
+            check("抢不到锁时也不会把 job 注册进去",
+                  S.scheduler.get_job("news_collect") is None)
+        finally:
+            if _fd >= 0:
+                S._unlock_fd(_fd)    # 用局部引用释放：start_scheduler 可能已把模块变量置空
+        check("释放后别人又能抢到（锁不是一次性的）",
+              S.scheduler_lock_available() is True,
+              "锁靠「持有打开的文件描述符」维持，进程退出时内核自动释放 —— "
+              "不会因为崩溃留下死锁")
 
-    print(f"\n{'=' * 46}\n{PASS} PASS / {FAIL} FAIL\n{'=' * 46}")
+    print(f"\n{'=' * 46}\n{PASS} PASS / {FAIL} FAIL / {SKIP} SKIP\n{'=' * 46}")
     return 1 if FAIL else 0
 
 

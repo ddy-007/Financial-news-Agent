@@ -68,8 +68,25 @@ def list_reports(db: Session, limit: int = 30,
     return q.order_by(MarketReport.date.desc()).limit(limit).all()
 
 
+def _generation_failed(content: str | None) -> bool:
+    """识别生成失败占位行，兼容尚未带标记的历史报告。"""
+    try:
+        data = json.loads(content)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    env = data.get("env")
+    return (isinstance(env, dict) and bool(env.get("generation_failed"))) or (
+        data.get("degraded_reason") == "fallback_failed"
+    )
+
+
 def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport:
     """按 `(report_type='daily', report_day)` 幂等写入日报：**当天已有则原地覆盖**。
+
+    生成失败占位行不能覆盖任何已有日报；无报告时仍保存失败记录，
+    后续成功结果可以覆盖失败记录。唯一索引冲突后的重查分支遵循相同规则。
 
     **为什么需要**（H2，2026-09-25）：日报原先是无条件 `db.add(...)`，
     而同日的判定落在 `date`（生成时刻，含微秒）上 —— 于是**同一天可以落多份**。
@@ -97,7 +114,13 @@ def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport
                 MarketReport.report_day == report_day)
         .first()
     )
+    incoming_failed = _generation_failed(fields.get("content"))
     if existing is not None:
+        if incoming_failed:
+            # 不依赖可能陈旧的 ORM 内容判断：另一会话可能已将失败行更新成功。
+            db.refresh(existing)
+            logger.warning(f"当日（{report_day}）重跑失败，保留已有日报 id={existing.id}")
+            return existing
         logger.info(
             f"当日（{report_day}）已有日报 id={existing.id}（生成于 {existing.date}）—— "
             f"**原地覆盖**，不再新增一份（H2：`date` 含微秒，原先的「一天一份」没约束住）"
@@ -122,6 +145,10 @@ def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport
         )
         if report is None:
             raise
+        if incoming_failed:
+            db.refresh(report)
+            logger.warning(f"当日（{report_day}）并发生成失败，保留已有日报 id={report.id}")
+            return report
         for k, v in fields.items():
             setattr(report, k, v)
         db.commit()
