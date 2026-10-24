@@ -199,6 +199,8 @@ class GraphContracts(unittest.TestCase):
         self.assertFalse(result["is_passed"])
         self.assertEqual(result["critic_status"], "error")
         self.assertEqual(result["retry_count"], 0)
+        self.assertEqual(result["final"]["draft_model"], "fake-model")
+        self.assertIsNone(result["final"]["critic_model"])
         self.assertEqual(self.audit.call_count, 1)
 
     def test_incomplete_fulltext_never_calls_audit_or_revises(self):
@@ -206,6 +208,7 @@ class GraphContracts(unittest.TestCase):
         result = self.invoke()
         self.assertFalse(result["is_passed"])
         self.assertEqual(result["critic_status"], "incomplete_sources")
+        self.assertIsNone(result["final"]["critic_model"])
         self.audit.assert_not_called()
 
     def test_empty_chief_is_repaired_before_audit(self):
@@ -239,16 +242,111 @@ class GraphContracts(unittest.TestCase):
         self.assertIn(FAIL["revision_instructions"], content["critic_feedback"])
         self.assertAlmostEqual(report.score, -0.4)
 
+    def test_report_model_is_not_replaced_by_critic_fallback_model(self):
+        engine = create_engine("sqlite:///:memory:")
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(engine)
+        original_chief = self.chief.side_effect
+
+        def record(name):
+            L._ModelRecorder("expert", "draft-model").on_chat_model_start(
+                {}, [], metadata={"ls_model_name": name},
+            )
+
+        def chief(*args, **kwargs):
+            record("draft-model")
+            return original_chief(*args, **kwargs)
+
+        def critic(*args, **kwargs):
+            record("critic-backup")
+            return CriticVerdict(**PASS)
+
+        self.chief.side_effect = chief
+        self.audit.side_effect = critic
+        with patch.dict(L._USED_MODEL, {}, clear=True), \
+             patch.object(L, "note_primary_failed", return_value=None), \
+             patch.object(G, "get_llm_model_name", side_effect=L.get_llm_model_name), \
+             patch.object(G, "get_app", return_value=G.build_graph()), Session(engine) as db:
+            report = G.generate_daily_report(db, NOW)
+            content = json.loads(report.content)
+        self.assertEqual(report.model, "draft-model")
+        self.assertEqual(content["draft_model"], "draft-model")
+        self.assertEqual(content["critic_model"], "critic-backup")
+
+    def test_each_revision_keeps_its_own_draft_and_critic_models(self):
+        current_model = ["initial"]
+        self.stack.enter_context(patch.object(G, "get_llm_model_name", side_effect=lambda **kw: current_model[0]))
+        original_chief = self.chief.side_effect
+        rounds = []
+
+        def chief(*args, **kwargs):
+            rounds.append(len(rounds) + 1)
+            current_model[0] = f"draft-{len(rounds)}"
+            return original_chief(*args, **kwargs)
+
+        def critic(*args, **kwargs):
+            current_model[0] = f"critic-{len(rounds)}"
+            return CriticVerdict(**(FAIL if len(rounds) == 1 else PASS))
+
+        self.chief.side_effect = chief
+        self.audit.side_effect = critic
+        final = self.invoke()["final"]
+        self.assertEqual(final["retry_count"], 1)
+        self.assertEqual(final["draft_model"], "draft-2")
+        self.assertEqual(final["critic_model"], "critic-2")
+
+    def test_missing_chief_does_not_claim_critic_model_authored_report(self):
+        self.chief.side_effect = ConnectionError("chief unavailable")
+        engine = create_engine("sqlite:///:memory:")
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(engine)
+        with patch.object(G, "get_app", return_value=G.build_graph()), Session(engine) as db:
+            report = G.generate_daily_report(db, NOW)
+            final = json.loads(report.content)
+            self.assertIsNone(report.model)
+            self.assertIsNone(final["draft_model"])
+            self.assertEqual(final["critic_model"], "fake-model")
+
     def test_fallback_cannot_inherit_previous_pass(self):
         engine = create_engine("sqlite:///:memory:")
         self.addCleanup(engine.dispose)
         Base.metadata.create_all(engine)
         with Session(engine) as db, patch.object(G, "_run_experts", return_value=({
             "market_summary": "", "is_passed": True, "critic_status": "passed",
+            "critic_model": "previous-critic",
         }, False)), patch.object(G, "_fallback_report", return_value={"market_summary": "兜底正文"}):
             content = json.loads(G.generate_daily_report(db, NOW).content)
         self.assertFalse(content["is_passed"])
         self.assertEqual(content["critic_status"], "not_reviewed")
+        self.assertIsNone(content["critic_model"])
+
+    def test_summary_patch_invalidates_previous_audit_model(self):
+        engine = create_engine("sqlite:///:memory:")
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(engine)
+        with Session(engine) as db, patch.object(G, "_run_experts", return_value=({
+            "market_summary": "", "expert_opinions": [{"expert": "宏观"}],
+            "is_passed": True, "critic_model": "previous-critic", "draft_model": "old-writer",
+        }, False)), patch.object(G, "_fallback_report") as fallback:
+            report = G.generate_daily_report(db, NOW)
+            content = json.loads(report.content)
+            self.assertIsNone(report.model)
+        fallback.assert_not_called()
+        self.assertFalse(content["is_passed"])
+        self.assertIsNone(content["critic_model"])
+
+    def test_single_model_fallback_records_its_own_draft_model(self):
+        engine = create_engine("sqlite:///:memory:")
+        self.addCleanup(engine.dispose)
+        Base.metadata.create_all(engine)
+        self.llm.return_value = RunnableLambda(lambda _: AIMessage(content=json.dumps({
+            "title": "单次兜底", "market_summary": "单次生成的报告", "score": 0.1,
+        })))
+        with Session(engine) as db, patch.object(G, "_market_snapshot", return_value=("无", "无")), \
+             patch.object(G, "_calendar_degraded", return_value=False), \
+             patch.object(G, "get_llm_model_name", return_value="single-writer"):
+            final = G._fallback_report(db, NOW)
+        self.assertEqual(final["draft_model"], "single-writer")
 
 
 class EvidenceContracts(unittest.TestCase):

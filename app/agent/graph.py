@@ -523,6 +523,7 @@ def chief_node(state: AnalystState) -> dict:
     risk = RiskOpinion(**state["risk_opinion"]) if state.get("risk_opinion") else RiskOpinion()
 
     narrative: dict
+    draft_model = None
     if not opinions:
         # 四位分析师**全部**缺席（2026-10-21 实测：DeepSeek 402 欠费那轮）。
         # 此时首席手里没有任何观点可汇总，再调一次 LLM 只会白打一次请求。
@@ -545,6 +546,8 @@ def chief_node(state: AnalystState) -> dict:
         try:
             narrative = run_chief(get_llm(temperature=0.2, part="expert"), ctx, opinions,
                                   risk, quant, part="expert")
+            # Critic 也使用 expert 分组，必须在它更新分组模型记录之前快照。
+            draft_model = get_llm_model_name(part="expert")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[首席] 汇总失败，使用降级结构：{e}")
             narrative = {
@@ -560,6 +563,7 @@ def chief_node(state: AnalystState) -> dict:
         **narrative, **quant,
         "expert_opinions": [o.model_dump() for o in opinions],
         "risk_opinion": risk.model_dump(),
+        "draft_model": draft_model,
     }
     # 修补也必须发生在审计之前，否则落库正文与通过审核的正文不一致。
     if opinions and (_is_blank(final.get("market_summary"))
@@ -568,6 +572,7 @@ def chief_node(state: AnalystState) -> dict:
         if _is_blank(final.get("title")) or _is_placeholder_title(final.get("title")):
             final["title"] = "研判降级：首席综述缺失"
         final.update(degraded=True, degraded_reason="chief_summary_missing")
+        final["draft_model"] = None  # 摘要由代码补写，不能冒称某个模型产出。
     return {"final": final}
 
 
@@ -577,6 +582,7 @@ def critic_node(state: AnalystState) -> dict:
     final = dict(state.get("final", {}))
     flaws: list[str] = []
     passed = False
+    critic_model = None
     if not state.get("opinions"):
         status, feedback = "skipped", "分析师未产出底稿，未完成审计。"
     elif ctx.get("evidence_issues") or not ctx.get("news_fulltext"):
@@ -586,6 +592,7 @@ def critic_node(state: AnalystState) -> dict:
     else:
         try:
             verdict = run_critic(get_llm(temperature=0.0, part="expert"), ctx, final)
+            critic_model = get_llm_model_name(part="expert")
             passed = verdict.is_passed
             status = "passed" if passed else "rejected"
             flaws = verdict.flaws
@@ -597,7 +604,7 @@ def critic_node(state: AnalystState) -> dict:
             status, feedback = "error", f"审计调用或结构校验失败（{type(exc).__name__}），本报告未通过核验。"
     retries = state.get("retry_count", 0)
     final.update(is_passed=passed, critic_status=status, critic_feedback=feedback,
-                 critic_flaws=flaws, retry_count=retries)
+                 critic_flaws=flaws, retry_count=retries, critic_model=critic_model)
     if not passed:
         final["degraded"] = True
     logger.info(f"[Critic] 状态={status} 修正次数={retries}/2 缺陷数={len(flaws)}")
@@ -645,6 +652,7 @@ def _fallback_report(db: Session, as_of: datetime | None = None) -> dict:
     ))
     return {
         "title": str(data.get("title", "")).strip(),
+        "draft_model": get_llm_model_name(part="expert"),
         "market_summary": str(data.get("market_summary", "")),
         "sentiment": data.get("sentiment", "中性"),
         # **兜底一律 low，不采信 LLM 自报的 confidence**（2026-10-23）。
@@ -1059,6 +1067,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         # 标注降级，便于评估层/前端区分（quant 与 opinions 都还在）
         final["degraded"] = True
         final["degraded_reason"] = "chief_summary_missing"
+        final["draft_model"] = None
     elif _summary_blank or _summary_is_placeholder or _all_experts_gone:
         _report_changed_after_graph = True
         # ⚠️ 兜底**必须先留档再替换**（2026-10-22 复审发现 M2）：
@@ -1124,6 +1133,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
                 "env": {"calendar_degraded": _calendar_degraded(), "fallback": True,
                         "generation_failed": True},
                 "degraded_reason": "fallback_failed",
+                "draft_model": None,
             }
         # 单次生成成功也必须并入风险官的全部风险点；字符串不能拆成字符。
         final["risks"] = list(dict.fromkeys(
@@ -1141,6 +1151,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         # 图外兜底会重写正文并合并旧风险，不能继承此前某个版本的审核结论。
         final.update(
             is_passed=False, critic_status="not_reviewed", retry_count=0, critic_flaws=[],
+            critic_model=None,
             critic_feedback="图外补写或单次生成兜底已改变正文，当前版本未经过全文审计。",
         )
 
@@ -1179,6 +1190,7 @@ def generate_daily_report(db: Session, date: datetime | None = None) -> MarketRe
         low_info=info_level.get("low_info"),
         # 含义见 `is_stale`：近 1 天某类目无新闻 **或** 当日 0 条。
         data_stale=data_freshness.get("stale"),
-        model=get_llm_model_name(part="expert"),
+        # 显式 None 表示代码补写；仅旧调用方缺少快照字段时沿用原兼容口径。
+        model=final["draft_model"] if "draft_model" in final else get_llm_model_name(part="expert"),
     )
     return report

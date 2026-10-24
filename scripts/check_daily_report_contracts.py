@@ -151,6 +151,57 @@ class DailyReportContracts(unittest.TestCase):
         self.assertEqual(second.score, 0.4)
         self.assertNotIn("generation_failed", content.get("env", {}))
 
+    def test_audit_failure_cannot_replace_an_existing_passed_report(self):
+        first, _, _ = self.generate({
+            "title": "已审计通过", "market_summary": "有依据的原报告", "score": 0.6,
+            "is_passed": True, "critic_status": "passed",
+        })
+        original = (first.id, first.date, first.title, first.content, first.score)
+        for status in ("rejected", "error", "incomplete_sources", "not_reviewed", "skipped"):
+            with self.subTest(status=status):
+                kept, _, _ = self.generate({
+                    "title": "审计失败新稿", "market_summary": "未核验的新正文", "score": -0.7,
+                    "is_passed": False, "critic_status": status, "degraded": True,
+                })
+                self.assertEqual((kept.id, kept.date, kept.title, kept.content, kept.score), original)
+        self.assertEqual(self.db.query(MarketReport).count(), 1)
+
+    def test_first_audit_failure_is_saved_and_passed_result_can_replace_it(self):
+        first, failed, _ = self.generate({
+            "market_summary": "首份审计失败记录", "is_passed": False, "critic_status": "rejected",
+        })
+        self.assertFalse(failed["is_passed"])
+        original_id = first.id
+        recovered, passed, _ = self.generate({
+            "market_summary": "更正后审计通过", "is_passed": True, "critic_status": "passed", "score": 0.4,
+        })
+        self.assertEqual(recovered.id, original_id)
+        self.assertTrue(passed["is_passed"])
+        self.assertEqual(recovered.score, 0.4)
+
+    def test_passed_audit_can_update_an_existing_passed_report(self):
+        first, _, _ = self.generate({"market_summary": "通过的第一版", "is_passed": True})
+        original_id = first.id
+        second, _, _ = self.generate({"market_summary": "通过的第二版", "is_passed": True})
+        self.assertEqual(second.id, original_id)
+        self.assertEqual(json.loads(second.content)["market_summary"], "通过的第二版")
+
+    def test_concurrent_audit_failure_does_not_replace_winner(self):
+        winner = SimpleNamespace(id=42, content=json.dumps({"is_passed": True}), score=0.6)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.side_effect = [None, winner]
+        db.commit.side_effect = IntegrityError("mock insert", {}, Exception("unique conflict"))
+        result = R.upsert_daily_report(
+            db, NOW.date(), score=-0.7,
+            content=json.dumps({"is_passed": False, "critic_status": "error"}),
+        )
+        self.assertIs(result, winner)
+        self.assertEqual(winner.score, 0.6)
+        self.assertTrue(json.loads(winner.content)["is_passed"])
+        db.rollback.assert_called_once()
+        db.refresh.assert_called_once_with(winner)
+        self.assertEqual(db.commit.call_count, 1)
+
     def test_successful_rerun_still_updates_same_row(self):
         first, _, _ = self.generate({"market_summary": "第一版", "score": 0.2})
         second, _, _ = self.generate({"market_summary": "第二版", "score": 0.7})
@@ -190,6 +241,9 @@ class DailyReportContracts(unittest.TestCase):
         for content in (None, "old text", "[]", "null", '{"env": "old"}'):
             self.assertFalse(R._generation_failed(content))
         self.assertTrue(R._generation_failed('{"degraded_reason":"fallback_failed"}'))
+        self.assertTrue(R._generation_failed('{"is_passed":false}'))
+        for content in ('{"is_passed":true}', '{"is_passed":null}', '{"is_passed":0}', '{"is_passed":"false"}'):
+            self.assertFalse(R._generation_failed(content))
 
 
 class LoggingContracts(unittest.TestCase):

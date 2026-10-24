@@ -69,7 +69,7 @@ def list_reports(db: Session, limit: int = 30,
 
 
 def _generation_failed(content: str | None) -> bool:
-    """识别生成失败占位行，兼容尚未带标记的历史报告。"""
+    """识别生成或审计失败，缺少审计字段的历史报告保持原判据。"""
     try:
         data = json.loads(content)
     except (TypeError, ValueError):
@@ -77,15 +77,17 @@ def _generation_failed(content: str | None) -> bool:
     if not isinstance(data, dict):
         return False
     env = data.get("env")
-    return (isinstance(env, dict) and bool(env.get("generation_failed"))) or (
-        data.get("degraded_reason") == "fallback_failed"
+    return (
+        data.get("is_passed") is False
+        or (isinstance(env, dict) and bool(env.get("generation_failed")))
+        or data.get("degraded_reason") == "fallback_failed"
     )
 
 
 def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport:
     """按 `(report_type='daily', report_day)` 幂等写入日报：**当天已有则原地覆盖**。
 
-    生成失败占位行不能覆盖任何已有日报；无报告时仍保存失败记录，
+    生成失败或明确未通过审计的新稿不能覆盖任何已有日报；无报告时仍保存失败记录，
     后续成功结果可以覆盖失败记录。唯一索引冲突后的重查分支遵循相同规则。
 
     **为什么需要**（H2，2026-09-25）：日报原先是无条件 `db.add(...)`，
