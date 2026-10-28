@@ -5,6 +5,7 @@ import json
 from datetime import date
 
 from loguru import logger
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -84,11 +85,41 @@ def _generation_failed(content: str | None) -> bool:
     )
 
 
+def _record_report_write(db: Session, report: MarketReport, action: str) -> MarketReport:
+    """仅记录本次会话的保存结果，供调度日志区分新稿与被保留的旧稿。"""
+    db.info["daily_report_write"] = {"action": action, "report_id": report.id}
+    return report
+
+
+def _apply_report_update(db: Session, report: MarketReport, fields: dict, incoming_failed: bool) -> bool:
+    if not incoming_failed:
+        for key, value in fields.items():
+            setattr(report, key, value)
+        return True
+    # 必须先刷新：会话缓存的失败稿可能已被另一个会话恢复成功。
+    db.refresh(report)
+    if not _generation_failed(report.content):
+        logger.warning(f"本轮新稿被丢弃，保留可用日报 id={report.id}（生成于 {report.date}）")
+        _record_report_write(db, report, "kept_existing")
+        return False
+    # 两稿都失败时允许更新，但不能覆盖刷新后才并发恢复的成功稿。
+    result = db.execute(update(MarketReport).where(
+        MarketReport.id == report.id, MarketReport.content == report.content,
+    ).values(**fields), execution_options={"synchronize_session": False})
+    if result.rowcount != 1:
+        db.rollback()
+        db.refresh(report)
+        logger.warning(f"本轮新稿被丢弃，保留并发更新的日报 id={report.id}（生成于 {report.date}）")
+        _record_report_write(db, report, "kept_existing")
+        return False
+    return True
+
+
 def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport:
     """按 `(report_type='daily', report_day)` 幂等写入日报：**当天已有则原地覆盖**。
 
-    生成失败或明确未通过审计的新稿不能覆盖任何已有日报；无报告时仍保存失败记录，
-    后续成功结果可以覆盖失败记录。唯一索引冲突后的重查分支遵循相同规则。
+    失败新稿不能覆盖可用旧稿；两稿都失败时允许更新，首次失败仍可留档。
+    条件更新与唯一索引冲突后的重查分支均保护并发恢复成功的报告。
 
     **为什么需要**（H2，2026-09-25）：日报原先是无条件 `db.add(...)`，
     而同日的判定落在 `date`（生成时刻，含微秒）上 —— 于是**同一天可以落多份**。
@@ -117,22 +148,19 @@ def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport
         .first()
     )
     incoming_failed = _generation_failed(fields.get("content"))
+    action = "updated_failed" if incoming_failed else "updated"
     if existing is not None:
-        if incoming_failed:
-            # 不依赖可能陈旧的 ORM 内容判断：另一会话可能已将失败行更新成功。
-            db.refresh(existing)
-            logger.warning(f"当日（{report_day}）重跑失败，保留已有日报 id={existing.id}")
+        if not _apply_report_update(db, existing, fields, incoming_failed):
             return existing
         logger.info(
             f"当日（{report_day}）已有日报 id={existing.id}（生成于 {existing.date}）—— "
             f"**原地覆盖**，不再新增一份（H2：`date` 含微秒，原先的「一天一份」没约束住）"
         )
-        for k, v in fields.items():
-            setattr(existing, k, v)
         report = existing
     else:
         report = MarketReport(report_type="daily", report_day=report_day, **fields)
         db.add(report)
+        action = "inserted"
     try:
         db.commit()
     except IntegrityError:
@@ -147,15 +175,12 @@ def upsert_daily_report(db: Session, report_day: date, **fields) -> MarketReport
         )
         if report is None:
             raise
-        if incoming_failed:
-            db.refresh(report)
-            logger.warning(f"当日（{report_day}）并发生成失败，保留已有日报 id={report.id}")
+        if not _apply_report_update(db, report, fields, incoming_failed):
             return report
-        for k, v in fields.items():
-            setattr(report, k, v)
+        action = "updated_failed" if incoming_failed else "updated"
         db.commit()
     db.refresh(report)
-    return report
+    return _record_report_write(db, report, action)
 
 
 def report_to_dict(r: MarketReport) -> dict:

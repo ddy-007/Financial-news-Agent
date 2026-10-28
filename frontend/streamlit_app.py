@@ -119,6 +119,11 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
 
     # 数据时效：基于陈旧数据时必须明示，不能冒充"今日研判"
     fr = c.get("data_freshness") or {}
+    if fr.get("evidence_excluded_count"):
+        st.warning(
+            f"⚠️ **新闻选取限制**：全文预算使 {fr['evidence_excluded_count']} 条候选新闻未纳入本次研判；"
+            "报告仅核验已选取的全文，不能据此断言某事件未发生。"
+        )
     if fr.get("coverage_incomplete"):
         st.warning(
             f"⚠️ **覆盖缺口提醒**：报告取数窗口仍有 {fr.get('pending_count', 0)} 条原文待处理、"
@@ -174,6 +179,7 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
         info = c.get("info_level") or {}
         if (data.get("data_stale") or fr.get("stale") or fr.get("round_overdue")
                 or fr.get("coverage_incomplete")
+                or fr.get("evidence_excluded_count")
                 or fr.get("collecting") or fr.get("readiness_scope") == "historical_unknown"):
             st.info("可用素材较少，采集覆盖尚不完整或未知，不能据此判断是否有重大消息。")
         else:

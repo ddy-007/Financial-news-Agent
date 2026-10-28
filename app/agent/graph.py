@@ -22,7 +22,7 @@ from langgraph.types import Overwrite
 from loguru import logger
 from sqlalchemy.orm import Session
 
-from app.agent.critic import load_news_evidence, run_critic
+from app.agent.critic import run_critic, select_news_evidence
 from app.agent.experts import (
     _as_list,
     run_capital_expert,
@@ -189,6 +189,13 @@ def prepare_node(state: AnalystState) -> dict:
             all_news = (
                 q2.order_by(News.publish_time.desc()).limit(ALL_NEWS_LIMIT).all()
             )
+        selected_ids, news_fulltext, evidence_issues, excluded_count = select_news_evidence(
+            db, [macro, industry, capital, comprehensive, all_news], analyzed_at,
+        )
+        macro, industry, capital, comprehensive, all_news = [
+            [row for row in rows if row.id in selected_ids]
+            for rows in (macro, industry, capital, comprehensive, all_news)
+        ]
         a_share, us = _market_snapshot(db, as_of)
         # 三项增量数据均加保护：任一失败只按缺省处理，不拖垮核心研判
         from app.services.info_level import (
@@ -278,6 +285,7 @@ def prepare_node(state: AnalystState) -> dict:
             "readiness_scope": "historical_unknown" if as_of is not None else "snapshot",
             **coverage,
             "coverage_incomplete": bool(coverage["pending_count"] or coverage["open_gap_count"]),
+            "evidence_excluded_count": excluded_count,
             # 补跑时"今天"应指截止时点那一天，而不是真正的今天
             "today": (as_of.date() if as_of else date.today()).isoformat(),
             # ---- H2 / H1（2026-09-23 新增）----
@@ -330,8 +338,7 @@ def prepare_node(state: AnalystState) -> dict:
 
         # 运行环境：交易日历降级（会按「工作日」猜测，节假日可能误判）
         env = {"calendar_degraded": _calendar_degraded()}
-        # 使用同一截止时点、同一批全文贯穿所有修正轮，避免循环时证据漂移。
-        news_fulltext, evidence_issues = load_news_evidence(db, used + all_news, analyzed_at)
+        # 使用同一截止时点、同一批预算内全文贯穿修正轮，避免证据漂移。
     finally:
         db.close()
 
@@ -346,6 +353,11 @@ def prepare_node(state: AnalystState) -> dict:
         "us_market": us,
         "indicators": indicators,
         "news_fulltext": news_fulltext,
+        "evidence_selection_note": (
+            f"全文上下文预算使 {excluded_count} 条候选新闻未纳入本次分析。"
+            "必须说明选取覆盖限制，不得据此写今日无重大消息或断言某事件未发生。"
+            if excluded_count else ""
+        ),
         "evidence_issues": evidence_issues,
     }
     stale_note = (
@@ -541,6 +553,7 @@ def chief_node(state: AnalystState) -> dict:
             "key_drivers": [], "sector_opportunities": [],
             "risks": list(risk.risks), "reference_news": [], "consensus_note": "",
             "degraded": True,
+            "degraded_reason": "analysts_unavailable",
         }
     else:
         try:
@@ -557,6 +570,7 @@ def chief_node(state: AnalystState) -> dict:
                 "risks": list(risk.risks), "reference_news": [], "consensus_note": "",
                 # 标记降级：便于日志/评估层区分「专家都在、只缺首席叙述」
                 "degraded": True,
+                "degraded_reason": "chief_summary_missing",
             }
 
     final = {
@@ -607,6 +621,7 @@ def critic_node(state: AnalystState) -> dict:
                  critic_flaws=flaws, retry_count=retries, critic_model=critic_model)
     if not passed:
         final["degraded"] = True
+        final["degraded_reason"] = final.get("degraded_reason") or f"critic_{status}"
     logger.info(f"[Critic] 状态={status} 修正次数={retries}/2 缺陷数={len(flaws)}")
     return {"final": final, "is_passed": passed, "critic_status": status,
             "critic_feedback": feedback}

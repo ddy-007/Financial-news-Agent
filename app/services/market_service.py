@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import threading
+from datetime import date, datetime, time
 
 from loguru import logger
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from app.collectors.market_collector import collect_all_market_data
+from app.collectors.market_collector import A_SHARE_INDICES, US_INDICES, collect_all_market_data
 from app.models.market import MarketData
 
 
@@ -52,9 +54,58 @@ def save_market_data(db: Session, rows: list[dict]) -> int:
     # **没有 `rowcount`** —— 实测直接 `AttributeError`。Core 路径才给 `CursorResult`。
     result = db.connection().execute(stmt, rows)
     db.commit()
+    # 独立会话回读真实提交结果，不依赖 rowcount 或原会话的 ORM 缓存。
+    expected = {(row["symbol"], row["date"]) for row in rows}
+    keys = list(expected)
+    present = set()
+    with Session(bind=db.get_bind()) as check_db:
+        for start in range(0, len(keys), 300):
+            present.update(check_db.execute(select(MarketData.symbol, MarketData.date).where(
+                tuple_(MarketData.symbol, MarketData.date).in_(keys[start:start + 300]),
+            )).all())
+    missing = expected - present
+    if missing:
+        raise RuntimeError(f"行情提交后回读缺少 {len(missing)} 个(symbol,date)，禁止报告采集成功")
+    logger.info(f"[行情] 提交后回读已核验 {len(present)} 个(symbol,date)")
     # `rowcount` 是**真正插入**的行数；被冲突挡掉的不计入 ——
     # 返回值语义（「新增条数」）与改动前一致。
     return result.rowcount or 0
+
+
+def check_market_coverage(db: Session, today: date | None = None) -> dict:
+    """只读最近七个已结束 A 股交易日；美股按自身最新日期核对，不套用中国日历。"""
+    from app.collectors.trading_calendar import recent_trading_days
+
+    today = today or date.today()
+    days = recent_trading_days(today)
+    latest = dict(db.execute(select(MarketData.symbol, func.max(MarketData.date)).group_by(MarketData.symbol)).all())
+    gaps = {}
+    if days:
+        rows = db.execute(select(MarketData.symbol, MarketData.date).where(
+            MarketData.date >= datetime.combine(min(days), time.min),
+            MarketData.date < datetime.combine(today, time.min),
+        )).all()
+        present = {(symbol, day.date()) for symbol, day in rows}
+        for day in days:
+            absent = [symbol for symbol, _ in A_SHARE_INDICES if (symbol, day) not in present]
+            if absent:
+                gaps[day.isoformat()] = absent
+    us_day = max((latest[symbol].date() for symbol, _ in US_INDICES if latest.get(symbol)), default=None)
+    us_missing = [symbol for symbol, _ in US_INDICES
+                  if not latest.get(symbol) or latest[symbol].date() != us_day]
+    result = {
+        "history_status": "unknown" if not days else "incomplete" if gaps else "complete",
+        "a_share_gaps": gaps, "us_missing_latest": us_missing,
+        "latest_by_symbol": {symbol: value.isoformat() for symbol, value in latest.items()},
+    }
+    logger.info(f"[行情核验] 最新日期={result['latest_by_symbol']}")
+    if days is None or not days:
+        logger.warning("[行情核验] 交易日历不可用，近期历史覆盖未知")
+    if gaps:
+        logger.warning(f"[行情核验] 最近已结束的 A 股交易日存在缺口：{gaps}")
+    if us_missing:
+        logger.warning(f"[行情核验] 美股自身最新日期缺少指数：{us_missing}；不按 A 股交易日断言美股缺失")
+    return result
 
 
 # 行情采集互斥锁（**进程级**，与新闻侧的 `_COLLECT_LOCK` 同款）。

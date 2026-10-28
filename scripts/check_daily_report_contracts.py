@@ -187,7 +187,7 @@ class DailyReportContracts(unittest.TestCase):
         self.assertEqual(json.loads(second.content)["market_summary"], "通过的第二版")
 
     def test_concurrent_audit_failure_does_not_replace_winner(self):
-        winner = SimpleNamespace(id=42, content=json.dumps({"is_passed": True}), score=0.6)
+        winner = SimpleNamespace(id=42, date=NOW, content=json.dumps({"is_passed": True}), score=0.6)
         db = MagicMock()
         db.query.return_value.filter.return_value.first.side_effect = [None, winner]
         db.commit.side_effect = IntegrityError("mock insert", {}, Exception("unique conflict"))
@@ -224,7 +224,7 @@ class DailyReportContracts(unittest.TestCase):
         self.assertEqual(kept.title, "其他会话已恢复")
 
     def test_concurrent_failure_does_not_replace_winner(self):
-        winner = SimpleNamespace(id=42, content=json.dumps({"market_summary": "并发成功"}), score=0.6)
+        winner = SimpleNamespace(id=42, date=NOW, content=json.dumps({"market_summary": "并发成功"}), score=0.6)
         db = MagicMock()
         db.query.return_value.filter.return_value.first.side_effect = [None, winner]
         db.commit.side_effect = IntegrityError("mock insert", {}, Exception("unique conflict"))

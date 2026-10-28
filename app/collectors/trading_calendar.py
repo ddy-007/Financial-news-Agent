@@ -141,6 +141,23 @@ def is_degraded(ensure_loaded: bool = False) -> bool:
     return _degraded
 
 
+def recent_trading_days(before: date, limit: int = 7) -> list[date] | None:
+    """只读最近已结束日期；不联网、不用工作日猜测完整性。"""
+    dates = _dates if _loaded and not _degraded else None
+    if dates is None:
+        cached = _read_cache()
+        try:
+            if not cached or int(cached.get("covers_year") or 0) < before.year:
+                return None
+            dates = {date.fromisoformat(value) for value in cached["dates"]}
+        except (KeyError, TypeError, ValueError):
+            return None
+    if not dates or max(dates).year < before.year:
+        return None
+    history = sorted((day for day in dates if day < before), reverse=True)
+    return history[:limit] if len(history) >= limit else None
+
+
 def is_trading_day(d: date | datetime | None = None) -> bool:
     """今天（或指定日）是否为 A 股交易日。"""
     if isinstance(d, datetime):

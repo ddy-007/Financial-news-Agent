@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from itertools import zip_longest
 
 from sqlalchemy.orm import Session
 
@@ -34,7 +35,8 @@ CRITIC_SYSTEM_PROMPT = """你是严苛的金融风控核查员，负责审计全
 有任何疑点则驳回，严禁默认通过。"""
 
 
-def load_news_evidence(db: Session, rows: list, cutoff: datetime) -> tuple[str, list[str]]:
+def _load_news_evidence(db: Session, rows: list, cutoff: datetime,
+                        max_chars: int | None) -> tuple[str, list[str]]:
     """读取本次选取新闻的归档全文；缺档/损坏/超限会明确阻止审计通过。"""
     blocks: list[str] = []
     issues: list[str] = []
@@ -92,7 +94,7 @@ def load_news_evidence(db: Session, rows: list, cutoff: datetime) -> tuple[str, 
             except (ValueError, TypeError, KeyError):
                 issues.append(f"原文 {raw.id} 无法完整校验（格式、正文或时间不合规）")
                 continue
-            if size + len(block) + 1 > MAX_EVIDENCE_CHARS:
+            if max_chars is not None and size + len(block) + 1 > max_chars:
                 issues.append(f"原文 {raw.id} 超出全文上下文预算，需缩小选取范围")
                 continue
             blocks.append(block)
@@ -102,9 +104,9 @@ def load_news_evidence(db: Session, rows: list, cutoff: datetime) -> tuple[str, 
             has_representative |= (title == row.title and body == row.content)
             has_stored_time |= published == row.publish_time
         missing_sources = expected_sources - seen_sources
-        # 无 URL 的代表来源可以借用另一成员的展示链接；后续合并也会保存此展示组合。
+        # _insert_new 总是从来源列表取首个 URL，未必属于代表来源（即使代表自带 URL）。
         display_pair = (row.source, row.url or None)
-        if ((row.source, None) in seen_sources
+        if (any(source == row.source for source, _ in seen_sources)
                 and any(url == row.url for _, url in seen_sources)):
             missing_sources.discard(display_pair)
         if missing_sources or not has_representative or not has_stored_time:
@@ -112,6 +114,34 @@ def load_news_evidence(db: Session, rows: list, cutoff: datetime) -> tuple[str, 
     if not unique:
         issues.append("本轮未取得新闻原文，不能完成全文事实核验")
     return "\n".join(blocks) or "无可核验原文", issues
+
+
+def load_news_evidence(db: Session, rows: list, cutoff: datetime) -> tuple[str, list[str]]:
+    """严格读取指定范围，超出预算仍明确失败（供单独审计及兼容调用方）。"""
+    return _load_news_evidence(db, rows, cutoff, MAX_EVIDENCE_CHARS)
+
+
+def select_news_evidence(db: Session, groups: list[list], cutoff: datetime) -> tuple[set[str], str, list[str], int]:
+    """各输入组轮流取整条新闻，先定全文预算，再给所有撰稿角色分发同一范围。"""
+    candidates = {}
+    for batch in zip_longest(*groups):
+        for row in batch:
+            if row is not None:
+                candidates.setdefault(row.id, row)
+    selected: set[str] = set()
+    blocks, issues = [], []
+    size = 0
+    for row in candidates.values():
+        text, problems = _load_news_evidence(db, [row], cutoff, None)
+        if size + len(text) + bool(blocks) > MAX_EVIDENCE_CHARS:
+            continue  # 整组原文一起排除，不让未纳入全文的标题进入专家输入。
+        selected.add(row.id)
+        size += len(text) + bool(blocks)
+        blocks.append(text)
+        issues.extend(problems)
+    if not selected:
+        issues.append("本轮未取得预算内的新闻原文，不能完成全文事实核验")
+    return selected, "\n".join(blocks) or "无可核验原文", issues, len(candidates) - len(selected)
 
 
 def run_critic(llm, ctx: dict, final: dict) -> CriticVerdict:

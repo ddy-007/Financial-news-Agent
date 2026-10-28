@@ -1,5 +1,6 @@
 """APScheduler 定时调度：新闻增量采集 / 行情采集 / 每日研判。"""
 import os
+import json
 import time
 from pathlib import Path
 
@@ -110,7 +111,7 @@ def _job_news() -> None:
 def _job_market() -> None:
     from app.collectors.trading_calendar import is_trading_day
     from app.db import SessionLocal
-    from app.services.market_service import collect_and_store_market
+    from app.services.market_service import check_market_coverage, collect_and_store_market
 
     if not is_trading_day():
         logger.info("[调度] 今日非交易日，跳过行情采集")
@@ -118,7 +119,8 @@ def _job_market() -> None:
     db = SessionLocal()
     try:
         n = collect_and_store_market(db)
-        logger.info(f"[调度] 行情采集完成，新增 {n} 条")
+        coverage = check_market_coverage(db)
+        logger.info(f"[调度] 行情任务结束，新增 {n} 条；历史覆盖={coverage['history_status']}")
     finally:
         db.close()
 
@@ -198,7 +200,22 @@ def _job_report() -> None:
     db = SessionLocal()
     try:
         report = run_daily_pipeline(db)
-        logger.info(f"[调度] 每日研判完成: {report.sentiment} score={report.score}")
+        action = db.info.get("daily_report_write", {}).get("action")
+        if action == "kept_existing":
+            logger.warning(f"[调度] 本轮新稿被丢弃，保留日报 id={report.id}（生成于 {report.date}）")
+        else:
+            try:
+                content = json.loads(report.content)
+            except (TypeError, ValueError):
+                content = {}
+            if isinstance(content, dict) and content.get("is_passed") is False:
+                logger.warning(
+                    f"[调度] 每日研判新稿已保存但审计未通过：id={report.id} "
+                    f"状态={content.get('critic_status')} 生成于 {report.date} "
+                    f"分析时点={(content.get('data_freshness') or {}).get('analyzed_at')}"
+                )
+            else:
+                logger.info(f"[调度] 每日研判新稿已保存: id={report.id} {report.sentiment} score={report.score}")
     except Exception:
         # ⚠️ **这个 except 不能省**（2026-10-22 复审发现 S1-1）。
         #
