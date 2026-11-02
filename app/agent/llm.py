@@ -4,6 +4,7 @@
 每个分组的三项配置留空时，回落到 `DEEPSEEK_*`——所以**不配任何分组变量，
 行为与拆分前完全一致**。
 """
+import json
 from datetime import datetime, timedelta
 from typing import Callable
 
@@ -22,6 +23,7 @@ from openai import (
 )
 
 from app.config import settings
+from app.agent.llm_errors import error_details
 
 # 分组名 -> (api_key 字段, base_url 字段, model 字段, 关闭思考的开关字段)
 _GROUPS = {
@@ -384,7 +386,7 @@ def with_output_parser(llm, parser: Callable):
 
 
 def with_structured_output(llm, schema):
-    """在每级主备客户端内部约束结构，保留回调、冷却与异常策略。"""
+    """每级主备独立校验；auto 工具选择兼容思考模式，无有效工具结果仍失败。"""
     if isinstance(llm, RunnableBinding):
         return llm.model_copy(update={"bound": with_structured_output(llm.bound, schema)})
     if isinstance(llm, RunnableWithFallbacks):
@@ -392,8 +394,20 @@ def with_structured_output(llm, schema):
             "runnable": with_structured_output(llm.runnable, schema),
             "fallbacks": [with_structured_output(fallback, schema) for fallback in llm.fallbacks],
         })
-    # function_calling 兼容现有 OpenAI 协议服务；None/拒答同样触发校验和备用。
-    return llm.with_structured_output(schema, method="function_calling") | RunnableLambda(schema.model_validate)
+    # 思考模式不支持强制指定工具（实测 deepseek-flash 返回 HTTP 400）。
+    # auto 保留原生工具 schema；是否调用及结果仍须通过下方严格校验。
+    structured = llm.with_structured_output(schema, method="function_calling", tool_choice="auto")
+
+    def invoke(messages, config, **kwargs):
+        try:
+            return schema.model_validate(structured.invoke(messages, config=config, **kwargs))
+        except Exception as exc:
+            logger.warning("[Critic] 结构化调用失败 model={} error={}",
+                           getattr(llm, "model_name", "unknown"),
+                           json.dumps(error_details(exc), ensure_ascii=False))
+            raise
+
+    return RunnableLambda(invoke)
 
 
 def get_llm(temperature: float = 0.0, *, part: str,

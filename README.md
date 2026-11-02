@@ -84,6 +84,9 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 streamlit run frontend/streamlit_app.py
 ```
 
+前端通过 `st.navigation` 显式注册六个中文页面，避免与本地 `frontend/pages/` 自动发现产生重复导航。
+审计调用失败表示尚未取得有效核验结论；内容被驳回表示审计发现了具体问题，两者分别提示。
+
 打开浏览器访问（默认 http://localhost:8501）。
 
 ## 手动触发（可选，不依赖定时任务）

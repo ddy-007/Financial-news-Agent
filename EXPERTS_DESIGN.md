@@ -507,6 +507,13 @@ State:
   `not_reviewed/is_passed=false`，不会继承旧版本的通过结论；此路径仍保留原有故障恢复策略。
   周报和交互问答不在本次每日研判审计范围。模型审计降低幻觉风险，不保证消除所有幻觉。
 - 离线验证：`scripts/check_critic_contracts.py`，仅使用假模型、HTTP MockTransport 和内存 SQLite。
+  协议恢复补充验证为 `scripts/check_critic_recovery_contracts.py`：工具结构化输出使用
+  `tool_choice="auto"`，兼容思考模式（本机 deepseek-flash 强制指定工具时返回 HTTP 400）；提示词要求调用
+  `CriticVerdict` 工具，结果仍通过同一严格校验。未调用工具、矛盾或无效输出必须失败，
+  解析校验仍在每级主备切换边界内。普通 400、上下文超限、错误 schema 不重发。
+  日志记录消息条数、证据/底稿字符量及消息 UTF-8 字节量（不含协议包装），以及逐模型脱敏错误。
+  不记录请求正文、认证头或密钥；失败报告的 `critic_error` 保存有限脱敏诊断。
+  前端将调用故障/证据不足等未完成核验与内容驳回分别提示，导航只注册六个中文页面。
   日报链路补充验证为 `scripts/check_daily_chain_contracts.py`，覆盖失败稿更新、条件更新竞态、
   预算前置选取、真实缺档拒审、行情回读与准确日志。审计降级总有 `degraded_reason`；
   已有首席降级原因保留，其他未通过状态记为 `critic_<status>`。

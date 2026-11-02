@@ -107,10 +107,18 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
         return
 
     if c.get("is_passed") is False:
-        st.error(
-            f"🛑 **审计未通过**（状态：{c.get('critic_status', '未完成')}，"
-            f"已修正 {c.get('retry_count', 0)} 次）。本报告含未核验内容，请勿据此直接决策。"
-        )
+        status = c.get("critic_status")
+        if status == "rejected":
+            st.error(
+                f"🛑 **审计未通过：内容被驳回**，已修正 {c.get('retry_count', 0)} 次。"
+                "审计发现具体问题，请查看批注。"
+            )
+        else:
+            reason = {
+                "error": "审计调用失败", "incomplete_sources": "原文证据不完整",
+                "skipped": "缺少分析师底稿", "not_reviewed": "报告改写后尚未复审",
+            }.get(status, "审计尚未完成")
+            st.warning(f"⚠️ **尚未完成核验：{reason}**。这份报告尚无有效审计结论，请勿据此直接决策。")
         if c.get("critic_feedback"):
             with st.expander("查看审计批注"):
                 st.write(c["critic_feedback"])
@@ -122,7 +130,7 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
     if fr.get("evidence_excluded_count"):
         st.warning(
             f"⚠️ **新闻选取限制**：全文预算使 {fr['evidence_excluded_count']} 条候选新闻未纳入本次研判；"
-            "报告仅核验已选取的全文，不能据此断言某事件未发生。"
+            "分析范围仅涵盖已选取的全文，不能据此断言某事件未发生。"
         )
     if fr.get("coverage_incomplete"):
         st.warning(
@@ -188,7 +196,7 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
     c1, c2, c3 = st.columns(3)
     c1.metric("市场情绪", data.get("sentiment", "中性"))
     c2.metric("综合情绪分", _fmt_score(data.get("score")))
-    c3.metric("置信度", data.get("confidence", ""))
+    c3.metric("置信度", {"high": "高", "medium": "中", "low": "低"}.get(data.get("confidence"), "—"))
 
     # —— 专家观点 ——
     # 顶部使用可展开区域，保留完整观点、证据和不确定性，避免窄屏多列压缩。
@@ -205,7 +213,7 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
                 f"综合分 {_fmt_score(o.get('score'))}"
             )
             with st.expander(label):
-                st.caption(f"置信度：{o.get('confidence', '')}")
+                st.caption("置信度：" + {"high": "高", "medium": "中", "low": "低"}.get(o.get("confidence"), "—"))
                 key_points = o.get("key_points") or []
                 if not isinstance(key_points, list):
                     key_points = []
@@ -255,8 +263,9 @@ def page_dashboard(data: dict | None = None, *, include_market: bool = True):
     if div is not None:
         desc = "高度一致" if div < 0.5 else ("严重分歧" if div > 1.0 else "存在分歧")
         veto = "　⚠️ 风险官已下调置信度" if data.get("risk_veto") else ""
+        confidence = {"high": "高", "medium": "中", "low": "低"}.get(data.get("confidence"), "—")
         st.info(
-            f"专家分歧度：**{div:.2f}**（{desc}）　最终置信度：**{data.get('confidence', '')}**{veto}"
+            f"专家分歧度：**{div:.2f}**（{desc}）　最终置信度：**{confidence}**{veto}"
         )
 
     consensus_note = c.get("consensus_note")
@@ -778,22 +787,16 @@ def main():
         _cached_get.clear()
         st.rerun()
 
-    page = st.sidebar.radio(
-        "导航",
-        ["每日研判", "周度综述", "新闻流", "行情", "AI 问答", "历史与回测"],
-    )
-    if page == "每日研判":
-        page_dashboard()
-    elif page == "周度综述":
-        page_weekly()
-    elif page == "新闻流":
-        page_news()
-    elif page == "行情":
-        page_market()
-    elif page == "AI 问答":
-        page_chat()
-    else:
-        page_history()
+    # 显式注册可调用页面，关闭 pages/ 目录自动发现，避免两套导航及空白模块页。
+    page = st.navigation([
+        st.Page(page_dashboard, title="每日研判", default=True),
+        st.Page(page_weekly, title="周度综述"),
+        st.Page(page_news, title="新闻流"),
+        st.Page(page_market, title="行情"),
+        st.Page(page_chat, title="AI 问答"),
+        st.Page(page_history, title="历史与回测"),
+    ])
+    page.run()
 
 
 if __name__ == "__main__":

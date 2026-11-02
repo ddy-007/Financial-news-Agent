@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from itertools import zip_longest
 
+from loguru import logger
 from sqlalchemy.orm import Session
 
 from app.agent.llm import with_structured_output
@@ -32,7 +33,7 @@ CRITIC_SYSTEM_PROMPT = """你是严苛的金融风控核查员，负责审计全
 4. 每个缺陷写明报告字段、错误表述、对应证据标识和原句（无出处则明确写无出处），
    revision_instructions 给出可执行的删除或更正要求。不得为了通过而删除真实风险。
 只有所有事实与数据均吻合且无遗漏风险才 is_passed=true；通过时 flaws=[] 且修订指令为空。
-有任何疑点则驳回，严禁默认通过。"""
+有任何疑点则驳回，严禁默认通过。必须调用 CriticVerdict 工具提交审计结论。"""
 
 
 def _load_news_evidence(db: Session, rows: list, cutoff: datetime,
@@ -153,4 +154,10 @@ def run_critic(llm, ctx: dict, final: dict) -> CriticVerdict:
         ("system", CRITIC_SYSTEM_PROMPT),
         ("human", json.dumps({"原始证据": evidence, "分析师最新报告": final}, ensure_ascii=False)),
     ]
+    logger.info(
+        "[Critic] 请求规模：messages={} evidence_chars={} draft_chars={} message_utf8_bytes={}",
+        len(messages), len(str(evidence["news_fulltext"])),
+        len(json.dumps(final, ensure_ascii=False)),
+        sum(len(content.encode("utf-8")) for _, content in messages),
+    )
     return with_structured_output(llm, CriticVerdict).invoke(messages)

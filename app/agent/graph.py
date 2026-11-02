@@ -34,6 +34,7 @@ from app.agent.experts import (
 )
 from app.agent.indicators import compute_indicators, format_indicators
 from app.agent.llm import get_llm, get_llm_model_name, with_output_parser
+from app.agent.llm_errors import error_details
 from app.agent.prompts import REPORT_PROMPT_TEMPLATE
 from app.agent.schemas import ExpertOpinion, RiskOpinion
 from app.config import settings
@@ -597,6 +598,7 @@ def critic_node(state: AnalystState) -> dict:
     flaws: list[str] = []
     passed = False
     critic_model = None
+    critic_error = None
     if not state.get("opinions"):
         status, feedback = "skipped", "分析师未产出底稿，未完成审计。"
     elif ctx.get("evidence_issues") or not ctx.get("news_fulltext"):
@@ -614,11 +616,14 @@ def critic_node(state: AnalystState) -> dict:
                 *flaws, "修订指令：" + verdict.revision_instructions,
             ])
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[Critic] 审计异常，禁止默认通过：{type(exc).__name__}")
+            critic_error = error_details(exc)
+            logger.warning("[Critic] 审计异常，禁止默认通过：{}",
+                           json.dumps(critic_error, ensure_ascii=False))
             status, feedback = "error", f"审计调用或结构校验失败（{type(exc).__name__}），本报告未通过核验。"
     retries = state.get("retry_count", 0)
     final.update(is_passed=passed, critic_status=status, critic_feedback=feedback,
-                 critic_flaws=flaws, retry_count=retries, critic_model=critic_model)
+                 critic_flaws=flaws, retry_count=retries, critic_model=critic_model,
+                 critic_error=critic_error)
     if not passed:
         final["degraded"] = True
         final["degraded_reason"] = final.get("degraded_reason") or f"critic_{status}"
