@@ -70,7 +70,7 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 > **要对外提供服务，请自己做**（本项目的定位是单机学习研究）：
 > 1. 反向代理 + 鉴权（别让反代无保护转发）；
 > 2. 用防火墙 / 安全组限制来源；
-> 3. 收紧 `app/main.py` 里 `allow_origins=["*"]` 的 CORS 来源；
+> 3. 按实际部署地址配置 `app/main.py` 的 CORS 来源（默认仅 `http://localhost:8501`）；
 > 4. 不要因为「想远程看看」就改回 `0.0.0.0`。
 >
 > 另外：**不要用 `--workers N`**。每个 uvicorn worker 都会跑一遍 lifespan、
@@ -81,11 +81,14 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ### 4. 启动前端
 
 ```bash
-streamlit run frontend/streamlit_app.py
+streamlit run frontend/app.py
 ```
 
 前端通过 `st.navigation` 显式注册六个中文页面，避免与本地 `frontend/pages/` 自动发现产生重复导航。
 审计调用失败表示尚未取得有效核验结论；内容被驳回表示审计发现了具体问题，两者分别提示。
+原命令 `streamlit run frontend/streamlit_app.py` 继续可用，转到同一套模块实现。
+行情和板块缓存 30 秒，一般查询（含新闻日期列表）60 秒，报告查询 300 秒；侧边栏“刷新数据”和成功写操作会清除全部查询缓存，AI 问答不清缓存。
+前端离线回归：`.venv/Scripts/python.exe -B scripts/check_frontend_contracts.py`，使用假接口验证新旧入口、六页导航、审计展示、翻页与缓存，不调用真实模型。
 
 打开浏览器访问（默认 http://localhost:8501）。
 
@@ -146,7 +149,12 @@ app/
   services/          业务（入库/报告/回测）
   api/               路由
 frontend/
-  streamlit_app.py   前端看板
+  app.py            前端入口与六页导航
+  streamlit_app.py   旧启动命令兼容入口
+  api_client.py     API、异常提示与分级缓存
+  constants.py      颜色常量
+  utils.py          格式化工具
+  pages/            日报、周报、新闻、行情、问答、历史回测
 ```
 
 详见 `DESIGN.md`（完整设计文档）。

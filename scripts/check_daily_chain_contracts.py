@@ -258,14 +258,19 @@ class LoggingContracts(unittest.TestCase):
             self.assertIsNone(T.recent_trading_days(NOW.date(), 7))
 
     def test_frontend_discloses_budget_exclusion_without_claiming_no_news(self):
-        source = Path("frontend/streamlit_app.py")
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                     and node.name in ("page_dashboard", "_fmt_score")]
+        # 拆分后 page_dashboard 在 pages/dashboard.py，_fmt_score 在 utils.py
+        dashboard_source = Path("frontend/pages/dashboard.py")
+        utils_source = Path("frontend/utils.py")
+        dashboard_tree = ast.parse(dashboard_source.read_text(encoding="utf-8"))
+        utils_tree = ast.parse(utils_source.read_text(encoding="utf-8"))
+        functions = [n for n in utils_tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "_fmt_score"]
+        functions += [node for node in dashboard_tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "page_dashboard"]
         st = MagicMock()
         st.columns.side_effect = lambda n: [MagicMock() for _ in range(n)]
-        namespace = {"st": st}
-        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
+        namespace = {"st": st, "api_get": MagicMock(return_value=None)}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "frontend", "exec"), namespace)
         namespace["page_dashboard"]({"low_info": True, "content": {
             "data_freshness": {"evidence_excluded_count": 3},
         }}, include_market=False)

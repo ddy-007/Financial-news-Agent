@@ -454,14 +454,19 @@ class EvidenceContracts(unittest.TestCase):
 
 class FrontendContracts(unittest.TestCase):
     def test_rejected_report_exposes_status_and_feedback(self):
-        source = Path("frontend/streamlit_app.py")
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                 and n.name in ("page_dashboard", "_fmt_score")]
+        # 拆分后 page_dashboard 在 pages/dashboard.py，_fmt_score 在 utils.py
+        dashboard_source = Path("frontend/pages/dashboard.py")
+        utils_source = Path("frontend/utils.py")
+        dashboard_tree = ast.parse(dashboard_source.read_text(encoding="utf-8"))
+        utils_tree = ast.parse(utils_source.read_text(encoding="utf-8"))
+        nodes = [n for n in utils_tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_fmt_score"]
+        nodes += [n for n in dashboard_tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "page_dashboard"]
         st = MagicMock()
         st.columns.side_effect = lambda n: [MagicMock() for _ in range(n)]
-        namespace = {"st": st}
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+        namespace = {"st": st, "api_get": MagicMock(return_value=None)}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "frontend", "exec"), namespace)
         namespace["page_dashboard"]({"content": {
             "is_passed": False, "retry_count": 2, "critic_status": "rejected",
             "critic_feedback": "删除无依据利润率",

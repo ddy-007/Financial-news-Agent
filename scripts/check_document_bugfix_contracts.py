@@ -365,10 +365,12 @@ class DocumentBugfixContracts(unittest.TestCase):
             self.assertEqual(DA._nearest_existing(self.db, [cand], np.array([[1.0]])), [None])
 
     def test_risk_display_avoids_duplicate_and_keeps_unlisted_risks(self):
-        file = Path(__file__).resolve().parents[1] / "frontend" / "streamlit_app.py"
+        file = Path(__file__).resolve().parents[1] / "frontend" / "pages" / "dashboard.py"
         tree = ast.parse(file.read_text(encoding="utf-8"))
-        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                 and n.name in ("page_dashboard", "_fmt_score")]
+        utils = file.parents[1] / "utils.py"
+        utils_tree = ast.parse(utils.read_text(encoding="utf-8"))
+        nodes = [n for n in utils_tree.body if isinstance(n, ast.FunctionDef) and n.name == "_fmt_score"]
+        nodes += [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "page_dashboard"]
         st = MagicMock()
         st.columns.side_effect = lambda n: [MagicMock() for _ in range(n)]
         ns = {"st": st}

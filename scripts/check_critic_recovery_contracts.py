@@ -180,17 +180,32 @@ class RecoveryContracts(unittest.TestCase):
 
 class FrontendContracts(unittest.TestCase):
     def setUp(self):
-        source = Path("frontend/streamlit_app.py")
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                 and n.name in ("page_dashboard", "_fmt_score", "main")]
+        # 拆分后 page_dashboard 在 pages/dashboard.py，_fmt_score 在 utils.py，main 在 app.py
+        dashboard_source = Path("frontend/pages/dashboard.py")
+        utils_source = Path("frontend/utils.py")
+        app_source = Path("frontend/app.py")
+
+        dashboard_tree = ast.parse(dashboard_source.read_text(encoding="utf-8"))
+        utils_tree = ast.parse(utils_source.read_text(encoding="utf-8"))
+        app_tree = ast.parse(app_source.read_text(encoding="utf-8"))
+
+        dashboard_nodes = [n for n in dashboard_tree.body if isinstance(n, ast.FunctionDef)
+                           and n.name == "page_dashboard"]
+        utils_nodes = [n for n in utils_tree.body if isinstance(n, ast.FunctionDef)
+                       and n.name == "_fmt_score"]
+        app_nodes = [n for n in app_tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "main"]
+        nodes = utils_nodes + dashboard_nodes + app_nodes
+
         self.st = MagicMock()
         self.st.columns.side_effect = lambda n: [MagicMock() for _ in range(n)]
         self.ns = {"st": self.st, "get_api_base": lambda: "http://mock.invalid",
                    "page_weekly": MagicMock(), "page_news": MagicMock(), "page_market": MagicMock(),
-                   "page_chat": MagicMock(), "page_history": MagicMock()}
+                   "page_chat": MagicMock(), "page_history": MagicMock(),
+                   "api_get": MagicMock(return_value=None), "_fmt_score": None}
         self.st.sidebar.button.return_value = False
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), self.ns)
+        # 先执行 _fmt_score，再执行其他依赖它的函数
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "frontend", "exec"), self.ns)
 
     def render(self, status):
         self.ns["page_dashboard"]({"content": {"is_passed": False, "critic_status": status,
@@ -236,7 +251,7 @@ class FrontendContracts(unittest.TestCase):
                                   request=httpx.Request("GET", url))
 
         with patch.object(httpx.Client, "get", fake_get):
-            at = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "frontend/streamlit_app.py"),
+            at = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "frontend/app.py"),
                                    default_timeout=20).run()
         self.assertEqual(len(at.exception), 0)
         self.assertEqual(len(at.sidebar.radio), 0)

@@ -202,9 +202,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="金融新闻情报简报 Agent", version="0.1.0", lifespan=lifespan)
 
+# CORS：仅允许 Streamlit 前端（默认 8501 端口）的跨域请求。
+# 生产部署时按实际前端地址修改；不再使用 allow_origins=["*"] 以避免
+# 任意域名发起跨域请求带来的安全风险。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8501"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -110,17 +110,21 @@ def main() -> int:
     check("自定义 fallback", _clamp_limit(None, fallback=5), 5)
 
     print("\n[5] 前端源码守卫（巡检 M2）")
-    src = (ROOT / "frontend" / "streamlit_app.py").read_text(encoding="utf-8")
+    # 拆分后 page_dashboard 在 pages/dashboard.py，_fmt_score 在 utils.py
+    dashboard_src = (ROOT / "frontend" / "pages" / "dashboard.py").read_text(encoding="utf-8")
+    utils_src = (ROOT / "frontend" / "utils.py").read_text(encoding="utf-8")
+    src = dashboard_src + "\n" + utils_src
     bad = re.findall(r"\.get\([^)]*\)\s*:\+\.2f", src)
     check("不再有 `xxx.get(...):+.2f` 这类写法", bad, [],
           "键存在但值为 None 时 `.get(k, 0)` 的默认值**不生效**，"
           "`f\"{None:+.2f}\"` 直接抛 TypeError。已统一走 `_fmt_score`")
     check("`_fmt_score` 对非数值返回占位符而不是 0",
-          'return f"{v:+.2f}" if isinstance(v, (int, float)) else "—"' in src, True,
+          'return f"{v:+.2f}" if isinstance(v, (int, float)) else "—"' in utils_src, True,
           "兜成 0 是错的方向：0 是「中性」这个**真实结论**，None 是「拿不到」，"
           "把后者显示成 +0.00 等于凭空造一个结论")
     check("两处分数都改用了 `_fmt_score`",
-          src.count("_fmt_score(data.get(\"score\"))"), 2)
+          sum(path.read_text(encoding="utf-8").count("_fmt_score(data.get(\"score\"))")
+              for path in (ROOT / "frontend" / "pages").glob("*.py")), 2)
 
     print("\n[6] 就绪探针的三档判定（巡检 M8）")
     from app.main import _readiness_status, health  # noqa: PLC0415

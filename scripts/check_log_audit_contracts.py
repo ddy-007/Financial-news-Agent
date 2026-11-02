@@ -232,10 +232,12 @@ class AuditContracts(unittest.TestCase):
         self.assertIn("该时点的采集执行状态未留存", self.chief_prompt(fr))
 
     def dashboard_text(self, fr):
-        source = Path(__file__).resolve().parents[1] / "frontend" / "streamlit_app.py"
+        source = Path(__file__).resolve().parents[1] / "frontend" / "pages" / "dashboard.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
-        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                 and n.name in ("page_dashboard", "_fmt_score")]
+        utils = source.parents[1] / "utils.py"
+        utils_tree = ast.parse(utils.read_text(encoding="utf-8"))
+        nodes = [n for n in utils_tree.body if isinstance(n, ast.FunctionDef) and n.name == "_fmt_score"]
+        nodes += [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "page_dashboard"]
         st = MagicMock()
         st.columns.side_effect = lambda n: [MagicMock() for _ in range(n)]
         namespace = {"st": st}

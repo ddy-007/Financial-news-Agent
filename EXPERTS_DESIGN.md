@@ -620,7 +620,7 @@ State:
 | **Phase 2** | 技术指标计算 | `indicators.py` |
 | **Phase 3** | LangGraph 编排改造 | `graph.py` 重写 |
 | **Phase 4** | 表结构 + 服务层兼容 | `report.py`、`report_service.py` |
-| **Phase 5** | 前端专家卡片展示 | `streamlit_app.py` |
+| **Phase 5** | 前端专家卡片展示 | `frontend/pages/dashboard.py`（入口：`frontend/app.py`） |
 | **Phase 6** | 效果验证与调优 | 对比新旧报告质量 |
 
 > Phase 1~4 完成即可跑通（后端），Phase 5 是展示层。
