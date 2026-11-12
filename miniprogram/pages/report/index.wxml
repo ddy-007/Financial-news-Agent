@@ -1,0 +1,38 @@
+<view class="page">
+  <view class="toolbar">
+    <text class="page-title">最新日报</text>
+    <button class="action refresh" size="mini" bindtap="loadReport" loading="{{loading}}" disabled="{{loading}}">刷新</button>
+  </view>
+
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{loading && !report}}" class="card muted">正在加载日报…</view>
+
+  <block wx:if="{{report}}">
+    <view class="card">
+      <view class="report-meta">
+        <text class="muted">{{report.date}}</text>
+        <text class="badge badge--{{report.auditTone}}">{{report.auditLabel}}</text>
+      </view>
+      <view class="report-title">{{report.title}}</view>
+      <view class="metrics">
+        <view class="metric">
+          <text class="muted">市场情绪</text>
+          <text class="metric-value">{{report.sentiment}}</text>
+        </view>
+        <view class="metric">
+          <text class="muted">综合评分</text>
+          <text class="metric-value">{{report.score}}</text>
+        </view>
+        <view class="metric">
+          <text class="muted">置信度</text>
+          <text class="metric-value">{{report.confidence}}</text>
+        </view>
+      </view>
+    </view>
+
+    <view class="card">
+      <view class="section-title">核心摘要</view>
+      <text class="prose" user-select="true">{{report.summary}}</text>
+    </view>
+  </block>
+</view>

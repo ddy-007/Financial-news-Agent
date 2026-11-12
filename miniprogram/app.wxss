@@ -1,0 +1,63 @@
+page {
+  background: #f1f5f9;
+  color: #0f172a;
+  font-size: 28rpx;
+  line-height: 1.55;
+}
+
+.page {
+  padding: 32rpx 28rpx 44rpx;
+}
+
+.card {
+  padding: 28rpx;
+  margin-bottom: 20rpx;
+  background: #fff;
+  border: 1rpx solid #e2e8f0;
+  border-radius: 22rpx;
+}
+
+.section-title {
+  margin-bottom: 16rpx;
+  font-size: 32rpx;
+  font-weight: 650;
+}
+
+.muted {
+  color: #475569;
+  font-size: 25rpx;
+}
+
+.prose {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.75;
+}
+
+.action {
+  margin: 0;
+  border-radius: 14rpx;
+  background: #0f766e;
+  color: #fff;
+  font-size: 27rpx;
+  font-weight: 600;
+}
+
+.action::after {
+  border: 0;
+}
+
+.action[disabled] {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.error {
+  margin-bottom: 20rpx;
+  padding: 18rpx 24rpx;
+  border-radius: 14rpx;
+  background: #fff1f2;
+  color: #9f1239;
+  overflow-wrap: anywhere;
+}

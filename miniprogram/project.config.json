@@ -1,0 +1,6 @@
+{
+  "compileType": "miniprogram",
+  "miniprogramRoot": "./",
+  "projectname": "financial-news-agent",
+  "setting": { "es6": true }
+}

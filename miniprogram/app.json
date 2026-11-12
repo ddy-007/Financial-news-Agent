@@ -1,0 +1,20 @@
+{
+  "pages": ["pages/report/index", "pages/chat/index"],
+  "window": {
+    "navigationBarTitleText": "金融新闻情报",
+    "navigationBarBackgroundColor": "#f1f5f9",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#f1f5f9"
+  },
+  "tabBar": {
+    "color": "#475569",
+    "selectedColor": "#0f766e",
+    "backgroundColor": "#ffffff",
+    "borderStyle": "white",
+    "list": [
+      { "pagePath": "pages/report/index", "text": "最新日报" },
+      { "pagePath": "pages/chat/index", "text": "AI 问答" }
+    ]
+  },
+  "style": "v2"
+}

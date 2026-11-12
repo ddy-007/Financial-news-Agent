@@ -1,0 +1,69 @@
+.toolbar,
+.report-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toolbar {
+  margin-bottom: 24rpx;
+}
+
+.page-title,
+.report-title {
+  font-size: 38rpx;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.report-title {
+  margin: 16rpx 0 22rpx;
+  overflow-wrap: anywhere;
+}
+
+.refresh {
+  padding: 0 24rpx;
+  background: #d9f1ed;
+  color: #115e59;
+}
+
+.badge {
+  padding: 4rpx 14rpx;
+  border-radius: 20rpx;
+  font-size: 23rpx;
+}
+
+.badge--passed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.badge--rejected {
+  background: #ffe4e6;
+  color: #9f1239;
+}
+
+.badge--pending {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.metrics {
+  display: flex;
+  border-top: 1rpx solid #e2e8f0;
+  padding-top: 20rpx;
+}
+
+.metric {
+  flex: 1;
+  min-width: 0;
+  padding-right: 10rpx;
+}
+
+.metric-value {
+  display: block;
+  margin-top: 6rpx;
+  font-size: 34rpx;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
