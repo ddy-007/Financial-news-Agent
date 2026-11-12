@@ -35,7 +35,7 @@ function askQuestion(query) {
   return request('/api/v1/agent/chat', {
     method: 'POST',
     data: { query, chat_history: [] },
-    timeout: 60000
+    timeout: 180000
   })
 }
 
