@@ -1,0 +1,72 @@
+{
+	admin off
+	persist_config off
+	auto_https disable_redirects
+	skip_install_trust
+	log {
+		format filter {
+			wrap json
+			fields {
+				request delete
+			}
+		}
+	}
+}
+
+(readonly_api) {
+	header Cache-Control "no-store"
+	basic_auth {
+		"{$MINIPROGRAM_GATEWAY_USER}" "{$MINIPROGRAM_GATEWAY_HASH}"
+	}
+	reverse_proxy 127.0.0.1:{$MINIPROGRAM_UPSTREAM_PORT:8000} {
+		header_up -Authorization
+	}
+}
+
+https://{$MINIPROGRAM_GATEWAY_HOST:127.0.0.1:8443} {
+	bind {$MINIPROGRAM_GATEWAY_BIND:127.0.0.1}
+
+	@today {
+		method GET
+		path /api/v1/reports/today
+	}
+	@reports {
+		method GET
+		path /api/v1/reports
+	}
+	@news {
+		method GET
+		path /api/v1/news
+	}
+	@timeline {
+		method GET
+		path_regexp ^/api/v1/news/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/timeline$
+	}
+
+	route {
+		handle @today {
+			rewrite /api/v1/reports/today?
+			import readonly_api
+		}
+		handle @reports {
+			rewrite /api/v1/reports?report_type=daily&limit=10
+			import readonly_api
+		}
+		handle @news {
+			uri query {
+				limit 20
+				-days
+				-start
+				-end
+				-offset
+			}
+			import readonly_api
+		}
+		handle @timeline {
+			import readonly_api
+		}
+		handle {
+			respond 404
+		}
+	}
+}
