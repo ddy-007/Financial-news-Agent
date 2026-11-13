@@ -15,6 +15,32 @@
   width: 100%;
 }
 
+.input-count {
+  margin-top: 8rpx;
+  text-align: right;
+}
+
+.wait-note {
+  margin-top: 14rpx;
+}
+
+.answer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16rpx;
+}
+
+.answer-header .section-title {
+  margin-bottom: 0;
+}
+
+.copy {
+  margin: 0;
+  background: #d9f1ed;
+  color: #115e59;
+}
+
 .asked {
   display: block;
   margin-bottom: 16rpx;

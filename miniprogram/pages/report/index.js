@@ -1,53 +1,53 @@
-const { getLatestReport } = require('../../utils/api')
-
-const CONFIDENCE_LABELS = new Map([['high', '高'], ['medium', '中'], ['low', '低']])
-const AUDIT_LABELS = new Map([
-  ['rejected', ['审计未通过', 'rejected']],
-  ['error', ['审计调用失败', 'pending']],
-  ['incomplete_sources', ['原文证据不完整', 'pending']],
-  ['skipped', ['未执行审计', 'pending']],
-  ['not_reviewed', ['尚未复审', 'pending']]
-])
-
-function displayReport(report) {
-  if (!report || typeof report !== 'object' || Array.isArray(report)) {
-    throw new Error('日报数据格式异常。')
-  }
-  const content = report.content || {}
-  const [auditLabel, auditTone] = content.is_passed === true
-    ? ['审计通过', 'passed']
-    : AUDIT_LABELS.get(content.critic_status) || ['尚未完成核验', 'pending']
-  const date = typeof report.date === 'string' ? report.date.slice(0, 10) : ''
-  const summary = content.market_summary || content.raw
-
-  return {
-    title: report.title || '未命名日报',
-    date: report.report_day || date || '—',
-    sentiment: report.sentiment || '—',
-    score: Number.isFinite(report.score) ? report.score.toFixed(2) : '—',
-    confidence: CONFIDENCE_LABELS.get(report.confidence) || report.confidence || '—',
-    summary: typeof summary === 'string' && summary.trim() ? summary : '暂无摘要。',
-    auditLabel,
-    auditTone
-  }
-}
+const { getLatestReport, requestErrorMessage } = require('../../utils/api')
+const { displayReport, reportDateNotice } = require('../../utils/report')
 
 Page({
-  data: { report: null, loading: false, error: '' },
+  data: { report: null, dateNotice: '', loading: false, empty: false, error: '' },
 
   onLoad() {
     this.loadReport()
   },
 
+  onShow() {
+    if (this.data.report) this.setData({ dateNotice: reportDateNotice(this.data.report.date) })
+  },
+
+  onUnload() {
+    this._unloaded = true
+  },
+
   async loadReport() {
-    if (this.data.loading) return
-    this.setData({ loading: true, error: '' })
+    if (this.data.loading || this._unloaded) return
+    this.setData({ loading: true, empty: false, error: '' })
     try {
-      this.setData({ report: displayReport(await getLatestReport()) })
+      const report = displayReport(await getLatestReport())
+      if (this._unloaded) return
+      if (report) {
+        this.setData({ report, dateNotice: reportDateNotice(report.date) })
+      } else {
+        this.showLoadError('日报数据格式异常。')
+      }
     } catch (error) {
-      this.setData({ error: error.message || '加载日报失败。' })
+      if (this._unloaded) return
+      if (error.kind === 'http' && error.statusCode === 404 && !this.data.report) {
+        this.setData({ empty: true })
+      } else {
+        this.showLoadError(requestErrorMessage(error, 'report'))
+      }
     } finally {
-      this.setData({ loading: false })
+      if (!this._unloaded) this.setData({ loading: false })
+    }
+  },
+
+  showLoadError(message) {
+    const { report } = this.data
+    if (report) {
+      this.setData({
+        error: `刷新失败，仍显示上次加载的日报。${message}`,
+        dateNotice: reportDateNotice(report.date)
+      })
+    } else {
+      this.setData({ error: message })
     }
   }
 })

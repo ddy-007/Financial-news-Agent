@@ -21,6 +21,10 @@
   overflow-wrap: anywhere;
 }
 
+.report-note {
+  margin-bottom: 12rpx;
+}
+
 .refresh {
   padding: 0 24rpx;
   background: #d9f1ed;

@@ -4,19 +4,27 @@
     <textarea
       class="question-input"
       placeholder="例如：最近有哪些影响市场情绪的新闻？"
-      maxlength="-1"
+      maxlength="{{maxQuestionLength}}"
       value="{{query}}"
       bindinput="onInput"
       disabled="{{sending}}"
     />
+    <view class="input-count muted">{{queryLength}} / {{maxQuestionLength}}</view>
     <button class="action send" bindtap="sendQuestion" loading="{{sending}}" disabled="{{sending || !hasQuery}}">
-      {{sending ? '正在检索与回答…' : '发送'}}
+      {{sending ? '等待回答' : '发送'}}
     </button>
+    <view wx:if="{{sending}}" class="wait-note muted">
+      正在检索与回答，已等待 {{elapsedSeconds}} 秒。
+      <view wx:if="{{elapsedSeconds >= 30}}">复杂问题可能需要较长时间，请勿重复发送。</view>
+    </view>
   </view>
 
   <view wx:if="{{error}}" class="error">{{error}}</view>
   <view wx:if="{{answer}}" class="card">
-    <view class="section-title">回答</view>
+    <view class="answer-header">
+      <text class="section-title">回答</text>
+      <button class="copy action" size="mini" bindtap="copyAnswer">复制答案</button>
+    </view>
     <text class="asked muted">{{question}}</text>
     <text class="prose" user-select="true">{{answer}}</text>
   </view>

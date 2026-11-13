@@ -6,6 +6,7 @@
 
   <view wx:if="{{error}}" class="error">{{error}}</view>
   <view wx:if="{{loading && !report}}" class="card muted">正在加载日报…</view>
+  <view wx:if="{{empty}}" class="card muted">暂无日报。可稍后点击刷新查看。</view>
 
   <block wx:if="{{report}}">
     <view class="card">
@@ -14,6 +15,8 @@
         <text class="badge badge--{{report.auditTone}}">{{report.auditLabel}}</text>
       </view>
       <view class="report-title">{{report.title}}</view>
+      <view wx:if="{{dateNotice}}" class="report-note muted">{{dateNotice}}</view>
+      <view class="report-note muted">{{report.auditNote}}</view>
       <view class="metrics">
         <view class="metric">
           <text class="muted">市场情绪</text>
