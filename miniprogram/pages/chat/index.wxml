@@ -1,3 +1,7 @@
+<template name="answer-inline">
+  <text class="answer-text" user-select="true"><text wx:for="{{spans}}" wx:for-item="span" wx:key="id" class="answer-inline-{{span.style}}">{{span.text}}</text></text>
+</template>
+
 <view class="page">
   <view class="card">
     <view class="section-title">你的问题</view>
@@ -26,6 +30,28 @@
       <button class="copy action" size="mini" bindtap="copyAnswer">复制答案</button>
     </view>
     <text class="asked muted">{{question}}</text>
-    <text class="prose" user-select="true">{{answer}}</text>
+    <view class="answer-body">
+      <block wx:for="{{answerBlocks}}" wx:for-item="part" wx:key="id">
+        <view wx:if="{{part.kind === 'heading'}}" class="answer-block answer-heading {{part.level <= 2 ? 'answer-heading-main' : ''}}">
+          <template is="answer-inline" data="{{spans: part.spans}}" />
+        </view>
+        <view wx:elif="{{part.kind === 'table'}}" class="answer-block">
+          <view wx:for="{{part.rows}}" wx:for-item="row" wx:key="id" class="answer-table-row">
+            <view wx:for="{{row.cells}}" wx:for-item="cell" wx:key="id" class="answer-table-cell">
+              <view class="answer-table-label"><template is="answer-inline" data="{{spans: cell.label}}" /></view>
+              <template is="answer-inline" data="{{spans: cell.spans}}" />
+            </view>
+          </view>
+        </view>
+        <view wx:elif="{{part.kind === 'item'}}" class="answer-block answer-item">
+          <text class="answer-marker">{{part.marker}}</text>
+          <view class="answer-item-body"><template is="answer-inline" data="{{spans: part.spans}}" /></view>
+        </view>
+        <view wx:elif="{{part.kind === 'code'}}" class="answer-block answer-code"><text class="answer-text" user-select="true">{{part.text}}</text></view>
+        <view wx:else class="answer-block {{part.kind === 'notice' ? 'answer-notice' : ''}}">
+          <template is="answer-inline" data="{{spans: part.spans}}" />
+        </view>
+      </block>
+    </view>
   </view>
 </view>

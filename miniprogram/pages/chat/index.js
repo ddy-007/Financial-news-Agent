@@ -1,10 +1,11 @@
 const { askQuestion, requestErrorMessage } = require('../../utils/api')
+const { formatAnswer } = require('../../utils/answer')
 
 const MAX_QUESTION_LENGTH = 1000
 
 Page({
   data: {
-    query: '', hasQuery: false, question: '', answer: '', sending: false, error: '',
+    query: '', hasQuery: false, question: '', answer: '', answerBlocks: [], sending: false, error: '',
     maxQuestionLength: MAX_QUESTION_LENGTH, queryLength: 0, elapsedSeconds: 0
   },
 
@@ -33,7 +34,7 @@ Page({
       return
     }
 
-    this.setData({ sending: true, question: query, answer: '', error: '', elapsedSeconds: 0 })
+    this.setData({ sending: true, question: query, answer: '', answerBlocks: [], error: '', elapsedSeconds: 0 })
     const startedAt = Date.now()
     this._waitTimer = setInterval(() => {
       if (!this._unloaded) {
@@ -45,7 +46,7 @@ Page({
       const response = await askQuestion(query)
       if (this._unloaded) return
       const answer = response && typeof response.answer === 'string' ? response.answer.trim() : ''
-      this.setData(answer ? { answer } : { error: '未收到有效回答，请稍后重试。' })
+      this.setData(answer ? { answer, answerBlocks: formatAnswer(answer) } : { error: '未收到有效回答，请稍后重试。' })
     } catch (error) {
       if (!this._unloaded) this.setData({ error: requestErrorMessage(error, 'chat') })
     } finally {

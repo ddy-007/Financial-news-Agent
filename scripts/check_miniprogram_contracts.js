@@ -1,6 +1,49 @@
 const assert = require('node:assert/strict')
 const { test } = require('node:test')
 const { displayReport, reportDateNotice } = require('../miniprogram/utils/report')
+const { formatAnswer } = require('../miniprogram/utils/answer')
+
+test('长回答的标题、加粗、时效提示、证据表和编号均保留为可读区块', () => {
+  const sample = [
+    '## 最新一份日报（2026-11-06）', '',
+    '**报告**：《美联储鹰派叠加美股暴跌 全球风险资产承压》',
+    '**情绪：偏空，综合分 -0.537**', '',
+    '⚠️ **时效说明**：这份报告生成于 **2026 年 11 月 6 日**。', '',
+    '## 一条主要风险', '',
+    '| 环节 | 依据（含日期） |', '|---|---|',
+    '| 触发源 | 纳指100 跌 6.24%（2026-11-06） |',
+    '| A 股传导 | **成交额 1.67 万亿** |', '',
+    '## 几处需要打折扣的地方', '',
+    '1. **行情时间差**：`get_market_overview` 的快照滞后。',
+    '2. **周末事件**：影响尚无数据验证。'
+  ].join('\n')
+  const blocks = formatAnswer(sample)
+  assert.deepEqual(blocks.map(block => block.kind), ['heading', 'paragraph', 'notice', 'heading', 'table', 'heading', 'item', 'item'])
+  assert.equal(blocks[0].spans[0].text, '最新一份日报（2026-11-06）')
+  assert.ok(blocks[1].spans.some(span => span.style === 'strong' && span.text.includes('-0.537')))
+  assert.ok(blocks[2].spans.some(span => span.style === 'strong' && span.text === '时效说明'))
+  const rows = blocks[4].rows
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].cells[0].spans[0].text, '触发源')
+  assert.equal(rows[1].cells[1].label[0].text, '依据（含日期）')
+  assert.equal(rows[1].cells[1].spans[0].text, '成交额 1.67 万亿')
+  assert.equal(blocks[7].marker, '2.')
+  assert.ok(blocks[6].spans.some(span => span.style === 'code' && span.text === 'get_market_overview'))
+})
+
+test('不完整表格行保留原文，标签与代码只作为文本传给页面', () => {
+  const blocks = formatAnswer([
+    '| 名称 | 依据 |', '|---|---|', '| x \\| y | `a|b` |',
+    '正文 | 保留原样', '| 不完整 |', '', '<img src="https://example.com/a.png">',
+    '```text', '## 代码中的标题保留原样', '```'
+  ].join('\n'))
+  assert.deepEqual(blocks.map(block => block.kind), ['table', 'paragraph', 'paragraph', 'code'])
+  assert.equal(blocks[0].rows[0].cells[0].spans.map(span => span.text).join(''), 'x | y')
+  assert.equal(blocks[0].rows[0].cells[1].spans[0].text, 'a|b')
+  assert.equal(blocks[1].spans[0].text, '正文 | 保留原样\n| 不完整 |')
+  assert.equal(blocks[2].spans[0].text, '<img src="https://example.com/a.png">')
+  assert.equal(blocks[3].text, '## 代码中的标题保留原样')
+})
 
 function loadPage(name) {
   const path = require.resolve(`../miniprogram/pages/${name}/index`)
@@ -137,14 +180,15 @@ test('问答页阻止空白、超长及重复发送，显示等待并支持复�
   time.mock.mockImplementation(() => 32000)
   tick()
   assert.equal(page.data.elapsedSeconds, 31)
-  requests[0].success({ statusCode: 200, data: { answer: ' 测试回答\n第二行 ' } })
+  requests[0].success({ statusCode: 200, data: { answer: ' ## 测试回答\n**第二行** ' } })
   await pending
   assert.equal(page.data.sending, false)
   assert.equal(intervals.size, 0)
+  assert.deepEqual(page.data.answerBlocks.map(block => block.kind), ['heading', 'paragraph'])
   let copied
   wx.setClipboardData = ({ data }) => { copied = data }
   page.copyAnswer()
-  assert.equal(copied, '测试回答\n第二行')
+  assert.equal(copied, '## 测试回答\n**第二行**')
 })
 
 test('问答失败后保留输入，恢复发送且不自动重试', async (t) => {
