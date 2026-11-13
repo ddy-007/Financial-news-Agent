@@ -49,6 +49,25 @@
   overflow-wrap: anywhere;
 }
 
+.turn-note {
+  margin-bottom: 8rpx;
+}
+
+.turn-row {
+  padding: 14rpx 18rpx;
+  border-radius: 12rpx;
+  color: #334155;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn-row-active {
+  background: #e2f2ef;
+  color: #115e59;
+  font-weight: 600;
+}
+
 .answer-body {
   color: #26364a;
   line-height: 1.75;

@@ -299,6 +299,70 @@ test('问答失败后保留输入，恢复发送且不自动重试', async (t) =
   }
 })
 
+test('追问只携带成功问答，失败保留上一轮，新对话从空上下文开始', async (t) => {
+  const requests = mockRequests(t)
+  const page = loadPage('chat')
+  const input = value => page.onInput({ detail: { value } })
+  input('市场情绪如何？')
+  let pending = page.sendQuestion()
+  assert.deepEqual(requests[0].data.chat_history, [])
+  requests[0].success({ statusCode: 200, data: { answer: '**偏空**' } })
+  await pending
+  assert.equal(page.data.query, '')
+  input('为什么？')
+  pending = page.sendQuestion()
+  page.newConversation()
+  assert.deepEqual(requests[1].data, { query: '为什么？', chat_history: [['市场情绪如何？', '**偏空**']] })
+  requests[1].success({ statusCode: 500 })
+  await pending
+  assert.equal(page.data.query, '为什么？')
+  assert.equal(page.data.answer, '**偏空**')
+  assert.equal(page.data.recentQuestions.length, 1)
+  pending = page.sendQuestion()
+  assert.deepEqual(requests[2].data, requests[1].data)
+  requests[2].success({ statusCode: 200, data: { answer: '科技板块承压。' } })
+  await pending
+  assert.equal(page.data.answer, '科技板块承压。')
+  page.selectTurn({ currentTarget: { dataset: { index: 0 } } })
+  assert.equal(page.data.answer, '**偏空**')
+  page.newConversation()
+  assert.equal(page.data.answer, '')
+  assert.deepEqual(page.data.recentQuestions, [])
+  input('新话题')
+  pending = page.sendQuestion()
+  assert.deepEqual(requests[3].data, { query: '新话题', chat_history: [] })
+  requests[3].success({ statusCode: 200, data: { answer: '新答案' } })
+  await pending
+})
+
+test('问答上下文最多三轮且不超过字符预算，较长原答案仍完整显示', async (t) => {
+  const requests = mockRequests(t)
+  const page = loadPage('chat')
+  const ask = question => {
+    page.onInput({ detail: { value: question } })
+    return page.sendQuestion()
+  }
+  for (let index = 0; index < 4; index++) {
+    const pending = ask(`问题${index}`)
+    requests[index].success({ statusCode: 200, data: { answer: `回答${index}` } })
+    await pending
+  }
+  let pending = ask('长答案')
+  assert.deepEqual(requests[4].data.chat_history, [['问题1', '回答1'], ['问题2', '回答2'], ['问题3', '回答3']])
+  const answer = '内容'.repeat(5000)
+  requests[4].success({ statusCode: 200, data: { answer } })
+  await pending
+  assert.equal(page.data.answer, answer)
+  pending = ask('继续解释')
+  const history = requests[5].data.chat_history
+  assert.equal(history.length, 1)
+  assert.equal(history[0][0], '长答案')
+  assert.match(history[0][1], /较长回答已截断/)
+  assert.ok(history[0][0].length + history[0][1].length <= 8000)
+  requests[5].success({ statusCode: 200, data: { answer: '说明' } })
+  await pending
+})
+
 test('问答页卸载即清理计时，忽略晚到的请求结果', async (t) => {
   const requests = mockRequests(t)
   const page = loadPage('chat')

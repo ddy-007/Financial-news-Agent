@@ -57,10 +57,10 @@ function getDailyReports() {
   return request('/api/v1/reports?report_type=daily&limit=10', { timeout: 12000 })
 }
 
-function askQuestion(query) {
+function askQuestion(query, history = []) {
   return request('/api/v1/agent/chat', {
     method: 'POST',
-    data: { query, chat_history: [] },
+    data: { query, chat_history: history },
     timeout: 180000
   })
 }

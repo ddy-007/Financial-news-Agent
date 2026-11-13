@@ -2,10 +2,33 @@ const { askQuestion, requestErrorMessage } = require('../../utils/api')
 const { formatAnswer } = require('../../utils/answer')
 
 const MAX_QUESTION_LENGTH = 1000
+const MAX_HISTORY_TURNS = 3
+const MAX_HISTORY_LENGTH = 8000
+const TRUNCATED_ANSWER = '\n[较长回答已截断]'
+
+function requestHistory(turns) {
+  const history = []
+  let remaining = MAX_HISTORY_LENGTH
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const { question, answer } = turns[index]
+    if (question.length + answer.length > remaining) {
+      if (!history.length) {
+        const limit = remaining - question.length - TRUNCATED_ANSWER.length
+        const prefix = answer.slice(0, limit).replace(/[\uD800-\uDBFF]$/, '')
+        history.unshift([question, prefix + TRUNCATED_ANSWER])
+      }
+      break
+    }
+    history.unshift([question, answer])
+    remaining -= question.length + answer.length
+  }
+  return history
+}
 
 Page({
   data: {
     query: '', hasQuery: false, question: '', answer: '', answerBlocks: [], sending: false, error: '',
+    recentQuestions: [], activeTurn: -1,
     maxQuestionLength: MAX_QUESTION_LENGTH, queryLength: 0, elapsedSeconds: 0
   },
 
@@ -17,6 +40,26 @@ Page({
   onUnload() {
     this._unloaded = true
     this.stopWaitTimer()
+    this._turns = []
+  },
+
+  newConversation() {
+    if (this.data.sending || this._unloaded) return
+    this._turns = []
+    this.setData({
+      query: '', queryLength: 0, hasQuery: false, question: '', answer: '', answerBlocks: [],
+      recentQuestions: [], activeTurn: -1, error: '', elapsedSeconds: 0
+    })
+  },
+
+  selectTurn(event) {
+    const index = Number(event.currentTarget.dataset.index)
+    const turn = this._turns && this._turns[index]
+    if (turn && index !== this.data.activeTurn) this.showTurn(turn, index)
+  },
+
+  showTurn({ question, answer }, index, update = {}) {
+    this.setData({ ...update, question, answer, answerBlocks: formatAnswer(answer), activeTurn: index })
   },
 
   stopWaitTimer() {
@@ -34,7 +77,8 @@ Page({
       return
     }
 
-    this.setData({ sending: true, question: query, answer: '', answerBlocks: [], error: '', elapsedSeconds: 0 })
+    const turns = this._turns || []
+    this.setData({ sending: true, error: '', elapsedSeconds: 0 })
     const startedAt = Date.now()
     this._waitTimer = setInterval(() => {
       if (!this._unloaded) {
@@ -43,10 +87,19 @@ Page({
       }
     }, 1000)
     try {
-      const response = await askQuestion(query)
+      const response = await askQuestion(query, requestHistory(turns))
       if (this._unloaded) return
       const answer = response && typeof response.answer === 'string' ? response.answer.trim() : ''
-      this.setData(answer ? { answer, answerBlocks: formatAnswer(answer) } : { error: '未收到有效回答，请稍后重试。' })
+      if (!answer) {
+        this.setData({ error: '未收到有效回答，请稍后重试。' })
+        return
+      }
+      const turn = { question: query, answer }
+      this._turns = [...turns, turn].slice(-MAX_HISTORY_TURNS)
+      this.showTurn(turn, this._turns.length - 1, {
+        query: '', queryLength: 0, hasQuery: false,
+        recentQuestions: this._turns.map((item, index) => ({ index, question: item.question })).reverse()
+      })
     } catch (error) {
       if (!this._unloaded) this.setData({ error: requestErrorMessage(error, 'chat') })
     } finally {
