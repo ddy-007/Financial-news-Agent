@@ -90,9 +90,9 @@ class DocumentBugfixContracts(unittest.TestCase):
         with patch.object(T, "SessionLocal", side_effect=lambda: Session(self.engine)):
             for kwargs in ({"keyword": "央行"}, {"category": "宏观"},
                            {"keyword": "央行", "category": "宏观", "limit": 1}):
-                self.assertIn("央行政策", T.get_recent_news.func(**kwargs))
-            self.assertEqual(T.get_recent_news.func(keyword="不存在"), "暂无新闻。")
-            self.assertEqual(len(T.get_recent_news.func(limit=-1).splitlines()), 1)
+                self.assertIn("央行政策", T.get_recent_news.invoke(kwargs))
+            self.assertEqual(T.get_recent_news.invoke({"keyword": "不存在"}), "暂无新闻。")
+            self.assertEqual(len(T.get_recent_news.invoke({"limit": -1}).splitlines()), 1)
 
     def test_json_string_brackets_nested_and_code_fence(self):
         value = {"note": '字符串中的 [ ] { } 和 "引号"', "nested": {"items": [1, 2]}}
@@ -268,7 +268,7 @@ class DocumentBugfixContracts(unittest.TestCase):
         self.assertEqual(T._search_window("2026-09-01政策", now=NOW)[0], datetime(2026, 9, 1))
         with self.assertRaises(ValueError):
             T._search_window("x", "2026-10-17", now=NOW)
-        self.assertIn("日期无效", T.search_news.func("x", "invalid"))
+        self.assertIn("日期无效", T.search_news.invoke({"query": "x", "start": "invalid"}))
 
     def test_bounded_retrieval_uses_same_candidates_and_metadata(self):
         older = self.news("旧", dt=NOW - timedelta(days=40))

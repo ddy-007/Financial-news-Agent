@@ -25,10 +25,29 @@ function requestHistory(turns) {
   return history
 }
 
+function displaySources(sources) {
+  if (!Array.isArray(sources)) return []
+  const seen = new Set()
+  const results = []
+  for (const source of sources) {
+    if (!source || typeof source.id !== 'string' || !source.id.trim() ||
+        typeof source.title !== 'string' || !source.title.trim() || seen.has(source.id)) continue
+    seen.add(source.id)
+    results.push({
+      id: source.id,
+      title: source.title,
+      publishedAt: typeof source.published_at === 'string' ? source.published_at.replace('T', ' ') : '',
+      url: typeof source.url === 'string' && /^https?:\/\/[^\s\\]+$/i.test(source.url) ? source.url : ''
+    })
+    if (results.length === 10) break
+  }
+  return results
+}
+
 Page({
   data: {
     query: '', hasQuery: false, question: '', answer: '', answerBlocks: [], sending: false, error: '',
-    recentQuestions: [], activeTurn: -1,
+    recentQuestions: [], activeTurn: -1, sources: [],
     maxQuestionLength: MAX_QUESTION_LENGTH, queryLength: 0, elapsedSeconds: 0
   },
 
@@ -48,7 +67,7 @@ Page({
     this._turns = []
     this.setData({
       query: '', queryLength: 0, hasQuery: false, question: '', answer: '', answerBlocks: [],
-      recentQuestions: [], activeTurn: -1, error: '', elapsedSeconds: 0
+      recentQuestions: [], activeTurn: -1, sources: [], error: '', elapsedSeconds: 0
     })
   },
 
@@ -58,8 +77,8 @@ Page({
     if (turn && index !== this.data.activeTurn) this.showTurn(turn, index)
   },
 
-  showTurn({ question, answer }, index, update = {}) {
-    this.setData({ ...update, question, answer, answerBlocks: formatAnswer(answer), activeTurn: index })
+  showTurn({ question, answer, sources }, index, update = {}) {
+    this.setData({ ...update, question, answer, sources, answerBlocks: formatAnswer(answer), activeTurn: index })
   },
 
   stopWaitTimer() {
@@ -94,7 +113,7 @@ Page({
         this.setData({ error: '未收到有效回答，请稍后重试。' })
         return
       }
-      const turn = { question: query, answer }
+      const turn = { question: query, answer, sources: displaySources(response.sources) }
       this._turns = [...turns, turn].slice(-MAX_HISTORY_TURNS)
       this.showTurn(turn, this._turns.length - 1, {
         query: '', queryLength: 0, hasQuery: false,
@@ -109,11 +128,19 @@ Page({
   },
 
   copyAnswer() {
-    if (!this.data.answer) return
+    if (this.data.answer) this.copyText(this.data.answer, '复制失败，请长按答案复制')
+  },
+
+  copySource(event) {
+    const source = this.data.sources[Number(event.currentTarget.dataset.index)]
+    if (source && source.url) this.copyText(source.url, '链接复制失败')
+  },
+
+  copyText(data, failureMessage) {
     wx.setClipboardData({
-      data: this.data.answer,
+      data,
       fail: () => {
-        if (!this._unloaded) wx.showToast({ title: '复制失败，请长按答案复制', icon: 'none' })
+        if (!this._unloaded) wx.showToast({ title: failureMessage, icon: 'none' })
       }
     })
   }

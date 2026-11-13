@@ -168,7 +168,7 @@ class HybridRetriever:
                     q = q.filter(News.publish_time >= since)
                 chunks = [{"id": row.id, "text": f"{row.title}\n{row.content or ''}", "metadata": {
                     "news_id": row.id, "title": row.title, "source": row.source,
-                    "publish_time": row.publish_time.isoformat(), "category": row.category or "",
+                    "publish_time": row.publish_time.isoformat(), "category": row.category or "", "url": row.url,
                 }} for row in q.order_by(News.id).all()]
             if not chunks:
                 return []

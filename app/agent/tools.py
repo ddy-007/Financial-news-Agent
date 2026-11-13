@@ -6,6 +6,7 @@ import httpx
 from langchain_core.tools import tool
 from sqlalchemy import func
 
+from app.agent.chat_sources import ChatSource, news_source
 from app.config import settings
 from app.db import SessionLocal
 from app.models.market import MarketData
@@ -49,8 +50,8 @@ def _search_window(query: str, start: str = "", end: str = "", *, now=None):
     return since, cutoff
 
 
-@tool
-def search_news(query: str, start: str = "", end: str = "") -> str:
+@tool(response_format="content_and_artifact")
+def search_news(query: str, start: str = "", end: str = "") -> tuple[str, list[ChatSource]]:
     """语义检索金融新闻并返回来源、时间、正文。默认近7天；今天/昨天及YYYY-MM-DD按日期过滤。
 
     查询历史须提供 start/end（YYYY-MM-DD 或本地 ISO 时间）；可仅给 end 查询此前历史。
@@ -58,19 +59,23 @@ def search_news(query: str, start: str = "", end: str = "") -> str:
     try:
         since, cutoff = _search_window(query, start, end)
     except ValueError as exc:
-        return f"检索日期无效：{exc}"
+        return f"检索日期无效：{exc}", []
     hits = get_retriever().hybrid_search(query, top_k=5, since=since, until=cutoff)
     window = f"检索范围：{since.isoformat() if since else '历史记录'} 至 {cutoff.isoformat()}"
     if not hits:
-        return window + "\n该时间范围内未检索到相关新闻。"
+        return window + "\n该时间范围内未检索到相关新闻。", []
     lines = [window]
+    sources = []
     for h in hits:
         meta = h.metadata
         lines.append(
             f"- [{meta.get('source', '')}] {meta.get('title', '')}\n  {h.text[:200]}"
             f"（时间 {meta.get('publish_time', '')}）"
         )
-    return "\n".join(lines)
+        source = news_source(h.id, meta.get("title"), meta.get("publish_time"), meta.get("url"))
+        if source is not None:
+            sources.append(source)
+    return "\n".join(lines), sources
 
 
 # Agent 工具的**硬上限**。这些参数是 **LLM 生成**的，不是人填的 ——
@@ -122,8 +127,8 @@ def get_market_overview() -> str:
         db.close()
 
 
-@tool
-def get_recent_news(keyword: str = "", category: str = "", limit: int = 10) -> str:
+@tool(response_format="content_and_artifact")
+def get_recent_news(keyword: str = "", category: str = "", limit: int = 10) -> tuple[str, list[ChatSource]]:
     """按关键词或分类查询最近新闻。category 取 宏观/政策/行业/公司/国际/资金 之一（可空）。"""
     db = SessionLocal()
     try:
@@ -136,7 +141,12 @@ def get_recent_news(keyword: str = "", category: str = "", limit: int = 10) -> s
         lines = [
             f"- [{r.source}][{r.category}] {r.title}（{r.publish_time}）" for r in rows
         ]
-        return "\n".join(lines) if lines else "暂无新闻。"
+        sources = []
+        for row in rows:
+            source = news_source(row.id, row.title, row.publish_time, row.url)
+            if source is not None:
+                sources.append(source)
+        return ("\n".join(lines) if lines else "暂无新闻。"), sources
     finally:
         db.close()
 

@@ -363,6 +363,38 @@ test('问答上下文最多三轮且不超过字符预算，较长原答案仍�
   await pending
 })
 
+test('问答来源跟随所选轮次，只复制合法链接，兼容旧接口', async (t) => {
+  const requests = mockRequests(t)
+  const page = loadPage('chat')
+  let copied = ''
+  wx.setClipboardData = ({ data }) => { copied = data }
+  page.onInput({ detail: { value: '第一问' } })
+  let pending = page.sendQuestion()
+  requests[0].success({ statusCode: 200, data: { answer: '第一答', sources: [
+    { id: 'a', title: '新闻 A', published_at: '2026-11-05T12:00:00', url: 'https://example.com/a' },
+    { id: 'a', title: '重复' },
+    { id: 'b', title: '新闻 B', url: 'javascript:alert(1)' },
+    { id: 'bad', title: null }
+  ] } })
+  await pending
+  assert.deepEqual(page.data.sources.map(source => source.title), ['新闻 A', '新闻 B'])
+  assert.equal(page.data.sources[0].publishedAt, '2026-11-05 12:00:00')
+  page.copySource({ currentTarget: { dataset: { index: 1 } } })
+  assert.equal(copied, '')
+  page.copySource({ currentTarget: { dataset: { index: 0 } } })
+  assert.equal(copied, 'https://example.com/a')
+  page.onInput({ detail: { value: '第二问' } })
+  pending = page.sendQuestion()
+  assert.deepEqual(requests[1].data.chat_history, [['第一问', '第一答']])
+  requests[1].success({ statusCode: 200, data: { answer: '旧接口只返回文本' } })
+  await pending
+  assert.deepEqual(page.data.sources, [])
+  page.selectTurn({ currentTarget: { dataset: { index: 0 } } })
+  assert.equal(page.data.sources[0].id, 'a')
+  page.newConversation()
+  assert.deepEqual(page.data.sources, [])
+})
+
 test('问答页卸载即清理计时，忽略晚到的请求结果', async (t) => {
   const requests = mockRequests(t)
   const page = loadPage('chat')

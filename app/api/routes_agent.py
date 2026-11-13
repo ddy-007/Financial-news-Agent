@@ -1,16 +1,22 @@
 """Agent 问答接口。"""
 from fastapi import APIRouter
 from langchain_core.messages import AIMessage, HumanMessage
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app.agent.react_agent import chat
+from app.agent.chat_sources import ChatSource
+from app.agent.react_agent import chat_with_sources
 
 router = APIRouter(prefix="/api/v1/agent", tags=["agent"])
 
 
 class ChatRequest(BaseModel):
     query: str
-    chat_history: list[list[str]] = []  # 形如 [[user, ai], ...]
+    chat_history: list[list[str]] = Field(default_factory=list)  # 形如 [[user, ai], ...]
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[ChatSource]
 
 
 def _to_history(chat_history: list[list[str]]) -> list:
@@ -22,7 +28,7 @@ def _to_history(chat_history: list[list[str]]) -> list:
     return msgs
 
 
-@router.post("/chat")
-def chat_endpoint(req: ChatRequest):
-    answer = chat(req.query, _to_history(req.chat_history))
-    return {"answer": answer}
+@router.post("/chat", response_model=ChatResponse)
+def chat_endpoint(req: ChatRequest) -> ChatResponse:
+    answer, sources = chat_with_sources(req.query, _to_history(req.chat_history))
+    return ChatResponse(answer=answer, sources=sources)

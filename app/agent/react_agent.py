@@ -1,7 +1,8 @@
 """交互式问答 Agent（LangChain 1.x 的 create_agent）。"""
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
+from app.agent.chat_sources import ChatSource, collect_chat_sources
 from app.agent.llm import get_llm
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.tools import ALL_TOOLS
@@ -30,19 +31,20 @@ def get_chat_agent():
     return _agent
 
 
-def chat(query: str, chat_history: list | None = None) -> str:
-    """执行一次对话，返回文本回答。chat_history 为 LangChain 消息对象列表。"""
+def chat_with_sources(query: str, chat_history: list[BaseMessage] | None = None) -> tuple[str, list[ChatSource]]:
+    """一次调用，同时返回最终文本和本轮新闻工具提供的来源。"""
     agent = get_chat_agent()
     messages = list(chat_history or [])
     messages.append(HumanMessage(content=query))
+    initial_count = len(messages)
     result = agent.invoke({"messages": messages})
     msgs = result.get("messages", [])
-    if not msgs:
-        return ""
-    content = msgs[-1].content
-    if isinstance(content, list):  # 新版 content 可能是 block 列表
-        content = "".join(
-            part if isinstance(part, str) else getattr(part, "text", str(part))
-            for part in content
-        )
-    return content
+    if len(msgs) <= initial_count or not isinstance(msgs[-1], AIMessage) or msgs[-1].tool_calls:
+        return "", []
+    answer = msgs[-1].text
+    return answer, collect_chat_sources(msgs[initial_count:]) if answer.strip() else []
+
+
+def chat(query: str, chat_history: list[BaseMessage] | None = None) -> str:
+    """兼容只需要文本回答的调用方。"""
+    return chat_with_sources(query, chat_history)[0]

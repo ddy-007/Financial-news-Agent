@@ -154,3 +154,26 @@
   flex: 1;
   min-width: 0;
 }
+
+.source-note {
+  margin-bottom: 12rpx;
+}
+
+.source-row {
+  padding: 16rpx 0;
+  border-top: 1rpx solid #e2e8f0;
+}
+
+.source-title {
+  display: block;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.source-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8rpx;
+}
