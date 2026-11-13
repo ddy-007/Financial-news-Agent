@@ -1,0 +1,42 @@
+<view class="page">
+  <view class="card">
+    <view class="section-title">关注关键词</view>
+    <view class="keyword-editor">
+      <input class="keyword-input" placeholder="公司、行业或主题" value="{{input}}" maxlength="{{maxLength}}" disabled="{{storageUnavailable}}" bindinput="onInput" bindconfirm="addKeyword" confirm-type="done" />
+      <button class="action keyword-action" size="mini" bindtap="addKeyword" disabled="{{!input || storageUnavailable}}">添加</button>
+    </view>
+    <view wx:if="{{storageError}}" class="storage-error">{{storageError}}</view>
+    <view wx:if="{{keywords.length}}" class="keyword-list">
+      <view wx:for="{{keywords}}" wx:key="*this" class="keyword-pair {{active === item ? 'keyword-active' : ''}}">
+        <button class="keyword" size="mini" data-keyword="{{item}}" bindtap="selectKeyword">{{item}}</button>
+        <button class="keyword keyword-remove" size="mini" aria-label="移除关注 {{item}}" data-keyword="{{item}}" bindtap="removeKeyword">×</button>
+      </view>
+    </view>
+    <view wx:else class="muted keyword-empty">添加一个关键词，例如「半导体」。关注只保存在当前设备。</view>
+  </view>
+
+  <view wx:if="{{active}}" class="card">
+    <view class="watch-header">
+      <text class="section-title">{{active}}</text>
+      <button class="action keyword-action" size="mini" bindtap="refreshNews" loading="{{loading}}" disabled="{{loading}}">刷新</button>
+    </view>
+    <view class="muted watch-scope">按已入库新闻的标题匹配，最多显示最近 20 条。</view>
+    <view wx:if="{{newsError}}" class="error">{{newsError}}</view>
+    <view wx:elif="{{loading}}" class="muted">正在读取新闻…</view>
+    <view wx:elif="{{loaded && !news.length}}" class="muted">暂无标题包含该关键词的新闻。</view>
+    <view wx:for="{{news}}" wx:key="id" class="watch-row">
+      <view aria-role="button" data-id="{{item.id}}" bindtap="toggleNews">
+        <text class="watch-title">{{item.title}}</text>
+        <view class="watch-meta muted">
+          <text wx:if="{{item.source}}">{{item.source}}</text>
+          <text>{{item.date || '时间未提供'}}</text>
+          <text class="watch-toggle">{{expandedId === item.id ? '收起' : '查看'}}</text>
+        </view>
+      </view>
+      <view wx:if="{{expandedId === item.id}}" class="watch-detail">
+        <text class="prose" user-select="true">{{expandedText || '暂无新闻正文。'}}</text>
+        <button wx:if="{{expandedLink}}" class="action keyword-action link-button" size="mini" data-id="{{item.id}}" bindtap="copyLink">复制关联链接</button>
+      </view>
+    </view>
+  </view>
+</view>

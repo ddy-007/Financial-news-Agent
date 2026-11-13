@@ -71,6 +71,70 @@ function mockRequests(t) {
   return requests
 }
 
+test('关注保存在本机，重新打开时只查询一个标题关键词', async (t) => {
+  const requests = mockRequests(t)
+  const storage = new Map()
+  wx.getStorageSync = key => storage.get(key)
+  wx.setStorageSync = (key, value) => storage.set(key, value)
+  wx.navigateTo = ({ url }) => assert.equal(url, '/pages/watchlist/index')
+  loadPage('report').openWatchlist()
+  const page = loadPage('watchlist')
+  await page.onLoad()
+  assert.equal(requests.length, 0)
+  page.onInput({ detail: { value: '  AI_%  ' } })
+  let pending = page.addKeyword()
+  assert.match(requests[0].url, /\/api\/v1\/news$/)
+  assert.equal(requests[0].method, 'GET')
+  assert.deepEqual(requests[0].data, { keyword: 'AI_%', limit: 20 })
+  requests[0].success({ statusCode: 200, data: [{ id: '1', title: 'AI_% 报道', content: '正文'.repeat(3000), url: 'https://example.com/1' }] })
+  await pending
+  assert.equal(page.data.news[0].title, 'AI_% 报道')
+  assert.equal(page.data.news[0].content, undefined)
+  page.toggleNews({ currentTarget: { dataset: { id: '1' } } })
+  assert.equal(page.data.expandedId, '1')
+  assert.equal(page.data.expandedText, `${'正文'.repeat(1500)}\n…（正文预览）`)
+  wx.setClipboardData = ({ data }) => assert.equal(data, 'https://example.com/1')
+  page.copyLink({ currentTarget: { dataset: { id: '1' } } })
+  const reopened = loadPage('watchlist')
+  pending = reopened.onLoad()
+  assert.deepEqual(reopened.data.keywords, ['AI_%'])
+  requests[1].success({ statusCode: 200, data: [] })
+  await pending
+  reopened.onInput({ detail: { value: 'ai_%' } })
+  pending = reopened.addKeyword()
+  requests[2].success({ statusCode: 200, data: [] })
+  await pending
+  assert.deepEqual(reopened.data.keywords, ['AI_%'])
+  await reopened.removeKeyword({ currentTarget: { dataset: { keyword: 'AI_%' } } })
+  assert.equal(reopened.data.active, '')
+  assert.deepEqual([...storage.values()], [[]])
+})
+
+test('关注切换丢弃过期响应，网络错误可重试，存储失败不伪装成成功', async (t) => {
+  const requests = mockRequests(t)
+  wx.getStorageSync = () => ['半导体', '黄金']
+  wx.setStorageSync = () => { throw Error('Storage unavailable') }
+  const page = loadPage('watchlist')
+  const old = page.onLoad()
+  let current = page.selectKeyword({ currentTarget: { dataset: { keyword: '黄金' } } })
+  requests[1].fail({ errMsg: 'request:fail timeout' })
+  await current
+  requests[0].success({ statusCode: 200, data: [{ id: 'old', title: '过期新闻' }] })
+  await old
+  assert.equal(page.data.active, '黄金')
+  assert.match(page.data.newsError, /读取新闻超时/)
+  assert.deepEqual(page.data.news, [])
+  current = page.refreshNews()
+  requests[2].success({ statusCode: 200, data: [] })
+  await current
+  assert.equal(page.data.loaded, true)
+  page.onInput({ detail: { value: '政策' } })
+  await page.addKeyword()
+  assert.deepEqual(page.data.keywords, ['半导体', '黄金'])
+  assert.equal(page.data.input, '政策')
+  assert.match(page.data.storageError, /保存失败/)
+})
+
 test('历史日报按业务日排序去重，保留旧日期来源和无日期详情', () => {
   const reports = historyReports([
     { report_day: '2026-11-06', date: '2026-11-10T10:00:00', title: '回补的周五', score: 0 },

@@ -7,6 +7,7 @@
   <view class="history-actions">
     <button class="action history-button" size="mini" bindtap="openHistory">历史日报</button>
     <button wx:if="{{report && report.date !== '—'}}" class="action history-button" size="mini" bindtap="comparePrevious">与上期相比</button>
+    <button class="action history-button" size="mini" bindtap="openWatchlist">关注</button>
   </view>
 
   <view wx:if="{{error}}" class="error">{{error}}</view>

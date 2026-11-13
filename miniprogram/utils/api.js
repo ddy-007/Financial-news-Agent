@@ -12,7 +12,7 @@ function requestErrorMessage(error, page) {
   if (error.kind === 'timeout') {
     return page === 'chat'
       ? '等待超时，服务端可能仍在处理，请勿连续发送。'
-      : '读取日报超时，请稍后刷新。'
+      : page === 'news' ? '读取新闻超时，请稍后刷新。' : '读取日报超时，请稍后刷新。'
   }
   if (error.kind === 'network') return '无法连接后端，请检查服务地址和网络。'
   if (error.kind === 'http') {
@@ -24,7 +24,8 @@ function requestErrorMessage(error, page) {
     if (status >= 500) return '服务暂时未完成请求，请稍后重试。'
     return `请求失败（HTTP ${status}）。`
   }
-  return page === 'chat' ? '问答请求失败，请稍后重试。' : '加载日报失败，请稍后刷新。'
+  if (page === 'chat') return '问答请求失败，请稍后重试。'
+  return page === 'news' ? '加载新闻失败，请稍后刷新。' : '加载日报失败，请稍后刷新。'
 }
 
 function request(path, { method = 'GET', data, timeout }) {
@@ -57,6 +58,10 @@ function getDailyReports() {
   return request('/api/v1/reports?report_type=daily&limit=10', { timeout: 12000 })
 }
 
+function getWatchedNews(keyword) {
+  return request('/api/v1/news', { data: { keyword, limit: 20 }, timeout: 12000 })
+}
+
 function askQuestion(query, history = []) {
   return request('/api/v1/agent/chat', {
     method: 'POST',
@@ -65,4 +70,4 @@ function askQuestion(query, history = []) {
   })
 }
 
-module.exports = { getLatestReport, getDailyReports, askQuestion, requestErrorMessage }
+module.exports = { getLatestReport, getDailyReports, getWatchedNews, askQuestion, requestErrorMessage }

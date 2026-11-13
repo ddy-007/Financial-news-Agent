@@ -20,6 +20,10 @@ Page({
     wx.navigateTo({ url: '/pages/history/index' })
   },
 
+  openWatchlist() {
+    wx.navigateTo({ url: '/pages/watchlist/index' })
+  },
+
   comparePrevious() {
     const day = this.data.report && this.data.report.date
     if (day && day !== '—') wx.navigateTo({ url: `/pages/history/index?compareDay=${encodeURIComponent(day)}` })
