@@ -39,6 +39,25 @@ curl.exe --noproxy 127.0.0.1 --ssl-revoke-best-effort --cacert "$env:APPDATA\Cad
 
 Windows 自带的 Schannel 版 curl 需要 `--ssl-revoke-best-effort` 处理本地 CA 缺少吊销信息的情况，证书链和主机名仍会校验。使用 `Ctrl+C` 即可停掉前台网关，原有 FastAPI 独立运行。
 
+## 部署探测
+
+在运行 FastAPI 和 Caddy 的主机上执行。探针分别通过回环地址读取 FastAPI 的就绪状态、通过带认证的 HTTPS 读取最新日报。使用本机 Caddy 证书时，在项目根目录打开 PowerShell 并运行以下命令。
+
+```powershell
+$env:MINIPROGRAM_GATEWAY_USER = 'tester'
+.\.venv\Scripts\python.exe -B scripts/probe_miniprogram.py --prompt-password --ca-file "$env:APPDATA\Caddy\pki\authorities\local\root.crt"
+```
+
+正式 HTTPS 网关可用 `--gateway https://你的网关域名` 指定，使用受信任证书时省略 `--ca-file`。若上游监听其他端口，用 `--upstream-port` 指定。接入部署平台时，使用受保护的 `MINIPROGRAM_PROBE_PASSWORD` 环境变量并省略 `--prompt-password`。参数和本地 CA 文件通过校验后，探针输出一行 JSON，只记录状态、HTTP 状态码、耗时、已知依赖状态及日报业务日。参数或 CA 文件错误会写到标准错误流。
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 后端就绪，网关正常返回日报 |
+| `1` | 后端报告降级，或后端明确返回暂无日报 |
+| `2` | 后端不可用、认证或 TLS 失败、接口响应异常，或探针参数错误 |
+
+探针展示最近一期日报的业务日，周末没有新日报不会因此告警。暂停调度时，若后端就绪接口报降级，可通过 `scheduler_running` 判断原因。探针不会生成日报、恢复调度或调用模型。
+
 ## 正式上线前
 
 需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收。用户身份验证与服务端逐用户用量限制接入后，再评审开放问答接口。测试账号密码、模型密钥及通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)

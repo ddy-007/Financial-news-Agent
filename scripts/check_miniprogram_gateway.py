@@ -11,6 +11,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from threading import Thread
 import time
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 CONFIG = Path(__file__).resolve().parents[1] / "deploy" / "miniprogram" / "Caddyfile"
+PROBE = Path(__file__).with_name("probe_miniprogram.py")
 LOOPBACK = "127.0.0.1"
 TODAY = "/api/v1/reports/today"
 REPORTS = "/api/v1/reports"
@@ -34,12 +36,14 @@ class StubUpstream(BaseHTTPRequestHandler):
         if query.get("keyword") == [ERROR_KEYWORD]:
             self.close_connection = True
             return
-        body = json.dumps({
+        default = {
             "path": url.path,
             "query": query,
             "authorization": self.headers.get("Authorization"),
-        }).encode()
-        self.send_response(200)
+        }
+        status, payload = self.server.responses.get(url.path, (200, default))
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Stub-Upstream", "1")
@@ -72,13 +76,15 @@ class GatewayChecks(unittest.TestCase):
     def setUpClass(cls):
         work = Path(cls.enterClassContext(TemporaryDirectory(prefix="ws-miniprogram-gateway-")))
         upstream = cls.enterClassContext(ThreadingHTTPServer((LOOPBACK, 0), StubUpstream))
+        upstream.responses = {}
+        cls.upstream = upstream
         thread = Thread(target=upstream.serve_forever, daemon=True)
         thread.start()
         cls.addClassCleanup(thread.join, 5)
         cls.addClassCleanup(upstream.shutdown)
         cls.port = loopback_port()
 
-        password = secrets.token_urlsafe(18)
+        cls.password = password = secrets.token_urlsafe(18)
         cls.auth = "Basic " + base64.b64encode(f"tester:{password}".encode()).decode()
         command = [cls.caddy, "hash-password", "--algorithm", "bcrypt", "--bcrypt-cost", "4",
                    "--plaintext", password]
@@ -192,6 +198,57 @@ class GatewayChecks(unittest.TestCase):
         self.assertNotIn(ERROR_KEYWORD, log)
         self.assertNotIn(self.auth, log)
         self.assertFalse(self.autosave.exists())
+
+    def test_probe_classifies_readiness_and_report_independently(self):
+        readiness = "/api/v1/health/ready"
+        ready = {"status": "ok", "checks": {"database": True, "bm25_ready": True,
+                                           "scheduler_running": True}}
+        paused = {"status": "degraded", "checks": {**ready["checks"], "scheduler_running": False}}
+        report = {"report_type": "daily", "report_day": "2026-11-06", "date": "2026-11-07T02:00:00",
+                  "title": "report-title-marker", "content": {"raw": "report-body-marker"}}
+        missing_report = {"detail": "暂无研判报告，请先触发生成"}
+        cases = (
+            ("ok", (200, ready), (200, report), self.password, True, 0, "ok", "ok", None),
+            ("paused", (200, paused), (200, report), self.password, True, 1, "degraded", "ok", None),
+            ("no report", (200, ready), (404, missing_report), self.password, True,
+             1, "ok", "degraded", "no_daily_report"),
+            ("wrong route", (200, ready), (404, {"detail": "Not Found"}), self.password, True,
+             2, "ok", "failed", "unexpected_report_response"),
+            ("wrong report type", (200, ready), (200, {**report, "report_type": "weekly"}),
+             self.password, True, 2, "ok", "failed", "unexpected_report_response"),
+            ("database down", (503, {}), (200, report), self.password, True, 2, "failed", "ok", None),
+            ("invalid readiness", (200, {"status": "ok", "checks": {}}), (200, report),
+             self.password, True, 2, "failed", "ok", None),
+            ("gateway failure", (200, ready), (502, {}), self.password, True,
+             2, "ok", "failed", "unexpected_report_response"),
+            ("bad credentials", (200, ready), (200, report), "bad-password", True,
+             2, "ok", "failed", "authentication_failed"),
+            ("untrusted TLS", (200, ready), (200, report), self.password, False,
+             2, "ok", "failed", "tls_verification_failed"),
+            ("invalid JSON", (200, ready), (200, b"broken"), self.password, True,
+             2, "ok", "failed", "invalid_json"),
+            ("JSON integer exceeds parser limit", (200, ready), (200, b'{"number":' + b"9" * 5000 + b"}"),
+             self.password, True, 2, "ok", "failed", "invalid_json"),
+        )
+        self.addCleanup(self.upstream.responses.clear)
+        command = [sys.executable, "-B", str(PROBE), "--gateway", f"https://{LOOPBACK}:{self.port}",
+                   "--upstream-port", str(self.upstream.server_port)]
+        for name, local, via_gateway, password, trust, code, local_status, gateway_status, reason in cases:
+            with self.subTest(name=name):
+                self.upstream.responses.update({readiness: local, TODAY: via_gateway})
+                args = command + (["--ca-file", str(self.root_ca)] if trust else [])
+                env = dict(self.env, MINIPROGRAM_PROBE_PASSWORD=password, PYTHONINTMAXSTRDIGITS="4300")
+                run = subprocess.run(args, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(run.returncode, code, run.stderr)
+                result = json.loads(run.stdout)
+                self.assertEqual(result["status"], ("ok", "degraded", "failed")[code])
+                self.assertEqual(result["readiness"]["status"], local_status)
+                self.assertEqual(result["gateway"]["status"], gateway_status)
+                self.assertEqual(result["gateway"].get("reason"), reason)
+                if gateway_status == "ok":
+                    self.assertEqual(result["gateway"]["report_day"], "2026-11-06")
+                for private_value in (password, "report-title-marker", "report-body-marker"):
+                    self.assertNotIn(private_value, run.stdout + run.stderr)
 
 
 if __name__ == "__main__":
