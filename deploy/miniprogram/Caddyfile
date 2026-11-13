@@ -42,6 +42,12 @@ https://{$MINIPROGRAM_GATEWAY_HOST:127.0.0.1:8443} {
 		method GET
 		path_regexp ^/api/v1/news/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/timeline$
 	}
+	@chat {
+		method POST
+		path /api/v1/agent/chat
+		remote_ip 127.0.0.1 ::1
+		expression `"{$MINIPROGRAM_CHAT_ENABLED:0}" == "1"`
+	}
 
 	route {
 		handle @today {
@@ -64,6 +70,13 @@ https://{$MINIPROGRAM_GATEWAY_HOST:127.0.0.1:8443} {
 		}
 		handle @timeline {
 			import readonly_api
+		}
+		handle @chat {
+			request_body {
+				max_size 65536
+			}
+			rewrite /internal/miniprogram/chat?
+			reverse_proxy 127.0.0.1:{$MINIPROGRAM_CHAT_PORT:8001}
 		}
 		handle {
 			respond 404

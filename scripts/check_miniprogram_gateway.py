@@ -33,6 +33,9 @@ class StubUpstream(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlsplit(self.path)
         query = parse_qs(url.query)
+        if self.command == "POST":
+            self.server.posts.append((url.path, self.headers.get("Authorization"),
+                                      self.rfile.read(int(self.headers.get("Content-Length", "0")))))
         if query.get("keyword") == [ERROR_KEYWORD]:
             self.close_connection = True
             return
@@ -41,7 +44,8 @@ class StubUpstream(BaseHTTPRequestHandler):
             "query": query,
             "authorization": self.headers.get("Authorization"),
         }
-        status, payload = self.server.responses.get(url.path, (200, default))
+        fallback = (404, {"detail": "Not Found"}) if url.path == "/internal/miniprogram/chat" else (200, default)
+        status, payload = self.server.responses.get(url.path, fallback)
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -73,10 +77,15 @@ def stop_process(process):
 
 class GatewayChecks(unittest.TestCase):
     @classmethod
+    def caddy_environment(cls):
+        return {}
+
+    @classmethod
     def setUpClass(cls):
         work = Path(cls.enterClassContext(TemporaryDirectory(prefix="ws-miniprogram-gateway-")))
         upstream = cls.enterClassContext(ThreadingHTTPServer((LOOPBACK, 0), StubUpstream))
         upstream.responses = {}
+        upstream.posts = []
         cls.upstream = upstream
         thread = Thread(target=upstream.serve_forever, daemon=True)
         thread.start()
@@ -94,6 +103,8 @@ class GatewayChecks(unittest.TestCase):
                        MINIPROGRAM_GATEWAY_BIND=LOOPBACK, MINIPROGRAM_GATEWAY_USER="tester",
                        MINIPROGRAM_GATEWAY_HASH=hashed.stdout.strip(),
                        MINIPROGRAM_UPSTREAM_PORT=str(upstream.server_port))
+        cls.env.pop("MINIPROGRAM_CHAT_ENABLED", None)
+        cls.env.update(cls.caddy_environment())
         args = ["--config", str(CONFIG), "--adapter", "caddyfile"]
         validated = subprocess.run([cls.caddy, "validate", *args], env=cls.env, capture_output=True,
                                    text=True, timeout=15)
@@ -162,7 +173,8 @@ class GatewayChecks(unittest.TestCase):
 
     def test_other_routes_and_methods_never_reach_upstream(self):
         cases = (
-            ("POST", "/api/v1/agent/chat"), ("POST", "/api/v1/news/collect"),
+            ("POST", "/api/v1/agent/chat"), ("POST", "/internal/miniprogram/chat"),
+            ("POST", "/api/v1/news/collect"),
             ("POST", "/api/v1/market/collect"), ("POST", "/api/v1/reports/generate"),
             ("POST", "/api/v1/reports/weekly/generate"), ("GET", "/api/v1/reports/evaluation"),
             ("GET", "/api/v1/reports/weekly"), ("GET", "/api/v1/reports/backtest"),

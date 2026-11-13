@@ -9,7 +9,7 @@
 | `GET /api/v1/news` | 保留关键词，每次最多 20 条，移除分页和日期范围参数 |
 | `GET /api/v1/news/{news_id}/timeline` | 仅匹配 UUID 形式的新闻 ID，保留 `as_of` |
 
-这四个接口凭据缺失或错误时返回 `401`，凭据不会传给 FastAPI。AI 问答、采集、报告生成、诊断和其他路径或方法均返回 `404`。网关关闭访问日志和配置快照，从错误日志中移除请求字段。部署前还需检查上游和其他代理的日志是否记录搜索词。 [Caddy 请求匹配文档](https://caddyserver.com/docs/caddyfile/matchers) · [Caddy 全局配置](https://caddyserver.com/docs/caddyfile/options)
+这四个接口凭据缺失或错误时返回 `401`，凭据不会传给 FastAPI。默认配置下，AI 问答、采集、报告生成、诊断和其他路径或方法均返回 `404`。网关关闭访问日志和配置快照，从错误日志中移除请求字段。部署前还需检查上游和其他代理的日志是否记录搜索词。 [Caddy 请求匹配文档](https://caddyserver.com/docs/caddyfile/matchers) · [Caddy 全局配置](https://caddyserver.com/docs/caddyfile/options)
 
 ## 离线验收
 
@@ -58,6 +58,27 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 探针展示最近一期日报的业务日，周末没有新日报不会因此告警。暂停调度时，若后端就绪接口报降级，可通过 `scheduler_running` 判断原因。探针不会生成日报、恢复调度或调用模型。
 
+## 本机问答内测
+
+`MINIPROGRAM_CHAT_ENABLED=1` 让 Caddy 将来自回环地址的 `POST /api/v1/agent/chat` 转发给独立接入层。内测时让 Caddy、接入层和原 FastAPI 均监听回环地址，并从同一台主机直接连接 Caddy。内测通过独立分发的 Bearer 凭据识别具名测试者。额度只约束网关路径，能在本机访问原 FastAPI 的用户仍能直接调用原接口，内测应在受信任的主机上进行。现有小程序仍使用原联调方式。采集、报告生成、诊断和内部路径始终返回 `404`。
+
+1. 为每人生成独立的高熵凭据，例如通过 Python `secrets.token_urlsafe(32)`。将原始凭据单独交给对应测试者。把测试者代号及其凭据的 SHA-256 小写十六进制摘要注入接入层的 `MINIPROGRAM_CHAT_USERS` 环境变量。格式为 JSON 对象，键为代号，值为摘要。撤销或轮换凭据时更新摘要并重启接入层。同一人的代号应保持稳定，以保留当天用量。
+2. 将 `MINIPROGRAM_CHAT_QUOTA_DB` 设为独立 SQLite 文件的绝对路径，父目录须预先存在并仅供部署账号读写。同一实例的所有接入层进程使用同一份持久文件。可通过 `MINIPROGRAM_CHAT_USER_DAILY` 和 `MINIPROGRAM_CHAT_TOTAL_DAILY` 覆盖内测默认值（每人 5 次、合计 20 次）。从仓库根目录运行接入层，先保持 Caddy 问答入口关闭。
+
+   ```powershell
+   .\.venv\Scripts\python.exe -B -m uvicorn deploy.miniprogram.chat_gate:create_app --factory --host 127.0.0.1 --port 8001 --no-access-log
+   ```
+
+3. 在 Caddy 进程环境中设置 `MINIPROGRAM_CHAT_ENABLED=1`，按前文验证配置并重启网关。上游 FastAPI 使用 `MINIPROGRAM_UPSTREAM_PORT`，接入层与 Caddy 必须使用相同的上游配置。若修改接入层监听端口，同步设置 Caddy 的 `MINIPROGRAM_CHAT_PORT`。将 `MINIPROGRAM_CHAT_ENABLED` 恢复为 `0` 后重启 Caddy，即可关闭内测入口。
+
+接入层先校验身份和输入，再扣减个人与全局的当日额度，按北京时间零点重置。超额返回 `429` 和 `Retry-After`，配额库故障返回 `503`。已放行的请求即使在上游失败也计入额度，因为可能已发生模型调用。额度按问答请求计数，单次问答可能产生多个模型调用，因此这不是供应商费用上限。当前方案仅支持单机试点。 [SQLite 事务说明](https://www.sqlite.org/lang_transaction.html)
+
+离线验收使用真实 Caddy、临时接入层和临时配额库，上游为模拟服务。
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts/check_miniprogram_chat_gate.py --caddy caddy
+```
+
 ## 正式上线前
 
-需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收。用户身份验证与服务端逐用户用量限制接入后，再评审开放问答接口。测试账号密码、模型密钥及通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
+需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围。正式问答还需要接入微信登录和服务端会话，将经平台验证的身份关联到用量，并在真实 AppID 下验收。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
