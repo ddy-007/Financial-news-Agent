@@ -3,6 +3,7 @@ import sys
 import unittest
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,11 +14,16 @@ from fastapi.testclient import TestClient
 from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
+from loguru import logger
+from openai import APITimeoutError
+from httpx import Request
 
 from app.agent import react_agent, tools
 from app.agent.chat_sources import ChatSource
+from app.api import routes_agent
 from app.api.routes_agent import router
 from app.rag.retriever import Hit
+from scripts.summarize_chat_latency import summarize
 
 
 def tool_call(name, args, call_id):
@@ -50,6 +56,8 @@ class ChatSourceContracts(unittest.TestCase):
                 "query": "继续", "chat_history": [["旧问题", "旧标题 https://example.com/old"]],
             })
         self.assertEqual(response.status_code, 200)
+        self.assertRegex(response.headers["X-Request-ID"], r"^[0-9a-f]{32}$")
+        self.assertRegex(response.headers["Server-Timing"], r"^chat;dur=\d+\.\d$")
         self.assertEqual(response.json(), {
             "answer": "回答里编造的标题",
             "sources": [{"id": "news-1", "title": "实际检索标题", "published_at": "2026-11-05T12:00:00",
@@ -96,6 +104,44 @@ class ChatSourceContracts(unittest.TestCase):
         with patch.object(react_agent, "get_chat_agent", return_value=agent):
             self.assertEqual(react_agent.chat_with_sources("问题"), ("答复", []))
             self.assertEqual(react_agent.chat("问题"), "答复")
+
+    def test_latency_records_outcomes_without_request_or_error_text(self):
+        app = FastAPI()
+        app.include_router(router)
+        timeout = APITimeoutError(request=Request("POST", "https://example.invalid/private-url"))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "chat.log"
+            sink = logger.add(path, format="{message}", filter=lambda record: record["name"] == routes_agent.__name__)
+            try:
+                with (TestClient(app, raise_server_exceptions=False) as client,
+                      patch.object(routes_agent, "chat_with_sources", side_effect=[
+                          ("private-answer", []), ("", []), timeout, RuntimeError("private-exception"),
+                      ])):
+                    responses = [client.post("/api/v1/agent/chat", json={"query": "private-query"}) for _ in range(4)]
+            finally:
+                logger.remove(sink)
+
+            self.assertEqual([res.status_code for res in responses], [200, 200, 500, 500])
+            log = path.read_text(encoding="utf-8")
+            self.assertIn(responses[0].headers["X-Request-ID"], log)
+            self.assertNotIn("private-", log)
+            result = summarize([path, path])  # File and console may contain the same requests.
+            self.assertEqual(result["completed_requests"], 4)
+            self.assertEqual(result["outcomes"], {"answered": 1, "empty": 1, "error": 2})
+            self.assertEqual(result["error_kinds"], {"timeout": 1, "execution": 1})
+            self.assertEqual(result["answered_latency_ms"]["p50"], result["answered_latency_ms"]["p95"])
+
+    def test_latency_summary_percentiles_and_empty_input(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "chat.log"
+            path.write_text("Unrelated log\n", encoding="utf-8")
+            self.assertIsNone(summarize([path])["answered_latency_ms"])
+            with path.open("a", encoding="utf-8") as stream:
+                for index in range(1, 21):
+                    stream.write(f"[chat_request] request_id={index:032x} elapsed_ms={index * 100}.0 "
+                                 "outcome=answered error_kind=none\n")
+            self.assertEqual(summarize([path])["answered_latency_ms"],
+                             {"min": 100.0, "p50": 1000.0, "p95": 1900.0, "max": 2000.0})
 
 
 if __name__ == "__main__":

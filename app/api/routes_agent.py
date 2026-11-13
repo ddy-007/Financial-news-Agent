@@ -1,6 +1,12 @@
 """Agent 问答接口。"""
-from fastapi import APIRouter
+from time import perf_counter
+from uuid import uuid4
+
+from fastapi import APIRouter, Response
+from httpx import TimeoutException
 from langchain_core.messages import AIMessage, HumanMessage
+from loguru import logger
+from openai import APITimeoutError
 from pydantic import BaseModel, Field
 
 from app.agent.chat_sources import ChatSource
@@ -29,6 +35,29 @@ def _to_history(chat_history: list[list[str]]) -> list:
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat_endpoint(req: ChatRequest) -> ChatResponse:
-    answer, sources = chat_with_sources(req.query, _to_history(req.chat_history))
-    return ChatResponse(answer=answer, sources=sources)
+def chat_endpoint(req: ChatRequest, response: Response) -> ChatResponse:
+    request_id = uuid4().hex
+    started = perf_counter()
+    outcome = "error"
+    error_kind = "none"
+    try:
+        answer, sources = chat_with_sources(req.query, _to_history(req.chat_history))
+        result = ChatResponse(answer=answer, sources=sources)
+        outcome = "answered" if result.answer.strip() else "empty"
+    except (TimeoutError, TimeoutException, APITimeoutError):
+        error_kind = "timeout"
+        raise
+    except Exception:
+        error_kind = "execution"
+        raise
+    finally:
+        elapsed_ms = (perf_counter() - started) * 1000
+        # Only include service-generated values. Request content and provider errors can contain secrets.
+        logger.info(
+            "[chat_request] request_id={} elapsed_ms={:.1f} outcome={} error_kind={}",
+            request_id, elapsed_ms, outcome, error_kind,
+        )
+
+    response.headers["X-Request-ID"] = request_id
+    response.headers["Server-Timing"] = f"chat;dur={elapsed_ms:.1f}"
+    return result
