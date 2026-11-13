@@ -45,12 +45,14 @@ function displayReport(report) {
 
   const content = isObject(report.content) ? report.content : {}
   const [auditLabel, auditTone, auditNote] = auditDisplay(content)
-  const day = validDay(text(report.report_day)) || validDay(text(report.date).slice(0, 10))
+  const businessDay = validDay(text(report.report_day))
+  const day = businessDay || validDay(text(report.date).slice(0, 10))
   const confidence = text(report.confidence)
 
   return {
     title: text(report.title) || '未命名日报',
     date: day || '—',
+    dateSource: businessDay ? '' : day ? '按生成日期显示' : '报告日期未提供',
     sentiment: text(report.sentiment) || '—',
     score: Number.isFinite(report.score) ? report.score.toFixed(2) : '—',
     confidence: CONFIDENCE_LABELS.get(confidence) || confidence || '—',
@@ -61,4 +63,45 @@ function displayReport(report) {
   }
 }
 
-module.exports = { displayReport, reportDateNotice }
+function historyReports(records) {
+  const dated = new Map()
+  const undated = []
+  records.forEach((record, index) => {
+    const display = displayReport(record)
+    if (!display) return
+    const freshness = record.content && record.content.data_freshness
+    let coverage = '新闻覆盖范围未记录。'
+    if (freshness && (freshness.coverage_incomplete === true ||
+        (Number.isFinite(freshness.evidence_excluded_count) && freshness.evidence_excluded_count > 0))) {
+      coverage = '新闻覆盖受限，部分材料未纳入研判。'
+    } else if (freshness && freshness.readiness_scope === 'snapshot' &&
+        freshness.coverage_incomplete === false && freshness.evidence_excluded_count === 0) {
+      coverage = ''
+    }
+    const entry = {
+      ...display, key: index, coverage,
+      scoreValue: Number.isFinite(record.score) ? record.score : null
+    }
+    if (entry.date === '—') {
+      undated.push(entry)
+    } else if (!dated.has(entry.date)) {
+      // The API orders by generation time descending, so the first record wins.
+      dated.set(entry.date, entry)
+    }
+  })
+  return [...dated.keys()].sort().reverse().map(day => dated.get(day)).concat(undated)
+}
+
+function compareReports(first, second) {
+  if (!first || !second || first.date === '—' || second.date === '—' || first.date === second.date) return null
+  const [newer, older] = first.date > second.date ? [first, second] : [second, first]
+  const delta = newer.scoreValue !== null && older.scoreValue !== null ? newer.scoreValue - older.scoreValue : NaN
+  let scoreChange = ''
+  if (Number.isFinite(delta)) {
+    const rounded = delta.toFixed(2)
+    scoreChange = Number(rounded) === 0 ? '0.00' : delta > 0 ? `+${rounded}` : rounded
+  }
+  return { newer, older, scoreChange }
+}
+
+module.exports = { displayReport, reportDateNotice, historyReports, compareReports }

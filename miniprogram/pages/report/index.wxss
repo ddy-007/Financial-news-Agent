@@ -9,6 +9,18 @@
   margin-bottom: 24rpx;
 }
 
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  margin-bottom: 20rpx;
+}
+
+.history-button {
+  margin: 0 12rpx 8rpx 0;
+  color: #115e59;
+  background: #e2f2ef;
+}
+
 .page-title,
 .report-title {
   font-size: 38rpx;

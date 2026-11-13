@@ -1,0 +1,79 @@
+@import "../report/index.wxss";
+
+.history-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16rpx;
+}
+
+.history-list-header .section-title,
+.history-list-header .history-button {
+  margin: 0;
+}
+
+.history-row {
+  padding: 16rpx 0;
+  border-top: 1rpx solid #e2e8f0;
+  line-height: 1.5;
+}
+
+.history-row-pressed {
+  background: #f1f5f9;
+}
+
+.history-row-active .history-title {
+  color: #0f766e;
+}
+
+.history-title {
+  margin: 10rpx 0;
+  font-size: 30rpx;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.history-note {
+  margin-bottom: 10rpx;
+}
+
+.history-date-source {
+  display: block;
+  font-size: 22rpx;
+}
+
+.history-detail + .history-detail {
+  margin-top: 24rpx;
+  padding-top: 24rpx;
+  border-top: 2rpx solid #cbd5e1;
+}
+
+.history-summary {
+  margin-top: 16rpx;
+}
+
+.compare-pickers {
+  display: flex;
+  flex-wrap: wrap;
+  margin-bottom: 10rpx;
+}
+
+.date-picker {
+  margin: 0 10rpx 10rpx 0;
+  padding: 10rpx 18rpx;
+  border-radius: 12rpx;
+  background: #e2f2ef;
+  color: #115e59;
+}
+
+.change-line {
+  margin-bottom: 20rpx;
+  color: #475569;
+}
+
+.change-value {
+  margin-left: 8rpx;
+  color: #0f172a;
+  font-size: 34rpx;
+  font-weight: 700;
+}

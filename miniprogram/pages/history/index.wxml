@@ -1,0 +1,69 @@
+<template name="report-detail">
+  <view class="history-detail">
+    <view class="report-meta">
+      <text class="muted">{{report.date}}</text>
+      <text class="badge badge--{{report.auditTone}}">{{report.auditLabel}}</text>
+    </view>
+    <view class="history-title">{{report.title}}</view>
+    <view wx:if="{{report.dateSource}}" class="muted history-note">{{report.dateSource}}</view>
+    <view class="muted history-note">{{report.auditNote}}</view>
+    <view wx:if="{{report.coverage}}" class="muted history-note">{{report.coverage}}</view>
+    <view class="metrics">
+      <view class="metric"><text class="muted">情绪</text><text class="metric-value">{{report.sentiment}}</text></view>
+      <view class="metric"><text class="muted">评分</text><text class="metric-value">{{report.score}}</text></view>
+      <view class="metric"><text class="muted">置信度</text><text class="metric-value">{{report.confidence}}</text></view>
+    </view>
+    <text class="prose history-summary" user-select="true">{{report.summary}}</text>
+  </view>
+</template>
+
+<view class="page">
+  <view class="toolbar">
+    <text class="page-title">历史日报</text>
+    <button class="action refresh" size="mini" bindtap="loadReports" loading="{{loading}}" disabled="{{loading}}">刷新</button>
+  </view>
+
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{loading && !loaded}}" class="card muted">正在读取日报…</view>
+  <view wx:if="{{loaded && !reports.length}}" class="card muted">暂无历史日报。</view>
+
+  <block wx:if="{{reports.length}}">
+    <view wx:if="{{showCompare}}" class="card">
+      <view class="section-title">两期对照</view>
+      <view wx:if="{{datedReports.length >= 2}}" class="compare-pickers">
+        <picker mode="selector" range="{{dateOptions}}" value="{{firstIndex + 1}}" bindchange="selectFirst">
+          <view class="date-picker">{{firstIndex < 0 ? '选择第一期' : datedReports[firstIndex].date}} <text aria-hidden="true">▾</text></view>
+        </picker>
+        <picker mode="selector" range="{{dateOptions}}" value="{{secondIndex + 1}}" bindchange="selectSecond">
+          <view class="date-picker">{{secondIndex < 0 ? '选择第二期' : datedReports[secondIndex].date}} <text aria-hidden="true">▾</text></view>
+        </picker>
+      </view>
+      <view wx:if="{{!comparison}}" class="muted">{{comparisonHint}}</view>
+      <block wx:else>
+        <view wx:if="{{comparison.scoreChange}}" class="change-line">评分变化 <text class="change-value">{{comparison.scoreChange}}</text></view>
+        <template is="report-detail" data="{{report: comparison.newer}}" />
+        <template is="report-detail" data="{{report: comparison.older}}" />
+      </block>
+    </view>
+    <view wx:elif="{{selected}}" class="card">
+      <template is="report-detail" data="{{report: selected}}" />
+    </view>
+
+    <view class="card">
+      <view class="history-list-header">
+        <text class="section-title">最近日报</text>
+        <button wx:if="{{!showCompare}}" class="action history-button" size="mini" bindtap="openCompare">两期对照</button>
+      </view>
+      <view wx:for="{{reports}}" wx:for-item="report" wx:for-index="reportIndex" wx:key="key" class="history-row {{!showCompare && selected && selected.key === report.key ? 'history-row-active' : ''}}" hover-class="history-row-pressed" aria-role="button" data-index="{{reportIndex}}" bindtap="selectReport">
+        <view class="report-meta">
+          <view>
+            <text class="muted">{{report.date === '—' ? '日期未提供' : report.date}}</text>
+            <text wx:if="{{report.date !== '—' && report.dateSource}}" class="history-date-source muted">{{report.dateSource}}</text>
+          </view>
+          <text class="badge badge--{{report.auditTone}}">{{report.auditLabel}}</text>
+        </view>
+        <view class="history-title">{{report.title}}</view>
+      </view>
+    </view>
+  </block>
+</view>

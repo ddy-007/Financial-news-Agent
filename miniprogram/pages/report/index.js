@@ -16,6 +16,15 @@ Page({
     this._unloaded = true
   },
 
+  openHistory() {
+    wx.navigateTo({ url: '/pages/history/index' })
+  },
+
+  comparePrevious() {
+    const day = this.data.report && this.data.report.date
+    if (day && day !== '—') wx.navigateTo({ url: `/pages/history/index?compareDay=${encodeURIComponent(day)}` })
+  },
+
   async loadReport() {
     if (this.data.loading || this._unloaded) return
     this.setData({ loading: true, empty: false, error: '' })

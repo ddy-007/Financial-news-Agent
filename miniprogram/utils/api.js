@@ -53,6 +53,10 @@ function getLatestReport() {
   return request('/api/v1/reports/today', { timeout: 12000 })
 }
 
+function getDailyReports() {
+  return request('/api/v1/reports?report_type=daily&limit=10', { timeout: 12000 })
+}
+
 function askQuestion(query) {
   return request('/api/v1/agent/chat', {
     method: 'POST',
@@ -61,4 +65,4 @@ function askQuestion(query) {
   })
 }
 
-module.exports = { getLatestReport, askQuestion, requestErrorMessage }
+module.exports = { getLatestReport, getDailyReports, askQuestion, requestErrorMessage }
