@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models.news import News
+from app.services.event_timeline import read_event_timeline
 from app.services.news_service import collect_and_store_news
 
 router = APIRouter(prefix="/api/v1/news", tags=["news"])
@@ -119,3 +120,15 @@ def collect(db: Session = Depends(get_db)):
     """手动触发一次新闻采集 + 入库 + 索引。"""
     n = collect_and_store_news(db)
     return {"added": n}
+
+
+@router.get("/{news_id}/timeline")
+def event_timeline(
+    news_id: str,
+    as_of: date | None = None,
+    db: Session = Depends(get_db),
+):
+    """已关联原文时间线，as_of 为含当日的本地业务日期。"""
+    now = datetime.now()
+    cutoff = min(now, datetime.combine(as_of, time.max)) if as_of else now
+    return read_event_timeline(db, news_id, cutoff)

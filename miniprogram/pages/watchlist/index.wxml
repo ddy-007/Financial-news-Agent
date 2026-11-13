@@ -36,6 +36,7 @@
       <view wx:if="{{expandedId === item.id}}" class="watch-detail">
         <text class="prose" user-select="true">{{expandedText || '暂无新闻正文。'}}</text>
         <button wx:if="{{expandedLink}}" class="action keyword-action link-button" size="mini" data-id="{{item.id}}" bindtap="copyLink">复制关联链接</button>
+        <button class="action keyword-action link-button" size="mini" data-id="{{item.id}}" bindtap="openTimeline">事件时间线</button>
       </view>
     </view>
   </view>

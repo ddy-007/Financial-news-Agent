@@ -1,0 +1,52 @@
+.timeline-controls,
+.timeline-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12rpx;
+}
+
+.timeline-controls,
+.retry {
+  margin-top: 18rpx;
+}
+
+.timeline-button,
+.timeline-date,
+.timeline-label {
+  background: #e2f2ef;
+  color: #115e59;
+}
+
+.timeline-date,
+.timeline-label {
+  padding: 6rpx 14rpx;
+  border-radius: 12rpx;
+}
+
+.timeline-label {
+  font-size: 24rpx;
+  font-weight: 650;
+}
+
+.timeline-row {
+  padding: 18rpx 0;
+}
+
+.timeline-row + .timeline-row {
+  border-top: 1rpx solid #e2e8f0;
+}
+
+.timeline-title {
+  display: block;
+  margin: 8rpx 0;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.timeline-detail {
+  margin-top: 14rpx;
+  padding: 16rpx;
+  border-radius: 12rpx;
+  background: #f8fafc;
+}

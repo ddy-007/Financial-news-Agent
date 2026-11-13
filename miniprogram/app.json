@@ -1,5 +1,5 @@
 {
-  "pages": ["pages/report/index", "pages/chat/index", "pages/history/index", "pages/watchlist/index"],
+  "pages": ["pages/report/index", "pages/chat/index", "pages/history/index", "pages/watchlist/index", "pages/timeline/index"],
   "window": {
     "navigationBarTitleText": "金融新闻情报",
     "navigationBarBackgroundColor": "#f1f5f9",

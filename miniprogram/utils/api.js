@@ -62,6 +62,12 @@ function getWatchedNews(keyword) {
   return request('/api/v1/news', { data: { keyword, limit: 20 }, timeout: 12000 })
 }
 
+function getEventTimeline(newsId, asOf) {
+  return request(`/api/v1/news/${encodeURIComponent(newsId)}/timeline`, {
+    data: asOf ? { as_of: asOf } : undefined, timeout: 12000
+  })
+}
+
 function askQuestion(query, history = []) {
   return request('/api/v1/agent/chat', {
     method: 'POST',
@@ -70,4 +76,4 @@ function askQuestion(query, history = []) {
   })
 }
 
-module.exports = { getLatestReport, getDailyReports, getWatchedNews, askQuestion, requestErrorMessage }
+module.exports = { getLatestReport, getDailyReports, getWatchedNews, getEventTimeline, askQuestion, requestErrorMessage }

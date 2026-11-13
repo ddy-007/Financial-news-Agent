@@ -95,6 +95,8 @@ test('关注保存在本机，重新打开时只查询一个标题关键词', as
   assert.equal(page.data.expandedText, `${'正文'.repeat(1500)}\n…（正文预览）`)
   wx.setClipboardData = ({ data }) => assert.equal(data, 'https://example.com/1')
   page.copyLink({ currentTarget: { dataset: { id: '1' } } })
+  wx.navigateTo = ({ url }) => assert.equal(url, '/pages/timeline/index?newsId=1')
+  page.openTimeline({ currentTarget: { dataset: { id: '1' } } })
   const reopened = loadPage('watchlist')
   pending = reopened.onLoad()
   assert.deepEqual(reopened.data.keywords, ['AI_%'])
@@ -108,6 +110,36 @@ test('关注保存在本机，重新打开时只查询一个标题关键词', as
   await reopened.removeKeyword({ currentTarget: { dataset: { keyword: 'AI_%' } } })
   assert.equal(reopened.data.active, '')
   assert.deepEqual([...storage.values()], [[]])
+})
+
+test('事件时间线按日期回看，丢弃旧请求并保留原文来源', async (t) => {
+  const requests = mockRequests(t)
+  const page = loadPage('timeline')
+  const latest = page.onLoad({ newsId: 'news-1' })
+  assert.match(requests[0].url, /\/api\/v1\/news\/news-1\/timeline$/)
+  const history = page.selectDate({ detail: { value: '2026-11-05' } })
+  assert.deepEqual(requests[1].data, { as_of: '2026-11-05' })
+  const item = { id: 'raw-1', title: '原始标题', source: '媒体', kind: 'report',
+    published_at: '2026-11-05T12:01:02', archived_at: '2026-11-05T12:02:00',
+    preview: '原文内容', url: 'https://example.com/1' }
+  requests[1].success({ statusCode: 200, data: { items: [item] } })
+  await history
+  requests[0].success({ statusCode: 200, data: { items: [] } })
+  await latest
+  assert.equal(page.data.asOf, '2026-11-05')
+  assert.equal(page.data.items[0].title, '原始标题')
+  assert.equal(page.data.items[0].label, '库内最早报道')
+  assert.equal(page.data.items[0].date, '2026-11-05 12:01')
+  page.toggleArticle({ currentTarget: { dataset: { id: 'raw-1' } } })
+  assert.equal(page.data.expandedId, 'raw-1')
+  let copied
+  wx.setClipboardData = ({ data }) => { copied = data }
+  page.copyLink({ currentTarget: { dataset: { id: 'raw-1' } } })
+  assert.equal(copied, item.url)
+  const refresh = page.showLatest()
+  requests[2].success({ statusCode: 200, data: { items: [null] } })
+  await refresh
+  assert.match(page.data.error, /格式异常/)
 })
 
 test('关注切换丢弃过期响应，网络错误可重试，存储失败不伪装成成功', async (t) => {

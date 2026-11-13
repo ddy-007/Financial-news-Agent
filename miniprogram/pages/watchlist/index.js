@@ -171,5 +171,12 @@ Page({
         if (!this._unloaded) wx.showToast({ title: '链接复制失败', icon: 'none' })
       }
     })
+  },
+
+  openTimeline(event) {
+    const id = event.currentTarget.dataset.id
+    if (this.data.news.some(item => item.id === id)) {
+      wx.navigateTo({ url: `/pages/timeline/index?newsId=${encodeURIComponent(id)}` })
+    }
   }
 })

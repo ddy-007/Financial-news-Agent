@@ -1,0 +1,36 @@
+<view class="page">
+  <view class="card">
+    <view class="section-title">事件时间线</view>
+    <view class="muted">按发布时间排列原文。历史回看沿用当前事件归组，只显示截至当日已经发布并归档的版本。回应和更正按原文标题标记。</view>
+    <view wx:if="{{today}}" class="timeline-controls">
+      <picker mode="date" value="{{asOf || today}}" end="{{today}}" bindchange="selectDate">
+        <view class="timeline-date">{{asOf ? '回看至 ' + asOf : '选择历史截点'}} ▾</view>
+      </picker>
+      <button wx:if="{{asOf}}" class="action timeline-button" size="mini" bindtap="showLatest">查看最新</button>
+    </view>
+  </view>
+
+  <view wx:if="{{error}}" class="error">
+    {{error}}
+    <button wx:if="{{today}}" class="action timeline-button retry" size="mini" bindtap="retry">重试</button>
+  </view>
+  <view wx:elif="{{loading}}" class="card muted">正在读取归档原文…</view>
+  <view wx:elif="{{loaded && !items.length}}" class="card muted">
+    {{skipped ? '已归档记录暂无法显示。' : '截至所选日期，暂无已关联的归档原文。'}}
+  </view>
+  <view wx:if="{{items.length}}" class="card">
+    <view wx:if="{{truncated || skipped}}" class="muted timeline-notice">{{truncated ? '仅显示最早的 50 条归档记录。' : ''}}{{skipped ? '部分归档记录缺少可显示的标题。' : ''}}</view>
+    <view wx:for="{{items}}" wx:key="id" class="timeline-row">
+      <view aria-role="button" data-id="{{item.id}}" bindtap="toggleArticle">
+        <view class="timeline-meta"><text class="timeline-label">{{item.label}}</text><text class="muted">{{item.date}}</text></view>
+        <text class="timeline-title">{{item.title}}</text>
+        <view class="muted">{{item.source}} · {{expandedId === item.id ? '收起' : '查看原文预览'}}</view>
+      </view>
+      <view wx:if="{{expandedId === item.id}}" class="timeline-detail">
+        <view class="muted">归档于 {{item.archivedAt}}</view>
+        <text class="prose" user-select="true">{{item.preview || '归档记录未包含正文。'}}{{item.previewTruncated ? '…' : ''}}</text>
+        <button wx:if="{{item.url}}" class="action timeline-button retry" size="mini" data-id="{{item.id}}" bindtap="copyLink">复制原文链接</button>
+      </view>
+    </view>
+  </view>
+</view>
