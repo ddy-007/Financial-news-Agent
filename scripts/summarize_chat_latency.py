@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 from collections import Counter
+from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 
@@ -16,11 +17,15 @@ _ENTRY = re.compile(
 )
 
 
-def summarize(paths: list[Path]) -> dict:
-    outcomes = Counter()
-    errors = Counter()
-    answered_ms = []
-    seen = set()
+@dataclass(frozen=True)
+class ChatRequestRecord:
+    elapsed_ms: float
+    outcome: str
+    error_kind: str
+
+
+def read_chat_requests(paths: list[Path]) -> dict[str, ChatRequestRecord]:
+    requests = {}
     for path in paths:
         with path.open(encoding="utf-8", errors="replace") as log:
             for line in log:
@@ -28,19 +33,25 @@ def summarize(paths: list[Path]) -> dict:
                 if not match:
                     continue
                 request_id, elapsed_ms, outcome, error_kind = match.groups()
-                if request_id in seen:
-                    continue
-                seen.add(request_id)
-                outcomes[outcome] += 1
-                if outcome == "answered":
-                    answered_ms.append(float(elapsed_ms))
-                if error_kind != "none":
-                    errors[error_kind] += 1
+                requests.setdefault(request_id, ChatRequestRecord(float(elapsed_ms), outcome, error_kind))
+    return requests
+
+
+def summarize_requests(requests: dict[str, ChatRequestRecord]) -> dict:
+    outcomes = Counter()
+    errors = Counter()
+    answered_ms = []
+    for record in requests.values():
+        outcomes[record.outcome] += 1
+        if record.outcome == "answered":
+            answered_ms.append(record.elapsed_ms)
+        if record.error_kind != "none":
+            errors[record.error_kind] += 1
 
     answered_ms.sort()
     count = len(answered_ms)
     return {
-        "completed_requests": len(seen),
+        "completed_requests": len(requests),
         "outcomes": dict(outcomes),
         "error_kinds": dict(errors),
         "answered_latency_ms": {
@@ -50,6 +61,10 @@ def summarize(paths: list[Path]) -> dict:
             "max": answered_ms[-1],
         } if count else None,
     }
+
+
+def summarize(paths: list[Path]) -> dict:
+    return summarize_requests(read_chat_requests(paths))
 
 
 if __name__ == "__main__":
