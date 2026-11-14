@@ -41,6 +41,8 @@ Windows 自带的 Schannel 版 curl 需要 `--ssl-revoke-best-effort` 处理本�
 
 ## 部署探测
 
+历史日报列表 `GET /api/v1/reports` 支持 gzip 压缩。客户端声明支持 gzip 且响应达到压缩阈值时，Caddy 才会压缩。解压后仍是同一份 JSON，鉴权和 `Cache-Control: no-store` 继续生效。需要回退时，移除 Caddyfile 中历史日报路由的 `encode gzip` 后重新部署该网关配置。 [Caddy 压缩说明](https://caddyserver.com/docs/caddyfile/directives/encode)
+
 在运行 FastAPI 和 Caddy 的主机上执行。探针分别通过回环地址读取 FastAPI 的就绪状态、通过带认证的 HTTPS 读取最新日报。使用本机 Caddy 证书时，在项目根目录打开 PowerShell 并运行以下命令。
 
 ```powershell

@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import gzip
 import json
 import os
 from http.client import HTTPSConnection
@@ -136,11 +137,14 @@ class GatewayChecks(unittest.TestCase):
             time.sleep(0.1)
         raise RuntimeError(cls.log_path.read_text(encoding="utf-8", errors="replace"))
 
-    def request(self, method, path, *, auth=None, timeout=3, source=None):
+    def request(self, method, path, *, auth=None, timeout=3, source=None, accept_encoding=None):
         context = ssl.create_default_context(cafile=str(self.root_ca))
         conn = HTTPSConnection(LOOPBACK, self.port, context=context, timeout=timeout, source_address=source)
         try:
-            conn.request(method, path, headers={"Authorization": auth} if auth else {})
+            headers = {"Authorization": auth} if auth else {}
+            if accept_encoding is not None:
+                headers["Accept-Encoding"] = accept_encoding
+            conn.request(method, path, headers=headers)
             response = conn.getresponse()
             return response.status, response.headers, response.read()
         finally:
@@ -173,6 +177,30 @@ class GatewayChecks(unittest.TestCase):
                 self.assertEqual(headers["X-Stub-Upstream"], "1")
                 self.assertEqual(headers["Cache-Control"], "no-store")
                 self.assertEqual(json.loads(body), {"path": path, "query": query, "authorization": None})
+
+    def test_only_report_history_negotiates_gzip(self):
+        payload = json.dumps([{"content": {"market_summary": "日报摘要 " * 150}}]).encode()
+        for path in (REPORTS, TODAY):
+            self.upstream.responses[path] = (200, payload)
+            self.addCleanup(self.upstream.responses.pop, path)
+
+        for path, accepted, expected in (
+            (REPORTS, "gzip", "gzip"), (REPORTS, "identity", None), (TODAY, "gzip", None),
+        ):
+            with self.subTest(path=path, accepted=accepted):
+                status, headers, body = self.request("GET", path, auth=self.auth, accept_encoding=accepted)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Encoding"), expected)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                if expected == "gzip":
+                    self.assertIn("Accept-Encoding", headers["Vary"])
+                    self.assertLess(len(body), len(payload))
+                    body = gzip.decompress(body)
+                self.assertEqual(body, payload)
+
+        status, headers, _ = self.request("GET", REPORTS, accept_encoding="gzip")
+        self.assertEqual(status, 401)
+        self.assertIsNone(headers.get("X-Stub-Upstream"))
 
     def test_other_routes_and_methods_never_reach_upstream(self):
         cases = (

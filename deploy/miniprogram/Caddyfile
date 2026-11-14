@@ -114,6 +114,7 @@ https://{$MINIPROGRAM_GATEWAY_HOST:127.0.0.1:8443} {
 			import readonly_api
 		}
 		handle @reports {
+			encode gzip
 			rewrite /api/v1/reports?report_type=daily&limit=10
 			import readonly_api
 		}
