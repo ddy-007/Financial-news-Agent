@@ -34,15 +34,31 @@
 					header X-Miniprogram-Read-Authorized 1
 				}
 				handle_response @allowed {
+					copy_response_headers {
+						include X-Miniprogram-Request-ID
+					}
 				}
 				@unauthorized status 401
 				handle_response @unauthorized {
 					header WWW-Authenticate Bearer
+					copy_response_headers {
+						include X-Miniprogram-Request-ID
+					}
 					respond 401
 				}
 				@unavailable status 503
 				handle_response @unavailable {
+					copy_response_headers {
+						include X-Miniprogram-Request-ID
+					}
 					respond 503
+				}
+				@internal status 500
+				handle_response @internal {
+					copy_response_headers {
+						include X-Miniprogram-Request-ID
+					}
+					respond 502
 				}
 				handle_response {
 					respond 502

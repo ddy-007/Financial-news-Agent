@@ -2,21 +2,26 @@
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
 import secrets
 import sqlite3
+from asyncio import CancelledError
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, time, timedelta, timezone
 from ipaddress import IPv6Address, ip_address, ip_network
 from pathlib import Path
-from time import time as unix_time
+from time import perf_counter, time as unix_time
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 
 from .wechat_login import WeChatLoginBlocked, WeChatRateLimited, WeChatUnavailable, exchange_code
 
@@ -33,6 +38,48 @@ DEFAULT_LOGIN_SOURCE_LIMIT = 4
 BUSINESS_TZ = timezone(timedelta(hours=8))
 NO_STORE = {"Cache-Control": "no-store"}
 TOKEN_PATTERN = re.compile(r"Bearer ([A-Za-z0-9_-]{43})", re.IGNORECASE | re.ASCII)
+REQUEST_ID_HEADER = "X-Miniprogram-Request-ID"
+gate_log = logging.getLogger("uvicorn.error")
+
+
+class GateError(HTTPException):
+    def __init__(self, status_code, outcome, detail, headers=None):
+        super().__init__(status_code, detail, {**NO_STORE, **(headers or {})})
+        self.outcome = outcome
+
+
+class ObservedRoute(APIRoute):
+    def get_route_handler(self):
+        handle = super().get_route_handler()
+
+        async def observed(request):
+            request_id = uuid4().hex
+            started = perf_counter()
+            status, outcome = 500, "internal_error"
+            try:
+                response = await handle(request)
+            except GateError as error:
+                error.headers[REQUEST_ID_HEADER] = request_id
+                status, outcome = error.status_code, error.outcome
+                raise
+            except CancelledError:
+                status, outcome = 499, "request_cancelled"
+                raise
+            except ClientDisconnect:
+                status, outcome = 499, "client_disconnected"
+                return Response(status_code=status, headers={**NO_STORE, REQUEST_ID_HEADER: request_id})
+            except Exception:
+                # Exception text from network and storage clients can contain request data.
+                return Response(status_code=status, headers={**NO_STORE, REQUEST_ID_HEADER: request_id})
+            else:
+                response.headers[REQUEST_ID_HEADER] = request_id
+                status, outcome = response.status_code, getattr(request.state, "outcome", "ok")
+                return response
+            finally:
+                gate_log.info("[miniprogram_gate] request_id=%s operation=%s status=%d outcome=%s elapsed_ms=%.1f",
+                              request_id, self.name, status, outcome, (perf_counter() - started) * 1000)
+
+        return observed
 
 
 class LoginCode(BaseModel):
@@ -43,7 +90,7 @@ async def read_body(request, limit):
     body = bytearray()
     async for chunk in request.stream():
         if len(body) + len(chunk) > limit:
-            raise HTTPException(413, "Request body too large", NO_STORE)
+            raise GateError(413, "body_too_large", "Request body too large")
         body.extend(chunk)
     return body
 
@@ -73,7 +120,7 @@ def login_source(request):
             raise ValueError
         address = ip_address(values[0])
     except ValueError:
-        raise HTTPException(503, "Login source unavailable", NO_STORE) from None
+        raise GateError(503, "login_source_unavailable", "Login source unavailable") from None
     if isinstance(address, IPv6Address):
         if address.ipv4_mapped:
             address = address.ipv4_mapped
@@ -185,6 +232,7 @@ def create_app():
             yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
+    app.router.route_class = ObservedRoute
 
     async def authenticated_user(request, *, allow_pilot=False):
         users, db_path, _, _ = app.state.admit
@@ -198,10 +246,10 @@ def create_app():
                 try:
                     user = await run_in_threadpool(session_user, db_path, digest, app.state.wechat[0])
                 except sqlite3.Error:
-                    raise HTTPException(503, "Session check unavailable", NO_STORE) from None
+                    raise GateError(503, "session_check_unavailable", "Session check unavailable") from None
                 if user:
                     return user
-        raise HTTPException(401, "Valid access token required", {**NO_STORE, "WWW-Authenticate": "Bearer"})
+        raise GateError(401, "session_required", "Valid access token required", {"WWW-Authenticate": "Bearer"})
 
     @app.get(READ_AUTH_PATH)
     async def authorize_read(request: Request):
@@ -211,34 +259,34 @@ def create_app():
     @app.post(LOGIN_PATH)
     async def login(request: Request, response: Response):
         if app.state.wechat is None:
-            raise HTTPException(404, "Not Found", NO_STORE)
+            raise GateError(404, "login_disabled", "Not Found")
         app_id, secret, login_limit, source_limit = app.state.wechat
         db_path = app.state.admit[1]
         try:
             credential = LoginCode.model_validate_json(await read_body(request, 2048))
         except ValidationError:
-            raise HTTPException(422, "Invalid login code", NO_STORE) from None
+            raise GateError(422, "invalid_login_input", "Invalid login code") from None
         source = login_source(request)
         try:
             retry_after = await run_in_threadpool(reserve_login_exchange, db_path, login_limit, source, source_limit)
         except sqlite3.Error:
-            raise HTTPException(503, "Login limit unavailable", NO_STORE) from None
+            raise GateError(503, "login_limit_unavailable", "Login limit unavailable") from None
         if retry_after is not None:
-            raise HTTPException(429, "Login exchange limit reached", {**NO_STORE, "Retry-After": str(retry_after)})
+            raise GateError(429, "local_login_limit", "Login exchange limit reached", {"Retry-After": str(retry_after)})
         try:
             openid = await run_in_threadpool(exchange_code, app_id, secret, credential.code)
         except WeChatLoginBlocked:
-            raise HTTPException(403, "WeChat denied login", NO_STORE) from None
+            raise GateError(403, "wechat_login_blocked", "WeChat denied login") from None
         except WeChatRateLimited:
-            raise HTTPException(429, "WeChat login rate limited", NO_STORE) from None
+            raise GateError(429, "wechat_login_limit", "WeChat login rate limited") from None
         except WeChatUnavailable:
-            raise HTTPException(502, "WeChat login unavailable", NO_STORE) from None
+            raise GateError(502, "wechat_unavailable", "WeChat login unavailable") from None
         if openid is None:
-            raise HTTPException(401, "Invalid or expired login code", NO_STORE)
+            raise GateError(401, "invalid_login_code", "Invalid or expired login code")
         try:
             token = await run_in_threadpool(new_session, db_path, app_id, openid)
         except sqlite3.Error:
-            raise HTTPException(503, "Session store unavailable", NO_STORE) from None
+            raise GateError(503, "session_store_unavailable", "Session store unavailable") from None
         response.headers.update(NO_STORE)
         return {"access_token": token, "expires_in": SESSION_TTL}
 
@@ -250,30 +298,32 @@ def create_app():
         try:
             question = PilotQuestion.model_validate_json(await read_body(request, MAX_BODY_BYTES))
         except ValidationError:
-            raise HTTPException(422, "Invalid question or conversation history", NO_STORE) from None
+            raise GateError(422, "invalid_chat_input", "Invalid question or conversation history") from None
 
         try:
             retry_after = await run_in_threadpool(charge_request, db_path, user, user_limit, total_limit)
         except sqlite3.Error:
-            raise HTTPException(503, "Quota check unavailable", NO_STORE) from None
+            raise GateError(503, "chat_quota_unavailable", "Quota check unavailable") from None
         if retry_after is not None:
-            raise HTTPException(429, "Daily chat quota reached", {**NO_STORE, "Retry-After": str(retry_after)})
+            raise GateError(429, "chat_quota_reached", "Daily chat quota reached", {"Retry-After": str(retry_after)})
 
         try:
             upstream = await app.state.upstream.post(CHAT_PATH, json=question.model_dump())
         except httpx.TimeoutException:
-            raise HTTPException(504, "Chat service timed out", NO_STORE) from None
+            raise GateError(504, "chat_timeout", "Chat service timed out") from None
         except httpx.RequestError:
-            raise HTTPException(502, "Chat service unavailable", NO_STORE) from None
+            raise GateError(502, "chat_unavailable", "Chat service unavailable") from None
         if upstream.status_code != 200 or upstream.headers.get("content-type", "").split(";")[0] != "application/json":
-            raise HTTPException(502, "Chat service failed", NO_STORE)
+            raise GateError(502, "chat_upstream_failed", "Chat service failed")
         try:
             result = upstream.json()
         except (ValueError, RecursionError):
-            raise HTTPException(502, "Invalid chat response", NO_STORE) from None
+            raise GateError(502, "invalid_chat_response", "Invalid chat response") from None
         if not (isinstance(result, dict) and isinstance(result.get("answer"), str)
                 and isinstance(result.get("sources"), list)):
-            raise HTTPException(502, "Invalid chat response", NO_STORE)
+            raise GateError(502, "invalid_chat_response", "Invalid chat response")
+        if not result["answer"].strip():
+            request.state.outcome = "empty_answer"
         headers = {**NO_STORE, **{key: upstream.headers[key] for key in ("X-Request-ID", "Server-Timing")
                                   if key in upstream.headers}}
         return Response(upstream.content, media_type="application/json", headers=headers)

@@ -58,6 +58,10 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 探针展示最近一期日报的业务日，周末没有新日报不会因此告警。暂停调度时，若后端就绪接口报降级，可通过 `scheduler_running` 判断原因。探针不会生成日报、恢复调度或调用模型。
 
+微信接入层通过进程日志输出 `[miniprogram_gate]` 记录，包含操作名、接入层 HTTP 状态、结果类别、处理总耗时及服务端生成的请求编号。联调时可从 Network 面板的 `X-Miniprogram-Request-ID` 响应头找到对应记录。对读取请求，这条记录仅覆盖会话校验，成功时记录 `204`，最终数据请求的状态和耗时以 Network 面板为准。已存在的问答上游 `X-Request-ID` 仍用于查 Agent 日志。网关在接入层之前拒绝的请求不会有接入层记录。
+
+遇到 `429` 时，`local_login_limit` 表示本地登录交换额度不足，`wechat_login_limit` 表示微信返回限流，`chat_quota_reached` 表示问答日配额用完。接入层日志不记录问题正文、微信凭证、请求来源地址或会话令牌。启动命令仍使用 `--no-access-log`。日志格式随接入层和 Caddy 配置一起部署或回退。
+
 ## 本机问答内测
 
 `MINIPROGRAM_CHAT_ENABLED=1` 让 Caddy 将来自回环地址的 `POST /api/v1/agent/chat` 转发给独立接入层。内测时让 Caddy、接入层和原 FastAPI 均监听回环地址，并从同一台主机直接连接 Caddy。内测通过独立分发的 Bearer 凭据识别具名测试者。额度只约束网关路径，能在本机访问原 FastAPI 的用户仍能直接调用原接口，内测应在受信任的主机上进行。现有小程序仍使用原联调方式。采集、报告生成、诊断和内部路径始终返回 `404`。

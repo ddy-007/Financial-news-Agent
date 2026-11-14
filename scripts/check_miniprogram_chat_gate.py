@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from http.client import HTTPConnection, HTTPSConnection
 import json
+import re
 from pathlib import Path
 import secrets
 import sqlite3
@@ -51,6 +52,7 @@ class ChatGateChecks(GatewayChecks):
 
     def run_gate(self, command):
         log_path = self.tmp / "gate.log"
+        self.gate_log_path = log_path
         with log_path.open("wb") as log:
             process = subprocess.Popen(command, cwd=ROOT, env=self.gate_env, stdout=log, stderr=log)
         self.addCleanup(stop_process, process)
@@ -181,6 +183,8 @@ class FakeWeChatConnection:
         self.code = query['js_code'][0]
 
     def getresponse(self):
+        if self.code == 'unexpected':
+            raise RuntimeError('private-unexpected-error')
         responses = {'first': {'openid': 'openid-marker', 'session_key': 'key-marker'},
                      'again': {'openid': 'openid-marker'}, 'other': {'openid': 'other-openid'},
                      'used': {'errcode': 40163}, 'down': {'errcode': -1},
@@ -201,6 +205,42 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
     def login(self, code, *, headers=None, source=None):
         return self.post(body=json.dumps({"code": code}).encode(), path="/api/v1/miniprogram/login",
                          headers=headers, source=source)
+
+    def test_gate_logs_allowlisted_fields_and_distinguishes_rate_limits(self):
+        self.start_wechat_gate(limit=3)
+        calls = []
+        status, headers, _ = self.login("limited", headers={"X-Miniprogram-Request-ID": "forged-id-marker"})
+        calls.append((status, headers, "login", 429, "wechat_login_limit"))
+        status, headers, body = self.login("first")
+        calls.append((status, headers, "login", 200, "ok"))
+        token = json.loads(body)["access_token"]
+        status, headers, body = self.login("unexpected")
+        calls.append((status, headers, "login", 500, "internal_error"))
+        self.assertNotIn(b"private-unexpected-error", body)
+        status, headers, _ = self.login("private-login-code")
+        calls.append((status, headers, "login", 429, "local_login_limit"))
+        status, headers, _ = self.request("GET", "/api/v1/reports/today", auth="Bearer " + token)
+        calls.append((status, headers, "authorize_read", 204, "ok"))
+        status, headers, _ = self.request("GET", "/api/v1/reports/today")
+        calls.append((status, headers, "authorize_read", 401, "session_required"))
+        self.upstream.responses[CHAT_PATH] = (500, {"detail": "private-upstream-error"})
+        self.addCleanup(self.upstream.responses.pop, CHAT_PATH)
+        status, headers, _ = self.post(auth="Bearer " + token, body=b'{"query":"private-question-marker"}')
+        calls.append((status, headers, "chat", 502, "chat_upstream_failed"))
+        self.upstream.responses[CHAT_PATH] = (200, {"answer": "  ", "sources": []})
+        status, headers, _ = self.post(auth="Bearer " + token)
+        calls.append((status, headers, "chat", 200, "empty_answer"))
+        log = self.gate_log_path.read_text(encoding="utf-8", errors="replace")
+        for status, headers, operation, logged_status, outcome in calls:
+            self.assertEqual(status, 200 if logged_status == 204 else logged_status)
+            request_id = headers["X-Miniprogram-Request-ID"]
+            self.assertRegex(request_id, r"^[a-f0-9]{32}$")
+            self.assertRegex(log, re.escape(f"request_id={request_id} operation={operation} "
+                                            f"status={logged_status} outcome={outcome} elapsed_ms=") + r"\d+\.\d")
+        for secret in (token, "synthetic-secret", "openid-marker", "key-marker", "private-login-code",
+                       "private-question-marker", "private-upstream-error", "private-unexpected-error",
+                       "forged-id-marker"):
+            self.assertNotIn(secret, log)
 
     def test_login_sessions_share_identity_quota_and_expire(self):
         self.start_wechat_gate(limit=12, source_limit=12)
@@ -373,6 +413,7 @@ if __name__ == "__main__":
         MisconfiguredGateChecks("test_wrong_proxy_port_does_not_reach_agent_route"),
         MisconfiguredGateChecks("test_wrong_auth_port_cannot_release_read_data"),
         WeChatGateChecks("test_login_sessions_share_identity_quota_and_expire"),
+        WeChatGateChecks("test_gate_logs_allowlisted_fields_and_distinguishes_rate_limits"),
         WeChatGateChecks("test_test_client_can_login_read_and_chat_only_from_allowed_source"),
         WeChatGateChecks("test_login_exchange_limit_blocks_before_provider_and_survives_restart"),
         WeChatGateChecks("test_login_source_limit_overwrites_client_headers_and_preserves_global_limit"),
