@@ -106,6 +106,7 @@ class GatewayChecks(unittest.TestCase):
         cls.env.pop("MINIPROGRAM_CHAT_ENABLED", None)
         cls.env.pop("MINIPROGRAM_WECHAT_LOGIN_ENABLED", None)
         cls.env.pop("MINIPROGRAM_WECHAT_READ_ENABLED", None)
+        cls.env.pop("MINIPROGRAM_TEST_CLIENT_RANGES", None)
         cls.env.update(cls.caddy_environment())
         args = ["--config", str(CONFIG), "--adapter", "caddyfile"]
         validated = subprocess.run([cls.caddy, "validate", *args], env=cls.env, capture_output=True,
@@ -135,9 +136,9 @@ class GatewayChecks(unittest.TestCase):
             time.sleep(0.1)
         raise RuntimeError(cls.log_path.read_text(encoding="utf-8", errors="replace"))
 
-    def request(self, method, path, *, auth=None, timeout=3):
+    def request(self, method, path, *, auth=None, timeout=3, source=None):
         context = ssl.create_default_context(cafile=str(self.root_ca))
-        conn = HTTPSConnection(LOOPBACK, self.port, context=context, timeout=timeout)
+        conn = HTTPSConnection(LOOPBACK, self.port, context=context, timeout=timeout, source_address=source)
         try:
             conn.request(method, path, headers={"Authorization": auth} if auth else {})
             response = conn.getresponse()

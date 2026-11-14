@@ -81,7 +81,7 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 ## 微信登录本地联调
 
-在接入层进程环境中设置 `MINIPROGRAM_WECHAT_APP_ID` 与 `MINIPROGRAM_WECHAT_APP_SECRET`，然后重启接入层。仅使用微信身份联调时，可省略 `MINIPROGRAM_CHAT_USERS`。Caddy 环境同时设置 `MINIPROGRAM_CHAT_ENABLED=1` 与 `MINIPROGRAM_WECHAT_LOGIN_ENABLED=1`，校验后重启。两个入口仍限定为回环访问。 [微信登录](https://developers.weixin.qq.com/miniprogram/dev/framework/open-ability/login.html) · [登录凭证校验](https://developers.weixin.qq.com/miniprogram/dev/server/API/user-login/api_code2session.html)
+在接入层进程环境中设置 `MINIPROGRAM_WECHAT_APP_ID` 与 `MINIPROGRAM_WECHAT_APP_SECRET`，然后重启接入层。仅使用微信身份联调时，可省略 `MINIPROGRAM_CHAT_USERS`。Caddy 环境同时设置 `MINIPROGRAM_CHAT_ENABLED=1` 与 `MINIPROGRAM_WECHAT_LOGIN_ENABLED=1`，校验后重启。两个入口默认限定为回环访问。 [微信登录](https://developers.weixin.qq.com/miniprogram/dev/framework/open-ability/login.html) · [登录凭证校验](https://developers.weixin.qq.com/miniprogram/dev/server/API/user-login/api_code2session.html)
 
 在 `miniprogram/utils/chat-config.js` 填入本地 HTTPS 网关源地址，例如 `https://127.0.0.1:8443`。开发者工具需使用同一个 AppID，且信任本地 Caddy 证书。发送问题时，小程序通过 `wx.login` 获取临时凭证，由接入层向微信校验。接入层只返回有效期一小时的随机会话令牌，SQLite 仅保存令牌摘要、用户代号及到期时间。小程序将令牌保存在运行内存中。登录失败或令牌失效时，由用户重新发送问题，避免自动重发问答。
 
@@ -95,9 +95,19 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 ### 日报和新闻共用微信会话
 
-完成问答登录联调后，可在 Caddy 环境增加 `MINIPROGRAM_WECHAT_READ_ENABLED=1` 并重启，同时把 `miniprogram/utils/chat-config.js` 的 `wechatReadEnabled` 设为 `true`。最新日报、历史日报、关键词新闻和事件时间线会走同一个 HTTPS 网关。首次读取需要微信登录，已有会话会直接复用。运维探针仍可在原地址使用 Basic Auth。微信读接口只接受本机回环请求，过期令牌返回 `401`，会话库故障时会拒绝读取。读取不消耗问答额度，请求发往原 FastAPI 前会移除凭据。
+完成问答登录联调后，可在 Caddy 环境增加 `MINIPROGRAM_WECHAT_READ_ENABLED=1` 并重启，同时把 `miniprogram/utils/chat-config.js` 的 `wechatReadEnabled` 设为 `true`。最新日报、历史日报、关键词新闻和事件时间线会走同一个 HTTPS 网关。首次读取需要微信登录，已有会话会直接复用。运维探针仍可在原地址使用 Basic Auth。微信读接口默认只接受本机回环请求，过期令牌返回 `401`，会话库故障时会拒绝读取。读取不消耗问答额度，请求发往原 FastAPI 前会移除凭据。
 
 只回退读接口时，关闭客户端 `wechatReadEnabled`，在 Caddy 环境移除 `MINIPROGRAM_WECHAT_READ_ENABLED` 或设为 `0` 并重启，问答联调可继续使用。
+
+## 指定设备真机验收
+
+确认测试手机能直连 Caddy，且手机信任网关使用的 HTTPS 证书。让 FastAPI 和微信接入层继续监听 `127.0.0.1`。将 `MINIPROGRAM_GATEWAY_HOST` 设为证书匹配的网关主机名和端口，将 `MINIPROGRAM_GATEWAY_BIND` 设为网关主机可达的单个网卡地址。仅把测试手机的来源地址追加到 `MINIPROGRAM_TEST_CLIENT_RANGES`，多个 IP 或 CIDR 用空格分隔。网关按直接连接来源匹配，反代或 NAT 场景须先确认它实际看到的地址。 [Caddy 来源匹配](https://caddyserver.com/docs/caddyfile/matchers#remote_ip)
+
+1. 按本节前文启用微信登录、读取与问答，校验 Caddy 配置后启动。在小程序中填写相同的 HTTPS 网关地址，使用与接入层一致的 AppID。非调试验收应使用微信已配置的合法请求域名和受信任证书。
+2. 在允许的手机上打开小程序，确认能登录、读取日报和历史列表。先用模拟上游验证发送与来源，真实问答按授权验证一次，并记录状态码、耗时及页面是否可继续操作。
+3. 结束验收后从 Caddy 环境移除 `MINIPROGRAM_TEST_CLIENT_RANGES`，恢复回环监听并重启。配置路径和证书由实际部署环境提供。
+
+登录和问答受来源白名单限制。启用微信读取时，四个读接口也受同一限制，包含 Basic Auth 请求。若运维探针继续从本机运行，`--gateway` 应指向本机能访问且证书匹配的网关地址。
 
 ## 正式上线前
 

@@ -15,11 +15,16 @@
 
 (readonly_api) {
 	header Cache-Control "no-store"
+	@disallowed_read {
+		not remote_ip 127.0.0.1 ::1 {$MINIPROGRAM_TEST_CLIENT_RANGES:}
+		expression `"{$MINIPROGRAM_WECHAT_READ_ENABLED:0}" == "1" && "{$MINIPROGRAM_CHAT_ENABLED:0}" == "1" && "{$MINIPROGRAM_WECHAT_LOGIN_ENABLED:0}" == "1"`
+	}
 	@session_read {
-		remote_ip 127.0.0.1 ::1
+		remote_ip 127.0.0.1 ::1 {$MINIPROGRAM_TEST_CLIENT_RANGES:}
 		expression `"{$MINIPROGRAM_WECHAT_READ_ENABLED:0}" == "1" && "{$MINIPROGRAM_CHAT_ENABLED:0}" == "1" && "{$MINIPROGRAM_WECHAT_LOGIN_ENABLED:0}" == "1" && !header_regexp('Authorization', r'(?i)^Basic ')`
 	}
 	route {
+		respond @disallowed_read 404
 		handle @session_read {
 			# Only the session verifier's explicit authorization may continue to the data upstream.
 			reverse_proxy 127.0.0.1:{$MINIPROGRAM_CHAT_PORT:8001} {
@@ -77,13 +82,13 @@ https://{$MINIPROGRAM_GATEWAY_HOST:127.0.0.1:8443} {
 	@chat {
 		method POST
 		path /api/v1/agent/chat
-		remote_ip 127.0.0.1 ::1
+		remote_ip 127.0.0.1 ::1 {$MINIPROGRAM_TEST_CLIENT_RANGES:}
 		expression `"{$MINIPROGRAM_CHAT_ENABLED:0}" == "1"`
 	}
 	@wechat_login {
 		method POST
 		path /api/v1/miniprogram/login
-		remote_ip 127.0.0.1 ::1
+		remote_ip 127.0.0.1 ::1 {$MINIPROGRAM_TEST_CLIENT_RANGES:}
 		expression `"{$MINIPROGRAM_CHAT_ENABLED:0}" == "1" && "{$MINIPROGRAM_WECHAT_LOGIN_ENABLED:0}" == "1"`
 	}
 
