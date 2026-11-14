@@ -133,10 +133,16 @@ class WeChatGateChecks(ChatGateChecks):
     def caddy_environment(cls):
         return {**super().caddy_environment(), "MINIPROGRAM_WECHAT_LOGIN_ENABLED": "1"}
 
-    def test_login_sessions_share_identity_quota_and_expire(self):
+    def setUp(self):
+        self.usage = self.tmp / f"{self.id().split('.')[-1]}.sqlite3"
+        self.gate_env = dict(self.gate_env, MINIPROGRAM_CHAT_QUOTA_DB=str(self.usage))
+        self.upstream.posts.clear()
+
+    def start_wechat_gate(self, *, limit):
         self.gate_env.update(MINIPROGRAM_WECHAT_APP_ID="wx0123456789abcdef",
-                             MINIPROGRAM_WECHAT_APP_SECRET="synthetic-secret")
-        self.gate_env.pop("MINIPROGRAM_CHAT_USERS")
+                             MINIPROGRAM_WECHAT_APP_SECRET="synthetic-secret",
+                             MINIPROGRAM_WECHAT_LOGIN_PER_MINUTE=str(limit))
+        self.gate_env.pop("MINIPROGRAM_CHAT_USERS", None)
         # Replace only the external HTTPS transport. The gateway, routes and DB are real.
         fake = """
 import json
@@ -175,23 +181,24 @@ wechat_login.HTTPSConnection = FakeWeChatConnection
 uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0.0.1',
             port=PORT, access_log=False)
 """
-        self.run_gate([sys.executable, "-B", "-c", fake.replace("port=PORT", f"port={self.gate_port}")])
-        login_path = "/api/v1/miniprogram/login"
+        return self.run_gate([sys.executable, "-B", "-c", fake.replace("port=PORT", f"port={self.gate_port}")])
 
-        def login(code):
-            return self.post(body=json.dumps({"code": code}).encode(), path=login_path)
+    def login(self, code):
+        return self.post(body=json.dumps({"code": code}).encode(), path="/api/v1/miniprogram/login")
 
-        self.assertEqual(self.post(body=b"x" * 2049, path=login_path)[0], 413)
-        self.assertEqual(login("invalid code")[0], 422)
-        self.assertEqual(login("used")[0], 401)
-        self.assertEqual(login("blocked")[0], 403)
-        self.assertEqual(login("limited")[0], 429)
-        self.assertEqual(login("down")[0], 502)
+    def test_login_sessions_share_identity_quota_and_expire(self):
+        self.start_wechat_gate(limit=12)
+        self.assertEqual(self.post(body=b"x" * 2049, path="/api/v1/miniprogram/login")[0], 413)
+        self.assertEqual(self.login("invalid code")[0], 422)
+        self.assertEqual(self.login("used")[0], 401)
+        self.assertEqual(self.login("blocked")[0], 403)
+        self.assertEqual(self.login("limited")[0], 429)
+        self.assertEqual(self.login("down")[0], 502)
         self.assertEqual(self.post(path="/internal/miniprogram/wechat-login")[0], 404)
         self.assertEqual(self.upstream.posts, [])
         tokens = []
         for code in ("first", "again", "other"):
-            status, headers, body = login(code)
+            status, headers, body = self.login(code)
             self.assertEqual(status, 200)
             self.assertEqual(headers["Cache-Control"], "no-store")
             payload = json.loads(body)
@@ -214,6 +221,39 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
         self.assertEqual(len(self.upstream.posts), 3)
         self.assertTrue(all(not authorization for _, authorization, _ in self.upstream.posts))
 
+    def test_login_exchange_limit_blocks_before_provider_and_survives_restart(self):
+        process = self.start_wechat_gate(limit=3)
+        self.assertEqual(self.login("invalid code")[0], 422)
+        self.assertEqual(self.login("down")[0], 502)
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            results = list(executor.map(self.login, ["used"] * 6))
+        self.assertEqual(sorted(status for status, _, _ in results), [401, 401, 429, 429, 429, 429])
+        for status, headers, _ in results:
+            if status == 429:
+                self.assertTrue(1 <= int(headers["Retry-After"]) <= 60)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+
+        stop_process(process)
+        self.start_wechat_gate(limit=2)
+        self.assertEqual(self.login("first")[0], 429)
+        with closing(sqlite3.connect(self.usage)) as db, db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM wechat_login_attempts").fetchone()[0], 3)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 0)
+            # After lowering the limit, waiting for only the oldest slot is insufficient.
+            db.execute("UPDATE wechat_login_attempts SET admitted_at = ? WHERE rowid = "
+                       "(SELECT MIN(rowid) FROM wechat_login_attempts)", (time.time() - 50,))
+        status, headers, _ = self.login("first")
+        self.assertEqual(status, 429)
+        self.assertGreater(int(headers["Retry-After"]), 10)
+        with closing(sqlite3.connect(self.usage)) as db, db:
+            db.execute("UPDATE wechat_login_attempts SET admitted_at = 0")
+        self.assertEqual(self.login("first")[0], 200)
+        with closing(sqlite3.connect(self.usage)) as db, db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM wechat_login_attempts").fetchone()[0], 1)
+            db.execute("BEGIN EXCLUSIVE")
+            self.assertEqual(self.login("down")[0], 503)
+        self.assertEqual(self.upstream.posts, [])
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
@@ -223,5 +263,6 @@ if __name__ == "__main__":
         ChatGateChecks("test_pilot_authentication_and_atomic_daily_quota"),
         MisconfiguredGateChecks("test_wrong_proxy_port_does_not_reach_agent_route"),
         WeChatGateChecks("test_login_sessions_share_identity_quota_and_expire"),
+        WeChatGateChecks("test_login_exchange_limit_blocks_before_provider_and_survives_restart"),
     ])
     raise SystemExit(0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)

@@ -87,6 +87,8 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 微信用户在同一个 AppID 下重新登录仍共享当天个人额度，也与内测账号共享全局额度。AppSecret 和微信会话密钥只在服务端处理。日报和新闻继续读取现有本地接口。回退时清空小程序配置中的网关地址，并关闭 `MINIPROGRAM_WECHAT_LOGIN_ENABLED`。如需立即停止现有微信会话访问，同时关闭问答入口，或从接入层环境移除微信配置并重启接入层。
 
+接入层默认在任意连续 60 秒内最多向微信交换 12 次凭证。可用 `MINIPROGRAM_WECHAT_LOGIN_PER_MINUTE` 调整为 `1` 至 `120`，重启后生效。同一实例的进程用同一份 SQLite 计数，进程重启会保留窗口内用量。输入校验失败不计入，已放行的交换即使被微信拒绝或超时也计入。超额返回 `429` 和 `Retry-After`，计数库不可用返回 `503`，两种情况均不会向微信发请求。登录交换和问答日配额独立计算。
+
 ## 正式上线前
 
-需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录和问答。开放登录入口前应为登录交换设置流量限制，并处理小程序读接口的身份策略。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
+需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录和问答。对外开放前还需确定读接口的身份策略，并在入口增加按可信客户端来源的限流，以免单个来源占满全局交换额度。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
