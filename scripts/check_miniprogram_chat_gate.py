@@ -4,7 +4,7 @@ import argparse
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from http.client import HTTPSConnection
+from http.client import HTTPConnection, HTTPSConnection
 import json
 from pathlib import Path
 import secrets
@@ -61,9 +61,9 @@ class ChatGateChecks(GatewayChecks):
             time.sleep(0.1)
         self.fail(log_path.read_text(encoding="utf-8", errors="replace"))
 
-    def post(self, user=None, body=b'{"query":"synthetic question"}', *, auth=None, path=CHAT_PATH):
+    def post(self, user=None, body=b'{"query":"synthetic question"}', *, auth=None, path=CHAT_PATH, headers=None):
         authorization = "Bearer " + self.tokens[user] if user else auth
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **(headers or {})}
         if authorization:
             headers["Authorization"] = authorization
         context = ssl.create_default_context(cafile=str(self.root_ca))
@@ -149,11 +149,14 @@ class WeChatGateChecks(ChatGateChecks):
         self.gate_env = dict(self.gate_env, MINIPROGRAM_CHAT_QUOTA_DB=str(self.usage))
         self.upstream.posts.clear()
 
-    def start_wechat_gate(self, *, limit):
+    def start_wechat_gate(self, *, limit, source_limit=None):
         self.gate_env.update(MINIPROGRAM_WECHAT_APP_ID="wx0123456789abcdef",
                              MINIPROGRAM_WECHAT_APP_SECRET="synthetic-secret",
                              MINIPROGRAM_WECHAT_LOGIN_PER_MINUTE=str(limit))
         self.gate_env.pop("MINIPROGRAM_CHAT_USERS", None)
+        self.gate_env.pop("MINIPROGRAM_WECHAT_LOGIN_SOURCE_PER_MINUTE", None)
+        if source_limit is not None:
+            self.gate_env["MINIPROGRAM_WECHAT_LOGIN_SOURCE_PER_MINUTE"] = str(source_limit)
         # Replace only the external HTTPS transport. The gateway, routes and DB are real.
         fake = """
 import json
@@ -194,11 +197,11 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
 """
         return self.run_gate([sys.executable, "-B", "-c", fake.replace("port=PORT", f"port={self.gate_port}")])
 
-    def login(self, code):
-        return self.post(body=json.dumps({"code": code}).encode(), path="/api/v1/miniprogram/login")
+    def login(self, code, *, headers=None):
+        return self.post(body=json.dumps({"code": code}).encode(), path="/api/v1/miniprogram/login", headers=headers)
 
     def test_login_sessions_share_identity_quota_and_expire(self):
-        self.start_wechat_gate(limit=12)
+        self.start_wechat_gate(limit=12, source_limit=12)
         self.assertEqual(self.post(body=b"x" * 2049, path="/api/v1/miniprogram/login")[0], 413)
         self.assertEqual(self.login("invalid code")[0], 422)
         self.assertEqual(self.login("used")[0], 401)
@@ -282,12 +285,53 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
         self.assertGreater(int(headers["Retry-After"]), 10)
         with closing(sqlite3.connect(self.usage)) as db, db:
             db.execute("UPDATE wechat_login_attempts SET admitted_at = 0")
+            db.execute("UPDATE wechat_login_sources SET admitted_at = 0")
         self.assertEqual(self.login("first")[0], 200)
         with closing(sqlite3.connect(self.usage)) as db, db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM wechat_login_attempts").fetchone()[0], 1)
             db.execute("BEGIN EXCLUSIVE")
             self.assertEqual(self.login("down")[0], 503)
         self.assertEqual(self.upstream.posts, [])
+
+    def test_login_source_limit_overwrites_client_headers_and_preserves_global_limit(self):
+        with closing(sqlite3.connect(self.usage)) as db, db:
+            db.execute("CREATE TABLE wechat_login_attempts (admitted_at REAL NOT NULL)")
+            db.execute("INSERT INTO wechat_login_attempts VALUES (?)", (time.time(),))
+        self.start_wechat_gate(limit=4, source_limit=2)
+        for claimed in ("192.0.2.1", "192.0.2.2"):
+            self.assertEqual(self.login("used", headers={"X-Miniprogram-Login-Source": claimed})[0], 401)
+        status, headers, _ = self.login("first", headers={"X-Miniprogram-Login-Source": "192.0.2.3",
+                                                        "X-Forwarded-For": "192.0.2.3"})
+        self.assertEqual(status, 429)
+        self.assertTrue(1 <= int(headers["Retry-After"]) <= 60)
+
+        # Synthetic source values injected at the isolated listener exercise multiple peers.
+        def direct(source):
+            conn = HTTPConnection(LOOPBACK, self.gate_port, timeout=5)
+            try:
+                headers = {} if source is None else {"X-Miniprogram-Login-Source": source}
+                conn.request("POST", "/internal/miniprogram/wechat-login", b'{"code":"used"}', headers)
+                return conn.getresponse().status
+            finally:
+                conn.close()
+
+        self.assertEqual(direct(None), 503)
+        self.assertEqual(direct("not-an-address"), 503)
+        self.assertEqual(direct("::ffff:127.0.0.1"), 429)
+        self.assertEqual(direct("192.0.2.4"), 401)
+        self.assertEqual(direct("192.0.2.5"), 429)
+        with closing(sqlite3.connect(self.usage)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM wechat_login_attempts").fetchone()[0], 4)
+            self.assertEqual(sorted(row[0] for row in db.execute(
+                "SELECT COUNT(*) FROM wechat_login_sources GROUP BY source"
+            )), [1, 2])
+            with db:
+                db.execute("UPDATE wechat_login_attempts SET admitted_at = 0")
+                db.execute("UPDATE wechat_login_sources SET admitted_at = 0")
+        self.assertEqual(direct("2001:db8:1::1"), 401)
+        self.assertEqual(direct("2001:db8:1::2"), 401)
+        self.assertEqual(direct("2001:db8:1::3"), 429)
+        self.assertEqual(direct("2001:db8:2::1"), 401)
 
 
 if __name__ == "__main__":
@@ -300,5 +344,6 @@ if __name__ == "__main__":
         MisconfiguredGateChecks("test_wrong_auth_port_cannot_release_read_data"),
         WeChatGateChecks("test_login_sessions_share_identity_quota_and_expire"),
         WeChatGateChecks("test_login_exchange_limit_blocks_before_provider_and_survives_restart"),
+        WeChatGateChecks("test_login_source_limit_overwrites_client_headers_and_preserves_global_limit"),
     ])
     raise SystemExit(0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)

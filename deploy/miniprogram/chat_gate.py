@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, time, timedelta, timezone
+from ipaddress import IPv6Address, ip_address, ip_network
 from pathlib import Path
 from time import time as unix_time
 
@@ -28,6 +29,7 @@ MAX_BODY_BYTES = 64 * 1024
 SESSION_TTL = 3600
 LOGIN_WINDOW_SECONDS = 60
 DEFAULT_LOGIN_LIMIT = 12
+DEFAULT_LOGIN_SOURCE_LIMIT = 4
 BUSINESS_TZ = timezone(timedelta(hours=8))
 NO_STORE = {"Cache-Control": "no-store"}
 TOKEN_PATTERN = re.compile(r"Bearer ([A-Za-z0-9_-]{43})", re.IGNORECASE | re.ASCII)
@@ -64,19 +66,41 @@ def session_user(db_path, digest, app_id):
         return row[0] if row and row[0].startswith(f"wechat:{app_id}:") else None
 
 
-def reserve_login_exchange(db_path, limit):
+def login_source(request):
+    values = request.headers.getlist("x-miniprogram-login-source")
+    try:
+        if len(values) != 1 or "%" in values[0]:
+            raise ValueError
+        address = ip_address(values[0])
+    except ValueError:
+        raise HTTPException(503, "Login source unavailable", NO_STORE) from None
+    if isinstance(address, IPv6Address):
+        if address.ipv4_mapped:
+            address = address.ipv4_mapped
+        elif not address.is_loopback:
+            address = ip_network((address, 64), strict=False).network_address
+    return hashlib.sha256(address.packed).hexdigest()
+
+
+def reserve_login_exchange(db_path, limit, source, source_limit):
     with closing(sqlite3.connect(db_path.as_uri() + "?mode=rw", uri=True, timeout=2)) as db, db:
         db.execute("BEGIN IMMEDIATE")
         now = unix_time()
         db.execute("DELETE FROM wechat_login_attempts WHERE admitted_at <= ?", (now - LOGIN_WINDOW_SECONDS,))
-        count, = db.execute("SELECT COUNT(*) FROM wechat_login_attempts").fetchone()
-        if count >= limit:
-            expires_from, = db.execute(
-                "SELECT admitted_at FROM wechat_login_attempts ORDER BY admitted_at LIMIT 1 OFFSET ?",
-                (count - limit,),
-            ).fetchone()
+        db.execute("DELETE FROM wechat_login_sources WHERE admitted_at <= ?", (now - LOGIN_WINDOW_SECONDS,))
+        attempts = db.execute("SELECT admitted_at FROM wechat_login_attempts ORDER BY admitted_at").fetchall()
+        source_attempts = db.execute("SELECT admitted_at FROM wechat_login_sources WHERE source = ? "
+                                     "ORDER BY admitted_at", (source,)).fetchall()
+        saturated = []
+        if len(attempts) >= limit:
+            saturated.append(attempts[-limit][0])
+        if len(source_attempts) >= source_limit:
+            saturated.append(source_attempts[-source_limit][0])
+        if saturated:
+            expires_from = max(saturated)
             return max(1, math.ceil(expires_from + LOGIN_WINDOW_SECONDS - now))
         db.execute("INSERT INTO wechat_login_attempts VALUES (?)", (now,))
+        db.execute("INSERT INTO wechat_login_sources VALUES (?, ?)", (now, source))
     return None
 
 
@@ -129,29 +153,34 @@ def create_app():
             user_limit = int(os.environ.get("MINIPROGRAM_CHAT_USER_DAILY", "5"))
             total_limit = int(os.environ.get("MINIPROGRAM_CHAT_TOTAL_DAILY", "20"))
             login_limit = DEFAULT_LOGIN_LIMIT
+            source_limit = DEFAULT_LOGIN_SOURCE_LIMIT
             if app_id:
                 login_limit = int(os.environ.get("MINIPROGRAM_WECHAT_LOGIN_PER_MINUTE", DEFAULT_LOGIN_LIMIT))
+                source_limit = int(os.environ.get("MINIPROGRAM_WECHAT_LOGIN_SOURCE_PER_MINUTE",
+                                                  min(DEFAULT_LOGIN_SOURCE_LIMIT, login_limit)))
             port = int(os.environ.get("MINIPROGRAM_UPSTREAM_PORT", "8000"))
             if (not db_path.is_absolute() or not 1 <= user_limit <= total_limit
-                    or not 1 <= login_limit <= 120 or not 1 <= port <= 65535):
+                    or not 1 <= source_limit <= login_limit <= 120 or not 1 <= port <= 65535):
                 raise ValueError
         except (KeyError, ValueError, TypeError):
             raise RuntimeError("Invalid mini program chat pilot configuration") from None
 
         try:
             with closing(sqlite3.connect(db_path, timeout=2)) as db, db:
+                db.execute("BEGIN IMMEDIATE")
                 db.execute("CREATE TABLE IF NOT EXISTS usage (day TEXT, user TEXT, count INTEGER NOT NULL, "
                            "PRIMARY KEY (day, user))")
                 db.execute("CREATE TABLE IF NOT EXISTS wechat_sessions (digest TEXT PRIMARY KEY, "
                            "user TEXT NOT NULL, expires_at INTEGER NOT NULL)")
                 db.execute("CREATE TABLE IF NOT EXISTS wechat_login_attempts (admitted_at REAL NOT NULL)")
+                db.execute("CREATE TABLE IF NOT EXISTS wechat_login_sources (admitted_at REAL NOT NULL, source TEXT NOT NULL)")
         except sqlite3.Error:
             raise RuntimeError("Cannot initialize mini program chat quota database") from None
 
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False,
                                      timeout=httpx.Timeout(175, connect=3)) as client:
             app.state.admit = (users_by_digest, db_path, user_limit, total_limit)
-            app.state.wechat = (app_id, secret, login_limit) if app_id else None
+            app.state.wechat = (app_id, secret, login_limit, source_limit) if app_id else None
             app.state.upstream = client
             yield
 
@@ -183,14 +212,15 @@ def create_app():
     async def login(request: Request, response: Response):
         if app.state.wechat is None:
             raise HTTPException(404, "Not Found", NO_STORE)
-        app_id, secret, login_limit = app.state.wechat
+        app_id, secret, login_limit, source_limit = app.state.wechat
         db_path = app.state.admit[1]
         try:
             credential = LoginCode.model_validate_json(await read_body(request, 2048))
         except ValidationError:
             raise HTTPException(422, "Invalid login code", NO_STORE) from None
+        source = login_source(request)
         try:
-            retry_after = await run_in_threadpool(reserve_login_exchange, db_path, login_limit)
+            retry_after = await run_in_threadpool(reserve_login_exchange, db_path, login_limit, source, source_limit)
         except sqlite3.Error:
             raise HTTPException(503, "Login limit unavailable", NO_STORE) from None
         if retry_after is not None:

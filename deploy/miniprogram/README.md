@@ -89,6 +89,10 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 接入层默认在任意连续 60 秒内最多向微信交换 12 次凭证。可用 `MINIPROGRAM_WECHAT_LOGIN_PER_MINUTE` 调整为 `1` 至 `120`，重启后生效。同一实例的进程用同一份 SQLite 计数，进程重启会保留窗口内用量。输入校验失败不计入，已放行的交换即使被微信拒绝或超时也计入。超额返回 `429` 和 `Retry-After`，计数库不可用返回 `503`，两种情况均不会向微信发请求。登录交换和问答日配额独立计算。
 
+单一连接来源默认每 60 秒最多交换 4 次，且受全局上限约束。使用 `MINIPROGRAM_WECHAT_LOGIN_SOURCE_PER_MINUTE` 覆盖，取值为 `1` 至全局上限。Caddy 用直接连接的地址覆盖专用来源头，接入层只需保存地址摘要。IPv4 按地址计算，非回环 IPv6 按 `/64` 计算；同一个出口后的用户可能共享额度。接入层须由本机受信任的 Caddy 调用。若 Caddy 前还有代理，当前配置会将该代理视为一个来源，应按实际代理拓扑重新验证来源边界。 [Caddy 连接地址占位符](https://caddyserver.com/docs/caddyfile/concepts#placeholders)
+
+如需回退版本，先关闭 Caddy 微信登录入口，再同时回退 Caddy 和接入层。原全局计数表可继续使用，无需重建 SQLite 文件。
+
 ### 日报和新闻共用微信会话
 
 完成问答登录联调后，可在 Caddy 环境增加 `MINIPROGRAM_WECHAT_READ_ENABLED=1` 并重启，同时把 `miniprogram/utils/chat-config.js` 的 `wechatReadEnabled` 设为 `true`。最新日报、历史日报、关键词新闻和事件时间线会走同一个 HTTPS 网关。首次读取需要微信登录，已有会话会直接复用。运维探针仍可在原地址使用 Basic Auth。微信读接口只接受本机回环请求，过期令牌返回 `401`，会话库故障时会拒绝读取。读取不消耗问答额度，请求发往原 FastAPI 前会移除凭据。
@@ -97,4 +101,4 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 ## 正式上线前
 
-需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录、读取和问答。对外开放前还需在入口增加按可信客户端来源的限流，以免单个来源占满全局交换额度。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
+需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录、读取和问答。按实际入口拓扑核对限流对应的连接来源。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
