@@ -41,6 +41,7 @@
 
     <view class="card">
       <view class="section-title">核心摘要</view>
+      <view wx:if="{{report.coverage}}" class="report-note muted">{{report.coverage}}</view>
       <text class="prose" user-select="true">{{report.summary}}</text>
     </view>
   </block>

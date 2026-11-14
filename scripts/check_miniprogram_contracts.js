@@ -361,6 +361,11 @@ test('日报格式化保留业务日期与零分，兼容旧摘要并避免渲�
   assert.equal(report.sentiment, '—')
   assert.equal(report.confidence, '中')
   assert.equal(report.summary, '原始摘要')
+  assert.equal(report.coverage, '新闻覆盖范围未记录。')
+  const withCoverage = (data_freshness) => displayReport({ content: { data_freshness } }).coverage
+  assert.match(withCoverage({ evidence_excluded_count: 35 }), /覆盖受限/)
+  assert.equal(withCoverage({ readiness_scope: 'snapshot', coverage_incomplete: false, evidence_excluded_count: 0 }), '')
+  assert.match(withCoverage({ readiness_scope: 'historical_unknown', coverage_incomplete: false, evidence_excluded_count: 0 }), /未记录/)
   assert.equal(displayReport({ report_day: '2026-02-30', date: '2026-03-01T00:00:00' }).date, '2026-03-01')
   assert.equal(displayReport({ content: [] }).summary, '暂无摘要。')
   assert.equal(displayReport(null), null)

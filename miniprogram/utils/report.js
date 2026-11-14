@@ -40,6 +40,16 @@ function auditDisplay(content) {
   return labels
 }
 
+function coverageNotice(freshness) {
+  if (freshness && (freshness.coverage_incomplete === true ||
+      (Number.isFinite(freshness.evidence_excluded_count) && freshness.evidence_excluded_count > 0))) {
+    return '新闻覆盖受限，部分材料未纳入研判。'
+  }
+  if (freshness && freshness.readiness_scope === 'snapshot' &&
+      freshness.coverage_incomplete === false && freshness.evidence_excluded_count === 0) return ''
+  return '新闻覆盖范围未记录。'
+}
+
 function displayReport(report) {
   if (!isObject(report)) return null
 
@@ -57,6 +67,7 @@ function displayReport(report) {
     score: Number.isFinite(report.score) ? report.score.toFixed(2) : '—',
     confidence: CONFIDENCE_LABELS.get(confidence) || confidence || '—',
     summary: text(content.market_summary) || text(content.raw) || '暂无摘要。',
+    coverage: coverageNotice(content.data_freshness),
     auditLabel,
     auditTone,
     auditNote
@@ -69,17 +80,8 @@ function historyReports(records) {
   records.forEach((record, index) => {
     const display = displayReport(record)
     if (!display) return
-    const freshness = record.content && record.content.data_freshness
-    let coverage = '新闻覆盖范围未记录。'
-    if (freshness && (freshness.coverage_incomplete === true ||
-        (Number.isFinite(freshness.evidence_excluded_count) && freshness.evidence_excluded_count > 0))) {
-      coverage = '新闻覆盖受限，部分材料未纳入研判。'
-    } else if (freshness && freshness.readiness_scope === 'snapshot' &&
-        freshness.coverage_incomplete === false && freshness.evidence_excluded_count === 0) {
-      coverage = ''
-    }
     const entry = {
-      ...display, key: index, coverage,
+      ...display, key: index,
       scoreValue: Number.isFinite(record.score) ? record.score : null
     }
     if (entry.date === '—') {
