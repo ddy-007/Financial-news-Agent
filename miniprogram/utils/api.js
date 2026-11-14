@@ -1,5 +1,8 @@
 // 模拟器使用回环地址。真机联调时改为电脑的局域网地址。
 const BASE_URL = 'http://127.0.0.1:8000'
+const { wechatChatOrigin } = require('./chat-config')
+let chatSession
+let loginInFlight
 
 function requestError(kind, statusCode) {
   const error = new Error(kind)
@@ -9,6 +12,10 @@ function requestError(kind, statusCode) {
 }
 
 function requestErrorMessage(error, page) {
+  if (error.kind === 'login' && error.statusCode === 429) return '微信登录请求过于频繁，请稍后重试。'
+  if (error.kind === 'login' && error.statusCode === 403) return '微信暂未允许本次登录。'
+  if (error.kind === 'login') return '微信登录失败，请稍后重新发送。'
+  if (error.kind === 'session') return '微信登录已失效，请重新发送。'
   if (error.kind === 'timeout') {
     return page === 'chat'
       ? '等待超时，服务端可能仍在处理，请勿连续发送。'
@@ -28,14 +35,16 @@ function requestErrorMessage(error, page) {
   return page === 'news' ? '加载新闻失败，请稍后刷新。' : '加载日报失败，请稍后刷新。'
 }
 
-function request(path, { method = 'GET', data, timeout }) {
+function request(path, { method = 'GET', data, timeout, origin = BASE_URL, token }) {
   return new Promise((resolve, reject) => {
+    const header = { 'content-type': 'application/json' }
+    if (token) header.Authorization = `Bearer ${token}`
     wx.request({
-      url: `${BASE_URL}${path}`,
+      url: `${origin}${path}`,
       method,
       data,
       timeout,
-      header: { 'content-type': 'application/json' },
+      header,
       success({ statusCode, data: body }) {
         if (statusCode >= 200 && statusCode < 300) {
           resolve(body)
@@ -48,6 +57,27 @@ function request(path, { method = 'GET', data, timeout }) {
       }
     })
   })
+}
+
+async function loginForChat() {
+  if (chatSession && chatSession.expiresAt > Date.now()) return chatSession.token
+  if (!loginInFlight) {
+    loginInFlight = (async () => {
+      const code = await new Promise((resolve, reject) => {
+        wx.login({ timeout: 8000, success: ({ code }) => code ? resolve(code) : reject(), fail: reject })
+      })
+      const startedAt = Date.now()
+      const body = await request('/api/v1/miniprogram/login', {
+        method: 'POST', data: { code }, timeout: 12000, origin: wechatChatOrigin
+      })
+      if (!body || typeof body.access_token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.access_token) ||
+          !Number.isInteger(body.expires_in) || body.expires_in <= 30 || body.expires_in > 3600) throw requestError('login')
+      chatSession = { token: body.access_token, expiresAt: startedAt + (body.expires_in - 30) * 1000 }
+      return chatSession.token
+    })().catch((error) => { throw requestError('login', error && error.statusCode) })
+      .finally(() => { loginInFlight = null })
+  }
+  return loginInFlight
 }
 
 function getLatestReport() {
@@ -68,12 +98,26 @@ function getEventTimeline(newsId, asOf) {
   })
 }
 
-function askQuestion(query, history = []) {
-  return request('/api/v1/agent/chat', {
-    method: 'POST',
-    data: { query, chat_history: history },
-    timeout: 180000
-  })
+async function askQuestion(query, history = []) {
+  if (wechatChatOrigin && !/^https:\/\/[a-z0-9.-]+(?::[0-9]{1,5})?$/i.test(wechatChatOrigin)) {
+    throw requestError('login')
+  }
+  const token = wechatChatOrigin ? await loginForChat() : null
+  try {
+    return await request('/api/v1/agent/chat', {
+      method: 'POST',
+      data: { query, chat_history: history },
+      timeout: 180000,
+      origin: wechatChatOrigin || BASE_URL,
+      token
+    })
+  } catch (error) {
+    if (token && error.statusCode === 401) {
+      if (chatSession && chatSession.token === token) chatSession = null
+      throw requestError('session')
+    }
+    throw error
+  }
 }
 
 module.exports = { getLatestReport, getDailyReports, getWatchedNews, getEventTimeline, askQuestion, requestErrorMessage }

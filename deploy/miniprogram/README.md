@@ -79,6 +79,14 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 .\.venv\Scripts\python.exe -B scripts/check_miniprogram_chat_gate.py --caddy caddy
 ```
 
+## 微信登录本地联调
+
+在接入层进程环境中设置 `MINIPROGRAM_WECHAT_APP_ID` 与 `MINIPROGRAM_WECHAT_APP_SECRET`，然后重启接入层。仅使用微信身份联调时，可省略 `MINIPROGRAM_CHAT_USERS`。Caddy 环境同时设置 `MINIPROGRAM_CHAT_ENABLED=1` 与 `MINIPROGRAM_WECHAT_LOGIN_ENABLED=1`，校验后重启。两个入口仍限定为回环访问。 [微信登录](https://developers.weixin.qq.com/miniprogram/dev/framework/open-ability/login.html) · [登录凭证校验](https://developers.weixin.qq.com/miniprogram/dev/server/API/user-login/api_code2session.html)
+
+在 `miniprogram/utils/chat-config.js` 填入本地 HTTPS 网关源地址，例如 `https://127.0.0.1:8443`。开发者工具需使用同一个 AppID，且信任本地 Caddy 证书。发送问题时，小程序通过 `wx.login` 获取临时凭证，由接入层向微信校验。接入层只返回有效期一小时的随机会话令牌，SQLite 仅保存令牌摘要、用户代号及到期时间。小程序将令牌保存在运行内存中。登录失败或令牌失效时，由用户重新发送问题，避免自动重发问答。
+
+微信用户在同一个 AppID 下重新登录仍共享当天个人额度，也与内测账号共享全局额度。AppSecret 和微信会话密钥只在服务端处理。日报和新闻继续读取现有本地接口。回退时清空小程序配置中的网关地址，并关闭 `MINIPROGRAM_WECHAT_LOGIN_ENABLED`。如需立即停止现有微信会话访问，同时关闭问答入口，或从接入层环境移除微信配置并重启接入层。
+
 ## 正式上线前
 
-需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围。正式问答还需要接入微信登录和服务端会话，将经平台验证的身份关联到用量，并在真实 AppID 下验收。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
+需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录和问答。开放登录入口前应为登录交换设置流量限制，并处理小程序读接口的身份策略。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)

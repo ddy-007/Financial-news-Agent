@@ -104,6 +104,7 @@ class GatewayChecks(unittest.TestCase):
                        MINIPROGRAM_GATEWAY_HASH=hashed.stdout.strip(),
                        MINIPROGRAM_UPSTREAM_PORT=str(upstream.server_port))
         cls.env.pop("MINIPROGRAM_CHAT_ENABLED", None)
+        cls.env.pop("MINIPROGRAM_WECHAT_LOGIN_ENABLED", None)
         cls.env.update(cls.caddy_environment())
         args = ["--config", str(CONFIG), "--adapter", "caddyfile"]
         validated = subprocess.run([cls.caddy, "validate", *args], env=cls.env, capture_output=True,
@@ -174,6 +175,7 @@ class GatewayChecks(unittest.TestCase):
     def test_other_routes_and_methods_never_reach_upstream(self):
         cases = (
             ("POST", "/api/v1/agent/chat"), ("POST", "/internal/miniprogram/chat"),
+            ("POST", "/api/v1/miniprogram/login"), ("POST", "/internal/miniprogram/wechat-login"),
             ("POST", "/api/v1/news/collect"),
             ("POST", "/api/v1/market/collect"), ("POST", "/api/v1/reports/generate"),
             ("POST", "/api/v1/reports/weekly/generate"), ("GET", "/api/v1/reports/evaluation"),

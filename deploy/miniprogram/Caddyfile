@@ -48,6 +48,12 @@ https://{$MINIPROGRAM_GATEWAY_HOST:127.0.0.1:8443} {
 		remote_ip 127.0.0.1 ::1
 		expression `"{$MINIPROGRAM_CHAT_ENABLED:0}" == "1"`
 	}
+	@wechat_login {
+		method POST
+		path /api/v1/miniprogram/login
+		remote_ip 127.0.0.1 ::1
+		expression `"{$MINIPROGRAM_CHAT_ENABLED:0}" == "1" && "{$MINIPROGRAM_WECHAT_LOGIN_ENABLED:0}" == "1"`
+	}
 
 	route {
 		handle @today {
@@ -76,6 +82,13 @@ https://{$MINIPROGRAM_GATEWAY_HOST:127.0.0.1:8443} {
 				max_size 65536
 			}
 			rewrite /internal/miniprogram/chat?
+			reverse_proxy 127.0.0.1:{$MINIPROGRAM_CHAT_PORT:8001}
+		}
+		handle @wechat_login {
+			request_body {
+				max_size 2048
+			}
+			rewrite /internal/miniprogram/wechat-login?
 			reverse_proxy 127.0.0.1:{$MINIPROGRAM_CHAT_PORT:8001}
 		}
 		handle {

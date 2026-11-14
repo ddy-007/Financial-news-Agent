@@ -37,6 +37,8 @@ class ChatGateChecks(GatewayChecks):
                                 user: hashlib.sha256(token.encode()).hexdigest()
                                 for user, token in cls.tokens.items()
                             }))
+        cls.gate_env.pop("MINIPROGRAM_WECHAT_APP_ID", None)
+        cls.gate_env.pop("MINIPROGRAM_WECHAT_APP_SECRET", None)
 
     @classmethod
     def caddy_environment(cls):
@@ -45,6 +47,9 @@ class ChatGateChecks(GatewayChecks):
     def start_gate(self):
         command = [sys.executable, "-B", "-m", "uvicorn", "deploy.miniprogram.chat_gate:create_app",
                    "--factory", "--host", LOOPBACK, "--port", str(self.gate_port), "--no-access-log"]
+        return self.run_gate(command)
+
+    def run_gate(self, command):
         log_path = self.tmp / "gate.log"
         with log_path.open("wb") as log:
             process = subprocess.Popen(command, cwd=ROOT, env=self.gate_env, stdout=log, stderr=log)
@@ -56,7 +61,7 @@ class ChatGateChecks(GatewayChecks):
             time.sleep(0.1)
         self.fail(log_path.read_text(encoding="utf-8", errors="replace"))
 
-    def post(self, user=None, body=b'{"query":"synthetic question"}', *, auth=None):
+    def post(self, user=None, body=b'{"query":"synthetic question"}', *, auth=None, path=CHAT_PATH):
         authorization = "Bearer " + self.tokens[user] if user else auth
         headers = {"Content-Type": "application/json"}
         if authorization:
@@ -64,7 +69,7 @@ class ChatGateChecks(GatewayChecks):
         context = ssl.create_default_context(cafile=str(self.root_ca))
         conn = HTTPSConnection(LOOPBACK, self.port, context=context, timeout=6)
         try:
-            conn.request("POST", CHAT_PATH, body=body, headers=headers)
+            conn.request("POST", path, body=body, headers=headers)
             response = conn.getresponse()
             return response.status, response.headers, response.read()
         finally:
@@ -74,6 +79,7 @@ class ChatGateChecks(GatewayChecks):
         self.assertEqual(self.post("alice")[0], 502)
         process = self.start_gate()
         self.assertEqual(self.post()[0], 401)
+        self.assertEqual(self.post(path="/api/v1/miniprogram/login")[0], 404)
         self.assertEqual(self.post(auth="Bearer " + "x" * 43)[0], 401)
         self.assertEqual(self.post(auth=self.auth)[0], 401)
         self.assertEqual(self.post("alice", b'{"query":" "}')[0], 422)
@@ -122,6 +128,93 @@ class MisconfiguredGateChecks(GatewayChecks):
         self.assertEqual(self.upstream.posts, [("/internal/miniprogram/chat", None, b"")])
 
 
+class WeChatGateChecks(ChatGateChecks):
+    @classmethod
+    def caddy_environment(cls):
+        return {**super().caddy_environment(), "MINIPROGRAM_WECHAT_LOGIN_ENABLED": "1"}
+
+    def test_login_sessions_share_identity_quota_and_expire(self):
+        self.gate_env.update(MINIPROGRAM_WECHAT_APP_ID="wx0123456789abcdef",
+                             MINIPROGRAM_WECHAT_APP_SECRET="synthetic-secret")
+        self.gate_env.pop("MINIPROGRAM_CHAT_USERS")
+        # Replace only the external HTTPS transport. The gateway, routes and DB are real.
+        fake = """
+import json
+from io import BytesIO
+from urllib.parse import parse_qs, urlsplit
+import uvicorn
+from deploy.miniprogram import wechat_login
+
+class FakeWeChatConnection:
+    def __init__(self, host, **kwargs):
+        assert host == 'api.weixin.qq.com'
+
+    def request(self, method, path):
+        assert method == 'GET'
+        url = urlsplit(path)
+        query = parse_qs(url.query)
+        assert url.path == '/sns/jscode2session'
+        assert query['appid'] == ['wx0123456789abcdef']
+        assert query['secret'] == ['synthetic-secret']
+        assert query['grant_type'] == ['authorization_code']
+        self.code = query['js_code'][0]
+
+    def getresponse(self):
+        responses = {'first': {'openid': 'openid-marker', 'session_key': 'key-marker'},
+                     'again': {'openid': 'openid-marker'}, 'other': {'openid': 'other-openid'},
+                     'used': {'errcode': 40163}, 'down': {'errcode': -1},
+                     'blocked': {'errcode': 40226}, 'limited': {'errcode': 45011}}
+        body = BytesIO(json.dumps(responses[self.code]).encode())
+        body.status = 200
+        return body
+
+    def close(self):
+        pass
+
+wechat_login.HTTPSConnection = FakeWeChatConnection
+uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0.0.1',
+            port=PORT, access_log=False)
+"""
+        self.run_gate([sys.executable, "-B", "-c", fake.replace("port=PORT", f"port={self.gate_port}")])
+        login_path = "/api/v1/miniprogram/login"
+
+        def login(code):
+            return self.post(body=json.dumps({"code": code}).encode(), path=login_path)
+
+        self.assertEqual(self.post(body=b"x" * 2049, path=login_path)[0], 413)
+        self.assertEqual(login("invalid code")[0], 422)
+        self.assertEqual(login("used")[0], 401)
+        self.assertEqual(login("blocked")[0], 403)
+        self.assertEqual(login("limited")[0], 429)
+        self.assertEqual(login("down")[0], 502)
+        self.assertEqual(self.post(path="/internal/miniprogram/wechat-login")[0], 404)
+        self.assertEqual(self.upstream.posts, [])
+        tokens = []
+        for code in ("first", "again", "other"):
+            status, headers, body = login(code)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            payload = json.loads(body)
+            self.assertEqual(set(payload), {"access_token", "expires_in"})
+            self.assertEqual(payload["expires_in"], 3600)
+            tokens.append(payload["access_token"])
+        self.assertEqual(len(set(tokens)), 3)
+        self.upstream.responses[CHAT_PATH] = (200, {"answer": "fake answer", "sources": []})
+        self.addCleanup(self.upstream.responses.pop, CHAT_PATH)
+        self.assertEqual([self.post(auth="Bearer " + tokens[index])[0] for index in (0, 1, 1, 2)],
+                         [200, 200, 429, 200])
+        with closing(sqlite3.connect(self.usage)) as db, db:
+            self.assertEqual(sorted(row[0] for row in db.execute("SELECT count FROM usage")), [1, 2])
+            rows = db.execute("SELECT digest, user FROM wechat_sessions").fetchall()
+            self.assertNotIn("openid-marker", str(rows))
+            for token in tokens:
+                self.assertNotIn(token, str(rows))
+            db.execute("UPDATE wechat_sessions SET expires_at = 0")
+        self.assertEqual(self.post(auth="Bearer " + tokens[2])[0], 401)
+        self.assertEqual(len(self.upstream.posts), 3)
+        self.assertTrue(all(not authorization for _, authorization, _ in self.upstream.posts))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--caddy", default="caddy")
@@ -129,5 +222,6 @@ if __name__ == "__main__":
     suite = unittest.TestSuite([
         ChatGateChecks("test_pilot_authentication_and_atomic_daily_quota"),
         MisconfiguredGateChecks("test_wrong_proxy_port_does_not_reach_agent_route"),
+        WeChatGateChecks("test_login_sessions_share_identity_quota_and_expire"),
     ])
     raise SystemExit(0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)

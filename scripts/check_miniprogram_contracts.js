@@ -3,6 +3,65 @@ const { test } = require('node:test')
 const { displayReport, reportDateNotice, historyReports, compareReports } = require('../miniprogram/utils/report')
 const { formatAnswer } = require('../miniprogram/utils/answer')
 
+test('微信登录联调复用会话，过期时保留用户手动重发', async (t) => {
+  const config = require('../miniprogram/utils/chat-config')
+  const path = require.resolve('../miniprogram/utils/api')
+  const requests = mockRequests(t)
+  const logins = []
+  global.wx.login = (options) => logins.push(options)
+  config.wechatChatOrigin = 'https://127.0.0.1:8443'
+  delete require.cache[path]
+  const { askQuestion, getLatestReport, requestErrorMessage } = require(path)
+  t.after(() => {
+    config.wechatChatOrigin = ''
+    delete require.cache[path]
+  })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const token = 'A'.repeat(43)
+  const first = askQuestion('问题一')
+  const second = askQuestion('问题二')
+  assert.equal(logins.length, 1)
+  logins[0].success({ code: 'one-time-code' })
+  await flush()
+  assert.equal(requests[0].url, 'https://127.0.0.1:8443/api/v1/miniprogram/login')
+  assert.deepEqual(requests[0].data, { code: 'one-time-code' })
+  assert.equal(requests[0].header.Authorization, undefined)
+  requests[0].success({ statusCode: 200, data: { access_token: token, expires_in: 3600 } })
+  await flush()
+  for (const request of requests.slice(1, 3)) {
+    assert.equal(request.url, 'https://127.0.0.1:8443/api/v1/agent/chat')
+    assert.equal(request.header.Authorization, `Bearer ${token}`)
+    request.success({ statusCode: 200, data: { answer: '回答' } })
+  }
+  await Promise.all([first, second])
+  const report = getLatestReport()
+  assert.match(requests[3].url, /^http:\/\/127\.0\.0\.1:8000\//)
+  assert.equal(requests[3].header.Authorization, undefined)
+  requests[3].success({ statusCode: 200, data: {} })
+  await report
+
+  const expired = askQuestion('问题三')
+  await flush()
+  assert.equal(logins.length, 1)
+  requests[4].success({ statusCode: 401 })
+  await assert.rejects(expired, { kind: 'session' })
+  assert.equal(requests.length, 5)
+  const failedLogin = askQuestion('问题三')
+  assert.equal(logins.length, 2)
+  logins[1].fail({ errMsg: 'login failed' })
+  await assert.rejects(failedLogin, { kind: 'login' })
+  assert.equal(requests.length, 5)
+  const rateLimited = askQuestion('问题三')
+  logins[2].success({ code: 'another-code' })
+  await flush()
+  requests[5].success({ statusCode: 429 })
+  await assert.rejects(rateLimited, (error) => {
+    assert.equal(requestErrorMessage(error, 'chat'), '微信登录请求过于频繁，请稍后重试。')
+    return true
+  })
+  assert.equal(requests.length, 6)
+})
+
 test('长回答的标题、加粗、时效提示、证据表和编号均保留为可读区块', () => {
   const sample = [
     '## 最新一份日报（2026-11-06）', '',

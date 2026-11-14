@@ -4,23 +4,60 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from time import time as unix_time
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.concurrency import run_in_threadpool
 
+from .wechat_login import WeChatLoginBlocked, WeChatRateLimited, WeChatUnavailable, exchange_code
+
 
 CHAT_PATH = "/api/v1/agent/chat"
 ADMISSION_PATH = "/internal/miniprogram/chat"
+LOGIN_PATH = "/internal/miniprogram/wechat-login"
 MAX_BODY_BYTES = 64 * 1024
+SESSION_TTL = 3600
 BUSINESS_TZ = timezone(timedelta(hours=8))
 NO_STORE = {"Cache-Control": "no-store"}
 TOKEN_PATTERN = re.compile(r"Bearer ([A-Za-z0-9_-]{43})", re.IGNORECASE | re.ASCII)
+
+
+class LoginCode(BaseModel):
+    code: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+
+
+async def read_body(request, limit):
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise HTTPException(413, "Request body too large", NO_STORE)
+        body.extend(chunk)
+    return body
+
+
+def new_session(db_path, app_id, openid):
+    token = secrets.token_urlsafe(32)
+    user = f"wechat:{app_id}:" + hashlib.sha256(f"{app_id}:{openid}".encode()).hexdigest()
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=rw", uri=True, timeout=2)) as db, db:
+        now = int(unix_time())
+        db.execute("DELETE FROM wechat_sessions WHERE expires_at <= ?", (now,))
+        db.execute("INSERT INTO wechat_sessions VALUES (?, ?, ?)", (digest, user, now + SESSION_TTL))
+    return token
+
+
+def session_user(db_path, digest, app_id):
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+        row = db.execute("SELECT user FROM wechat_sessions WHERE digest = ? AND expires_at > ?",
+                         (digest, int(unix_time()))).fetchone()
+        return row[0] if row and row[0].startswith(f"wechat:{app_id}:") else None
 
 
 class PilotQuestion(BaseModel):
@@ -58,8 +95,12 @@ def create_app():
     @asynccontextmanager
     async def lifespan(app):
         try:
-            users = json.loads(os.environ["MINIPROGRAM_CHAT_USERS"])
-            if (not isinstance(users, dict) or not users or len(set(users.values())) != len(users)
+            users = json.loads(os.environ.get("MINIPROGRAM_CHAT_USERS", "{}"))
+            app_id = os.environ.get("MINIPROGRAM_WECHAT_APP_ID", "")
+            secret = os.environ.get("MINIPROGRAM_WECHAT_APP_SECRET", "")
+            if (bool(app_id) != bool(secret) or (app_id and not re.fullmatch(r"wx[0-9a-fA-F]{16}", app_id))
+                    or not isinstance(users, dict) or not (users or app_id)
+                    or len(set(users.values())) != len(users)
                     or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user)
                            or not re.fullmatch(r"[a-f0-9]{64}", digest) for user, digest in users.items())):
                 raise ValueError
@@ -77,33 +118,65 @@ def create_app():
             with closing(sqlite3.connect(db_path, timeout=2)) as db, db:
                 db.execute("CREATE TABLE IF NOT EXISTS usage (day TEXT, user TEXT, count INTEGER NOT NULL, "
                            "PRIMARY KEY (day, user))")
+                db.execute("CREATE TABLE IF NOT EXISTS wechat_sessions (digest TEXT PRIMARY KEY, "
+                           "user TEXT NOT NULL, expires_at INTEGER NOT NULL)")
         except sqlite3.Error:
             raise RuntimeError("Cannot initialize mini program chat quota database") from None
 
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False,
                                      timeout=httpx.Timeout(175, connect=3)) as client:
             app.state.admit = (users_by_digest, db_path, user_limit, total_limit)
+            app.state.wechat = (app_id, secret) if app_id else None
             app.state.upstream = client
             yield
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
+
+    @app.post(LOGIN_PATH)
+    async def login(request: Request, response: Response):
+        if app.state.wechat is None:
+            raise HTTPException(404, "Not Found", NO_STORE)
+        app_id, secret = app.state.wechat
+        try:
+            credential = LoginCode.model_validate_json(await read_body(request, 2048))
+        except ValidationError:
+            raise HTTPException(422, "Invalid login code", NO_STORE) from None
+        try:
+            openid = await run_in_threadpool(exchange_code, app_id, secret, credential.code)
+        except WeChatLoginBlocked:
+            raise HTTPException(403, "WeChat denied login", NO_STORE) from None
+        except WeChatRateLimited:
+            raise HTTPException(429, "WeChat login rate limited", NO_STORE) from None
+        except WeChatUnavailable:
+            raise HTTPException(502, "WeChat login unavailable", NO_STORE) from None
+        if openid is None:
+            raise HTTPException(401, "Invalid or expired login code", NO_STORE)
+        try:
+            token = await run_in_threadpool(new_session, app.state.admit[1], app_id, openid)
+        except sqlite3.Error:
+            raise HTTPException(503, "Session store unavailable", NO_STORE) from None
+        response.headers.update(NO_STORE)
+        return {"access_token": token, "expires_in": SESSION_TTL}
 
     @app.post(ADMISSION_PATH)
     async def chat(request: Request):
         users, db_path, user_limit, total_limit = app.state.admit
         authorization = request.headers.getlist("authorization")
         match = TOKEN_PATTERN.fullmatch(authorization[0]) if len(authorization) == 1 else None
-        user = users.get(hashlib.sha256(match[1].encode("ascii")).hexdigest()) if match else None
+        user = None
+        if match:
+            digest = hashlib.sha256(match[1].encode("ascii")).hexdigest()
+            user = users.get(digest)
+            if user is None and app.state.wechat:
+                try:
+                    user = await run_in_threadpool(session_user, db_path, digest, app.state.wechat[0])
+                except sqlite3.Error:
+                    raise HTTPException(503, "Session check unavailable", NO_STORE) from None
         if user is None:
             raise HTTPException(401, "Pilot access required", {**NO_STORE, "WWW-Authenticate": "Bearer"})
 
-        body = bytearray()
-        async for chunk in request.stream():
-            if len(body) + len(chunk) > MAX_BODY_BYTES:
-                raise HTTPException(413, "Request body too large", NO_STORE)
-            body.extend(chunk)
         try:
-            question = PilotQuestion.model_validate_json(body)
+            question = PilotQuestion.model_validate_json(await read_body(request, MAX_BODY_BYTES))
         except ValidationError:
             raise HTTPException(422, "Invalid question or conversation history", NO_STORE) from None
 
