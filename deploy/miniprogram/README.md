@@ -107,7 +107,7 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 完成问答登录联调后，可在 Caddy 环境增加 `MINIPROGRAM_WECHAT_READ_ENABLED=1` 并重启，同时把 `miniprogram/utils/chat-config.js` 的 `wechatReadEnabled` 设为 `true`。最新日报、历史日报、关键词新闻和事件时间线会走同一个 HTTPS 网关。首次读取需要微信登录，已有会话会直接复用。运维探针仍可在原地址使用 Basic Auth。微信读接口默认只接受本机回环请求，过期令牌返回 `401`，会话库故障时会拒绝读取。读取不消耗问答额度，请求发往原 FastAPI 前会移除凭据。
 
-只回退读接口时，关闭客户端 `wechatReadEnabled`，在 Caddy 环境移除 `MINIPROGRAM_WECHAT_READ_ENABLED` 或设为 `0` 并重启，问答联调可继续使用。
+开发版本地联调可单独回退读接口。关闭客户端 `wechatReadEnabled`，在 Caddy 环境移除 `MINIPROGRAM_WECHAT_READ_ENABLED` 或设为 `0` 并重启，问答联调可继续使用。体验版和正式版需要保持读接口鉴权启用，关闭客户端开关会同时阻止读取和问答。
 
 ## 指定设备真机验收
 
@@ -122,3 +122,5 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 ## 正式上线前
 
 需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录、读取和问答。按实际入口拓扑核对限流对应的连接来源。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
+
+体验版和正式版应在 `miniprogram/utils/chat-config.js` 配置已登记的 HTTPS 网关域名，并设 `wechatReadEnabled: true`。配置缺失或仍指向本机 IP、`localhost` 时，小程序会在发请求前显示配置错误。域名是否登记、证书是否可信仍由微信运行环境验证。开发版可继续用原有回环地址，联调识别不到小程序版本时也会提示配置错误。 [微信版本环境接口](https://developers.weixin.qq.com/miniprogram/dev/api/open-api/account-info/wx.getAccountInfoSync.html)

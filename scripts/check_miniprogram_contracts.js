@@ -3,6 +3,58 @@ const { test } = require('node:test')
 const { displayReport, reportDateNotice, historyReports, compareReports } = require('../miniprogram/utils/report')
 const { formatAnswer } = require('../miniprogram/utils/answer')
 
+test('体验版和正式版只在网关配置齐全时发请求', async (t) => {
+  const config = require('../miniprogram/utils/chat-config')
+  const path = require.resolve('../miniprogram/utils/api')
+  const requests = mockRequests(t)
+  let environment = 'trial'
+  let loginCount = 0
+  wx.getAccountInfoSync = () => ({ miniProgram: { envVersion: environment } })
+  wx.login = () => { loginCount++ }
+  const original = { ...config }
+  t.after(() => {
+    Object.assign(config, original)
+    delete require.cache[path]
+  })
+  for (const [version, origin, reads] of [
+    ['trial', '', false], ['trial', 'https://127.0.0.1:8443', true],
+    ['trial', 'https://miniprogram.localhost', true], ['release', 'http://example.com', true],
+    ['release', 'https://example.com', false], ['release', 'https://example.com:65536', true],
+    ['release', 'https://example.com/api', true], ['', 'https://example.com', true]
+  ]) {
+    environment = version
+    Object.assign(config, { wechatChatOrigin: origin, wechatReadEnabled: reads })
+    delete require.cache[path]
+    const api = require(path)
+    await assert.rejects(api.getLatestReport(), { kind: 'config' })
+    await assert.rejects(api.askQuestion('问题'), { kind: 'config' })
+  }
+  assert.equal(loginCount, 0)
+  assert.equal(requests.length, 0)
+
+  for (const version of ['trial', 'release']) {
+    environment = version
+    Object.assign(config, { wechatChatOrigin: 'https://example.com', wechatReadEnabled: true })
+    delete require.cache[path]
+    const api = require(path)
+    wx.login = ({ success }) => success({ code: 'test-code' })
+    const start = requests.length
+    const calls = [api.getLatestReport(), api.askQuestion('问题')]
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(requests[start].url, 'https://example.com/api/v1/miniprogram/login')
+    requests[start].success({ statusCode: 200, data: { access_token: 'A'.repeat(43), expires_in: 3600 } })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(requests.slice(start + 1).map(item => item.url), [
+      'https://example.com/api/v1/reports/today', 'https://example.com/api/v1/agent/chat'
+    ])
+    for (const item of requests.slice(start + 1)) {
+      assert.equal(item.header.Authorization, `Bearer ${'A'.repeat(43)}`)
+      item.success({ statusCode: 200, data: {} })
+    }
+    await Promise.all(calls)
+  }
+})
+
 test('启用后四个读接口和问答共用微信会话', async (t) => {
   const config = require('../miniprogram/utils/chat-config')
   const path = require.resolve('../miniprogram/utils/api')
@@ -164,7 +216,10 @@ function loadPage(name) {
 
 function mockRequests(t) {
   const requests = []
-  global.wx = { request: (options) => requests.push(options) }
+  global.wx = {
+    request: (options) => requests.push(options),
+    getAccountInfoSync: () => ({ miniProgram: { envVersion: 'develop' } })
+  }
   t.after(() => { delete global.wx })
   return requests
 }

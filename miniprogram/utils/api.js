@@ -1,4 +1,4 @@
-// 模拟器使用回环地址。真机联调时改为电脑的局域网地址。
+// 开发版可以使用本机 FastAPI。体验版和正式版统一通过鉴权网关。
 const BASE_URL = 'http://127.0.0.1:8000'
 const { wechatChatOrigin, wechatReadEnabled } = require('./chat-config')
 let chatSession
@@ -12,6 +12,7 @@ function requestError(kind, statusCode) {
 }
 
 function requestErrorMessage(error, page) {
+  if (error.kind === 'config') return '服务地址配置不完整，请联系小程序管理员。'
   if (error.kind === 'login' && error.statusCode === 429) return '微信登录请求过于频繁，请稍后重试。'
   if (error.kind === 'login' && error.statusCode === 403) return '微信暂未允许本次登录。'
   if (error.kind === 'login') return page === 'chat' ? '微信登录失败，请稍后重新发送。' : '微信登录失败，请稍后重试。'
@@ -99,13 +100,33 @@ function getEventTimeline(newsId, asOf) {
 }
 
 function read(path, options) {
-  return wechatReadEnabled ? requestWithSession(path, options) : request(path, options)
+  return configuredRequest(path, options, wechatReadEnabled === true)
 }
 
-async function requestWithSession(path, options) {
-  if (!/^https:\/\/[a-z0-9.-]+(?::[0-9]{1,5})?$/i.test(wechatChatOrigin)) {
-    throw requestError('login')
+function versionEnvironment() {
+  try {
+    return wx.getAccountInfoSync().miniProgram.envVersion
+  } catch (_) {
+    return ''
   }
+}
+
+async function configuredRequest(path, options, useGateway) {
+  const environment = versionEnvironment()
+  const gateway = typeof wechatChatOrigin === 'string' &&
+    /^https:\/\/([a-z0-9.-]+)(?::([0-9]{1,5}))?$/i.exec(wechatChatOrigin)
+  const validGateway = gateway && (!gateway[2] || (Number(gateway[2]) > 0 && Number(gateway[2]) <= 65535))
+  if (environment === 'trial' || environment === 'release') {
+    const host = validGateway && gateway[1]
+    if (wechatReadEnabled !== true || !host || /(?:^|\.)localhost$/i.test(host) ||
+        !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$/i.test(host)) {
+      throw requestError('config')
+    }
+  } else if (environment !== 'develop' || (useGateway && !validGateway)) {
+    throw requestError('config')
+  }
+  if (!useGateway) return request(path, options)
+
   const token = await loginForChat()
   try {
     return await request(path, { ...options, origin: wechatChatOrigin, token })
@@ -119,10 +140,9 @@ async function requestWithSession(path, options) {
 }
 
 function askQuestion(query, history = []) {
-  const send = wechatChatOrigin ? requestWithSession : request
-  return send('/api/v1/agent/chat', {
+  return configuredRequest('/api/v1/agent/chat', {
     method: 'POST', data: { query, chat_history: history }, timeout: 180000
-  })
+  }, Boolean(wechatChatOrigin))
 }
 
 module.exports = { getLatestReport, getDailyReports, getWatchedNews, getEventTimeline, askQuestion, requestErrorMessage }
