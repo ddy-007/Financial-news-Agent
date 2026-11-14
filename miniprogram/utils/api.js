@@ -1,6 +1,6 @@
 // 模拟器使用回环地址。真机联调时改为电脑的局域网地址。
 const BASE_URL = 'http://127.0.0.1:8000'
-const { wechatChatOrigin } = require('./chat-config')
+const { wechatChatOrigin, wechatReadEnabled } = require('./chat-config')
 let chatSession
 let loginInFlight
 
@@ -14,8 +14,8 @@ function requestError(kind, statusCode) {
 function requestErrorMessage(error, page) {
   if (error.kind === 'login' && error.statusCode === 429) return '微信登录请求过于频繁，请稍后重试。'
   if (error.kind === 'login' && error.statusCode === 403) return '微信暂未允许本次登录。'
-  if (error.kind === 'login') return '微信登录失败，请稍后重新发送。'
-  if (error.kind === 'session') return '微信登录已失效，请重新发送。'
+  if (error.kind === 'login') return page === 'chat' ? '微信登录失败，请稍后重新发送。' : '微信登录失败，请稍后重试。'
+  if (error.kind === 'session') return page === 'chat' ? '微信登录已失效，请重新发送。' : '微信登录已失效，请重新加载。'
   if (error.kind === 'timeout') {
     return page === 'chat'
       ? '等待超时，服务端可能仍在处理，请勿连续发送。'
@@ -81,43 +81,48 @@ async function loginForChat() {
 }
 
 function getLatestReport() {
-  return request('/api/v1/reports/today', { timeout: 12000 })
+  return read('/api/v1/reports/today', { timeout: 12000 })
 }
 
 function getDailyReports() {
-  return request('/api/v1/reports?report_type=daily&limit=10', { timeout: 12000 })
+  return read('/api/v1/reports?report_type=daily&limit=10', { timeout: 12000 })
 }
 
 function getWatchedNews(keyword) {
-  return request('/api/v1/news', { data: { keyword, limit: 20 }, timeout: 12000 })
+  return read('/api/v1/news', { data: { keyword, limit: 20 }, timeout: 12000 })
 }
 
 function getEventTimeline(newsId, asOf) {
-  return request(`/api/v1/news/${encodeURIComponent(newsId)}/timeline`, {
+  return read(`/api/v1/news/${encodeURIComponent(newsId)}/timeline`, {
     data: asOf ? { as_of: asOf } : undefined, timeout: 12000
   })
 }
 
-async function askQuestion(query, history = []) {
-  if (wechatChatOrigin && !/^https:\/\/[a-z0-9.-]+(?::[0-9]{1,5})?$/i.test(wechatChatOrigin)) {
+function read(path, options) {
+  return wechatReadEnabled ? requestWithSession(path, options) : request(path, options)
+}
+
+async function requestWithSession(path, options) {
+  if (!/^https:\/\/[a-z0-9.-]+(?::[0-9]{1,5})?$/i.test(wechatChatOrigin)) {
     throw requestError('login')
   }
-  const token = wechatChatOrigin ? await loginForChat() : null
+  const token = await loginForChat()
   try {
-    return await request('/api/v1/agent/chat', {
-      method: 'POST',
-      data: { query, chat_history: history },
-      timeout: 180000,
-      origin: wechatChatOrigin || BASE_URL,
-      token
-    })
+    return await request(path, { ...options, origin: wechatChatOrigin, token })
   } catch (error) {
-    if (token && error.statusCode === 401) {
+    if (error.statusCode === 401) {
       if (chatSession && chatSession.token === token) chatSession = null
       throw requestError('session')
     }
     throw error
   }
+}
+
+function askQuestion(query, history = []) {
+  const send = wechatChatOrigin ? requestWithSession : request
+  return send('/api/v1/agent/chat', {
+    method: 'POST', data: { query, chat_history: history }, timeout: 180000
+  })
 }
 
 module.exports = { getLatestReport, getDailyReports, getWatchedNews, getEventTimeline, askQuestion, requestErrorMessage }

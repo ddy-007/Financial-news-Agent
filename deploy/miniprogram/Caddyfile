@@ -15,11 +15,43 @@
 
 (readonly_api) {
 	header Cache-Control "no-store"
-	basic_auth {
-		"{$MINIPROGRAM_GATEWAY_USER}" "{$MINIPROGRAM_GATEWAY_HASH}"
+	@session_read {
+		remote_ip 127.0.0.1 ::1
+		expression `"{$MINIPROGRAM_WECHAT_READ_ENABLED:0}" == "1" && "{$MINIPROGRAM_CHAT_ENABLED:0}" == "1" && "{$MINIPROGRAM_WECHAT_LOGIN_ENABLED:0}" == "1" && !header_regexp('Authorization', r'(?i)^Basic ')`
 	}
-	reverse_proxy 127.0.0.1:{$MINIPROGRAM_UPSTREAM_PORT:8000} {
-		header_up -Authorization
+	route {
+		handle @session_read {
+			# Only the session verifier's explicit authorization may continue to the data upstream.
+			reverse_proxy 127.0.0.1:{$MINIPROGRAM_CHAT_PORT:8001} {
+				rewrite /internal/miniprogram/wechat-read-auth?
+				@allowed {
+					status 204
+					header X-Miniprogram-Read-Authorized 1
+				}
+				handle_response @allowed {
+				}
+				@unauthorized status 401
+				handle_response @unauthorized {
+					header WWW-Authenticate Bearer
+					respond 401
+				}
+				@unavailable status 503
+				handle_response @unavailable {
+					respond 503
+				}
+				handle_response {
+					respond 502
+				}
+			}
+		}
+		handle {
+			basic_auth {
+				"{$MINIPROGRAM_GATEWAY_USER}" "{$MINIPROGRAM_GATEWAY_HASH}"
+			}
+		}
+		reverse_proxy 127.0.0.1:{$MINIPROGRAM_UPSTREAM_PORT:8000} {
+			header_up -Authorization
+		}
 	}
 }
 

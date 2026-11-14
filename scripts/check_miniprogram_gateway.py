@@ -44,7 +44,7 @@ class StubUpstream(BaseHTTPRequestHandler):
             "query": query,
             "authorization": self.headers.get("Authorization"),
         }
-        fallback = (404, {"detail": "Not Found"}) if url.path == "/internal/miniprogram/chat" else (200, default)
+        fallback = (404, {"detail": "Not Found"}) if url.path.startswith("/internal/miniprogram/") else (200, default)
         status, payload = self.server.responses.get(url.path, fallback)
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(status)
@@ -105,6 +105,7 @@ class GatewayChecks(unittest.TestCase):
                        MINIPROGRAM_UPSTREAM_PORT=str(upstream.server_port))
         cls.env.pop("MINIPROGRAM_CHAT_ENABLED", None)
         cls.env.pop("MINIPROGRAM_WECHAT_LOGIN_ENABLED", None)
+        cls.env.pop("MINIPROGRAM_WECHAT_READ_ENABLED", None)
         cls.env.update(cls.caddy_environment())
         args = ["--config", str(CONFIG), "--adapter", "caddyfile"]
         validated = subprocess.run([cls.caddy, "validate", *args], env=cls.env, capture_output=True,
@@ -134,9 +135,9 @@ class GatewayChecks(unittest.TestCase):
             time.sleep(0.1)
         raise RuntimeError(cls.log_path.read_text(encoding="utf-8", errors="replace"))
 
-    def request(self, method, path, *, auth=None):
+    def request(self, method, path, *, auth=None, timeout=3):
         context = ssl.create_default_context(cafile=str(self.root_ca))
-        conn = HTTPSConnection(LOOPBACK, self.port, context=context, timeout=3)
+        conn = HTTPSConnection(LOOPBACK, self.port, context=context, timeout=timeout)
         try:
             conn.request(method, path, headers={"Authorization": auth} if auth else {})
             response = conn.getresponse()
@@ -176,6 +177,7 @@ class GatewayChecks(unittest.TestCase):
         cases = (
             ("POST", "/api/v1/agent/chat"), ("POST", "/internal/miniprogram/chat"),
             ("POST", "/api/v1/miniprogram/login"), ("POST", "/internal/miniprogram/wechat-login"),
+            ("GET", "/internal/miniprogram/wechat-read-auth"),
             ("POST", "/api/v1/news/collect"),
             ("POST", "/api/v1/market/collect"), ("POST", "/api/v1/reports/generate"),
             ("POST", "/api/v1/reports/weekly/generate"), ("GET", "/api/v1/reports/evaluation"),

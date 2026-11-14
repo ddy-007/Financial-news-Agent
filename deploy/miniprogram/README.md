@@ -1,6 +1,6 @@
 # 小程序只读联调网关
 
-此配置供具名测试人员通过 HTTPS 核对接口。默认只监听 `127.0.0.1:8443`，上游 FastAPI 也必须只监听回环地址。网关使用单个测试账号，账号和密码哈希由运行环境提供。小程序仍可使用原有本地联调方式。此网关通过命令行验收，现有小程序还没有接入网关登录。 [Caddy HTTPS 文档](https://caddyserver.com/docs/automatic-https) · [Caddy 鉴权文档](https://caddyserver.com/docs/caddyfile/directives/basic_auth)
+此配置供具名测试人员通过 HTTPS 核对接口。默认只监听 `127.0.0.1:8443`，上游 FastAPI 也必须只监听回环地址。默认读接口使用单个测试账号，账号和密码哈希由运行环境提供。小程序可使用原有本地联调方式，也可按下文启用微信会话。 [Caddy HTTPS 文档](https://caddyserver.com/docs/automatic-https) · [Caddy 鉴权文档](https://caddyserver.com/docs/caddyfile/directives/basic_auth)
 
 | 允许的请求 | 网关限制 |
 | --- | --- |
@@ -85,10 +85,16 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 在 `miniprogram/utils/chat-config.js` 填入本地 HTTPS 网关源地址，例如 `https://127.0.0.1:8443`。开发者工具需使用同一个 AppID，且信任本地 Caddy 证书。发送问题时，小程序通过 `wx.login` 获取临时凭证，由接入层向微信校验。接入层只返回有效期一小时的随机会话令牌，SQLite 仅保存令牌摘要、用户代号及到期时间。小程序将令牌保存在运行内存中。登录失败或令牌失效时，由用户重新发送问题，避免自动重发问答。
 
-微信用户在同一个 AppID 下重新登录仍共享当天个人额度，也与内测账号共享全局额度。AppSecret 和微信会话密钥只在服务端处理。日报和新闻继续读取现有本地接口。回退时清空小程序配置中的网关地址，并关闭 `MINIPROGRAM_WECHAT_LOGIN_ENABLED`。如需立即停止现有微信会话访问，同时关闭问答入口，或从接入层环境移除微信配置并重启接入层。
+微信用户在同一个 AppID 下重新登录仍共享当天个人额度，也与内测账号共享全局额度。AppSecret 和微信会话密钥只在服务端处理。回退时清空小程序配置中的网关地址，关闭 `wechatReadEnabled` 和服务端 `MINIPROGRAM_WECHAT_LOGIN_ENABLED`。如需立即停止现有微信会话访问，同时关闭问答和微信读接口开关，或从接入层环境移除微信配置并重启接入层。
 
 接入层默认在任意连续 60 秒内最多向微信交换 12 次凭证。可用 `MINIPROGRAM_WECHAT_LOGIN_PER_MINUTE` 调整为 `1` 至 `120`，重启后生效。同一实例的进程用同一份 SQLite 计数，进程重启会保留窗口内用量。输入校验失败不计入，已放行的交换即使被微信拒绝或超时也计入。超额返回 `429` 和 `Retry-After`，计数库不可用返回 `503`，两种情况均不会向微信发请求。登录交换和问答日配额独立计算。
 
+### 日报和新闻共用微信会话
+
+完成问答登录联调后，可在 Caddy 环境增加 `MINIPROGRAM_WECHAT_READ_ENABLED=1` 并重启，同时把 `miniprogram/utils/chat-config.js` 的 `wechatReadEnabled` 设为 `true`。最新日报、历史日报、关键词新闻和事件时间线会走同一个 HTTPS 网关。首次读取需要微信登录，已有会话会直接复用。运维探针仍可在原地址使用 Basic Auth。微信读接口只接受本机回环请求，过期令牌返回 `401`，会话库故障时会拒绝读取。读取不消耗问答额度，请求发往原 FastAPI 前会移除凭据。
+
+只回退读接口时，关闭客户端 `wechatReadEnabled`，在 Caddy 环境移除 `MINIPROGRAM_WECHAT_READ_ENABLED` 或设为 `0` 并重启，问答联调可继续使用。
+
 ## 正式上线前
 
-需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录和问答。对外开放前还需确定读接口的身份策略，并在入口增加按可信客户端来源的限流，以免单个来源占满全局交换额度。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)
+需要确定合法 HTTPS 域名、证书、对外监听地址及访问范围，并在真实 AppID 下验收微信登录、读取和问答。对外开放前还需在入口增加按可信客户端来源的限流，以免单个来源占满全局交换额度。测试凭据、模型密钥和通用管理员凭据均由服务端或测试人员保管，不进入小程序包。 [微信小程序网络说明](https://developers.weixin.qq.com/miniprogram/dev/framework/ability/network.html)

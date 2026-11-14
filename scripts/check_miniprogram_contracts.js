@@ -3,6 +3,45 @@ const { test } = require('node:test')
 const { displayReport, reportDateNotice, historyReports, compareReports } = require('../miniprogram/utils/report')
 const { formatAnswer } = require('../miniprogram/utils/answer')
 
+test('启用后四个读接口和问答共用微信会话', async (t) => {
+  const config = require('../miniprogram/utils/chat-config')
+  const path = require.resolve('../miniprogram/utils/api')
+  const requests = mockRequests(t)
+  const logins = []
+  global.wx.login = (options) => logins.push(options)
+  Object.assign(config, { wechatChatOrigin: 'https://127.0.0.1:8443', wechatReadEnabled: true })
+  delete require.cache[path]
+  const api = require(path)
+  t.after(() => {
+    Object.assign(config, { wechatChatOrigin: '', wechatReadEnabled: false })
+    delete require.cache[path]
+  })
+  const calls = [api.getLatestReport(), api.getDailyReports(), api.getWatchedNews('芯片'),
+    api.getEventTimeline('news-1', '2026-11-13'), api.askQuestion('问题')]
+  assert.equal(logins.length, 1)
+  logins[0].success({ code: 'one-time-code' })
+  await new Promise((resolve) => setImmediate(resolve))
+  const token = 'B'.repeat(43)
+  requests[0].success({ statusCode: 200, data: { access_token: token, expires_in: 3600 } })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(requests.slice(1).map((item) => item.url), [
+    '/api/v1/reports/today', '/api/v1/reports?report_type=daily&limit=10', '/api/v1/news',
+    '/api/v1/news/news-1/timeline', '/api/v1/agent/chat'
+  ].map((item) => config.wechatChatOrigin + item))
+  assert.deepEqual(requests[3].data, { keyword: '芯片', limit: 20 })
+  assert.deepEqual(requests[4].data, { as_of: '2026-11-13' })
+  for (const request of requests.slice(1)) {
+    assert.equal(request.header.Authorization, `Bearer ${token}`)
+    request.success({ statusCode: 200, data: {} })
+  }
+  await Promise.all(calls)
+  const expired = api.getLatestReport()
+  await new Promise((resolve) => setImmediate(resolve))
+  requests[6].success({ statusCode: 401 })
+  await assert.rejects(expired, { kind: 'session' })
+  assert.equal(requests.length, 7)
+})
+
 test('微信登录联调复用会话，过期时保留用户手动重发', async (t) => {
   const config = require('../miniprogram/utils/chat-config')
   const path = require.resolve('../miniprogram/utils/api')

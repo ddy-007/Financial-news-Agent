@@ -120,18 +120,29 @@ class ChatGateChecks(GatewayChecks):
 class MisconfiguredGateChecks(GatewayChecks):
     @classmethod
     def caddy_environment(cls):
-        return {"MINIPROGRAM_CHAT_ENABLED": "1", "MINIPROGRAM_CHAT_PORT": str(cls.upstream.server_port)}
+        return {"MINIPROGRAM_CHAT_ENABLED": "1", "MINIPROGRAM_CHAT_PORT": str(cls.upstream.server_port),
+                "MINIPROGRAM_WECHAT_LOGIN_ENABLED": "1", "MINIPROGRAM_WECHAT_READ_ENABLED": "1"}
 
     def test_wrong_proxy_port_does_not_reach_agent_route(self):
         status, _, _ = self.request("POST", CHAT_PATH)
         self.assertEqual(status, 404)
         self.assertEqual(self.upstream.posts, [("/internal/miniprogram/chat", None, b"")])
 
+    def test_wrong_auth_port_cannot_release_read_data(self):
+        path = "/internal/miniprogram/wechat-read-auth"
+        self.upstream.responses[path] = (204, b"")
+        self.addCleanup(self.upstream.responses.pop, path)
+        status, headers, body = self.request("GET", "/api/v1/reports/today", auth="Bearer " + "x" * 43)
+        self.assertEqual(status, 502)
+        self.assertIsNone(headers.get("X-Stub-Upstream"))
+        self.assertEqual(body, b"")
+
 
 class WeChatGateChecks(ChatGateChecks):
     @classmethod
     def caddy_environment(cls):
-        return {**super().caddy_environment(), "MINIPROGRAM_WECHAT_LOGIN_ENABLED": "1"}
+        return {**super().caddy_environment(), "MINIPROGRAM_WECHAT_LOGIN_ENABLED": "1",
+                "MINIPROGRAM_WECHAT_READ_ENABLED": "1"}
 
     def setUp(self):
         self.usage = self.tmp / f"{self.id().split('.')[-1]}.sqlite3"
@@ -206,6 +217,29 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
             self.assertEqual(payload["expires_in"], 3600)
             tokens.append(payload["access_token"])
         self.assertEqual(len(set(tokens)), 3)
+        reads = (
+            "/api/v1/reports/today", "/api/v1/reports?report_type=all&limit=999",
+            "/api/v1/news?keyword=chip&limit=999",
+            "/api/v1/news/00000000-0000-0000-0000-000000000001/timeline?as_of=2026-11-13",
+        )
+        for path in reads:
+            self.assertEqual(self.request("GET", path)[0], 401)
+            status, headers, body = self.request("GET", path, auth="Bearer " + tokens[0])
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertIsNone(headers.get("X-Miniprogram-Read-Authorized"))
+            self.assertIsNone(json.loads(body)["authorization"])
+        with closing(sqlite3.connect(self.usage)) as db, db:
+            db.execute("BEGIN EXCLUSIVE")
+            status, headers, _ = self.request("GET", reads[0], auth="Bearer " + tokens[0], timeout=8)
+            self.assertEqual(status, 503)
+            self.assertIsNone(headers.get("X-Stub-Upstream"))
+        self.assertEqual(self.request("GET", reads[0], auth=self.auth)[0], 200)
+        self.assertEqual(self.request("GET", "/internal/miniprogram/wechat-read-auth",
+                                      auth="Bearer " + tokens[0])[0], 404)
+        with closing(sqlite3.connect(self.usage)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM wechat_login_attempts").fetchone()[0], 7)
         self.upstream.responses[CHAT_PATH] = (200, {"answer": "fake answer", "sources": []})
         self.addCleanup(self.upstream.responses.pop, CHAT_PATH)
         self.assertEqual([self.post(auth="Bearer " + tokens[index])[0] for index in (0, 1, 1, 2)],
@@ -218,6 +252,7 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
                 self.assertNotIn(token, str(rows))
             db.execute("UPDATE wechat_sessions SET expires_at = 0")
         self.assertEqual(self.post(auth="Bearer " + tokens[2])[0], 401)
+        self.assertEqual(self.request("GET", reads[0], auth="Bearer " + tokens[2])[0], 401)
         self.assertEqual(len(self.upstream.posts), 3)
         self.assertTrue(all(not authorization for _, authorization, _ in self.upstream.posts))
 
@@ -262,6 +297,7 @@ if __name__ == "__main__":
     suite = unittest.TestSuite([
         ChatGateChecks("test_pilot_authentication_and_atomic_daily_quota"),
         MisconfiguredGateChecks("test_wrong_proxy_port_does_not_reach_agent_route"),
+        MisconfiguredGateChecks("test_wrong_auth_port_cannot_release_read_data"),
         WeChatGateChecks("test_login_sessions_share_identity_quota_and_expire"),
         WeChatGateChecks("test_login_exchange_limit_blocks_before_provider_and_survives_restart"),
     ])

@@ -23,6 +23,7 @@ from .wechat_login import WeChatLoginBlocked, WeChatRateLimited, WeChatUnavailab
 CHAT_PATH = "/api/v1/agent/chat"
 ADMISSION_PATH = "/internal/miniprogram/chat"
 LOGIN_PATH = "/internal/miniprogram/wechat-login"
+READ_AUTH_PATH = "/internal/miniprogram/wechat-read-auth"
 MAX_BODY_BYTES = 64 * 1024
 SESSION_TTL = 3600
 LOGIN_WINDOW_SECONDS = 60
@@ -156,6 +157,28 @@ def create_app():
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
 
+    async def authenticated_user(request, *, allow_pilot=False):
+        users, db_path, _, _ = app.state.admit
+        authorization = request.headers.getlist("authorization")
+        match = TOKEN_PATTERN.fullmatch(authorization[0]) if len(authorization) == 1 else None
+        if match:
+            digest = hashlib.sha256(match[1].encode("ascii")).hexdigest()
+            if allow_pilot and digest in users:
+                return users[digest]
+            if app.state.wechat:
+                try:
+                    user = await run_in_threadpool(session_user, db_path, digest, app.state.wechat[0])
+                except sqlite3.Error:
+                    raise HTTPException(503, "Session check unavailable", NO_STORE) from None
+                if user:
+                    return user
+        raise HTTPException(401, "Valid access token required", {**NO_STORE, "WWW-Authenticate": "Bearer"})
+
+    @app.get(READ_AUTH_PATH)
+    async def authorize_read(request: Request):
+        await authenticated_user(request)
+        return Response(status_code=204, headers={**NO_STORE, "X-Miniprogram-Read-Authorized": "1"})
+
     @app.post(LOGIN_PATH)
     async def login(request: Request, response: Response):
         if app.state.wechat is None:
@@ -191,20 +214,8 @@ def create_app():
 
     @app.post(ADMISSION_PATH)
     async def chat(request: Request):
-        users, db_path, user_limit, total_limit = app.state.admit
-        authorization = request.headers.getlist("authorization")
-        match = TOKEN_PATTERN.fullmatch(authorization[0]) if len(authorization) == 1 else None
-        user = None
-        if match:
-            digest = hashlib.sha256(match[1].encode("ascii")).hexdigest()
-            user = users.get(digest)
-            if user is None and app.state.wechat:
-                try:
-                    user = await run_in_threadpool(session_user, db_path, digest, app.state.wechat[0])
-                except sqlite3.Error:
-                    raise HTTPException(503, "Session check unavailable", NO_STORE) from None
-        if user is None:
-            raise HTTPException(401, "Pilot access required", {**NO_STORE, "WWW-Authenticate": "Bearer"})
+        _, db_path, user_limit, total_limit = app.state.admit
+        user = await authenticated_user(request, allow_pilot=True)
 
         try:
             question = PilotQuestion.model_validate_json(await read_body(request, MAX_BODY_BYTES))
