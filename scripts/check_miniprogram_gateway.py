@@ -267,6 +267,49 @@ class GatewayChecks(unittest.TestCase):
                 for private_value in (password, "report-title-marker", "report-body-marker"):
                     self.assertNotIn(private_value, run.stdout + run.stderr)
 
+    def test_external_probe_verifies_read_only_boundary(self):
+        self.upstream.responses[TODAY] = (200, {"report_type": "daily", "report_day": "2026-11-06",
+                                               "content": {"raw": "private-report-marker"}})
+        self.addCleanup(self.upstream.responses.pop, TODAY)
+        command = [sys.executable, "-B", str(PROBE), "--gateway", f"https://{LOOPBACK}:{self.port}",
+                   "--gateway-only", "--verify-boundary", "--ca-file", str(self.root_ca)]
+        env = dict(self.env, MINIPROGRAM_PROBE_PASSWORD=self.password)
+        run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(result["readiness"], {"status": "skipped"})
+        self.assertEqual(result["gateway"]["report_day"], "2026-11-06")
+        self.assertEqual(result["boundary"]["status"], "ok")
+        self.assertEqual(result["boundary"]["checks"][TODAY]["http_status"], 401)
+        self.assertEqual(result["boundary"]["checks"]["/openapi.json"]["http_status"], 404)
+        self.assertNotIn("private-report-marker", run.stdout)
+
+    def test_external_probe_detects_anonymous_or_private_data_exposure(self):
+        from unittest.mock import patch
+        import probe_miniprogram as probe
+
+        with patch.object(probe, "get_json", return_value=({"http_status": 200, "elapsed_ms": 1}, {})):
+            result = probe.check_boundary(LOOPBACK, self.port, ssl.create_default_context(), self.auth, 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["checks"][TODAY]["reason"], "unexpected_access_status")
+        self.assertEqual(result["checks"]["/openapi.json"]["reason"], "unexpected_access_status")
+
+    def test_probe_sanitizes_dns_and_tls_errors(self):
+        from unittest.mock import Mock
+        import probe_miniprogram as probe
+
+        for error, reason in ((socket.gaierror("private-dns-marker"), "dns_resolution_failed"),
+                              (ssl.SSLError("private-tls-marker"), "tls_handshake_failed")):
+            with self.subTest(reason=reason):
+                connection = Mock()
+                connection.request.side_effect = error
+                result, payload = probe.get_json(connection, TODAY)
+                self.assertEqual(set(result), {"reason", "elapsed_ms"})
+                self.assertEqual(result["reason"], reason)
+                self.assertEqual(payload, {})
+                connection.close.assert_called_once()
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

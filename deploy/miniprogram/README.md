@@ -54,9 +54,15 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 | --- | --- |
 | `0` | 后端就绪，网关正常返回日报 |
 | `1` | 后端报告降级，或后端明确返回暂无日报 |
-| `2` | 后端不可用、认证或 TLS 失败、接口响应异常，或探针参数错误 |
+| `2` | 后端不可用、认证或 TLS 失败、接口响应异常、边界检查失败，或探针参数错误 |
 
 探针展示最近一期日报的业务日，周末没有新日报不会因此告警。暂停调度时，若后端就绪接口报降级，可通过 `scheduler_running` 判断原因。探针不会生成日报、恢复调度或调用模型。
+
+从验收电脑只核对 HTTPS 网关时，使用 `--gateway-only`。发布前可加 `--verify-boundary`，额外验证四个读接口拒绝匿名请求，以及携带运维凭据访问 OpenAPI、就绪探针等内部读路径仍返回 `404`。探针只发 GET 请求，使用标准证书和主机名校验，报告域名解析、TLS 校验或不可达等错误。验收电脑须在网关允许范围内，手机实际网络和微信合法域名仍需从微信验收。
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts/probe_miniprogram.py --gateway https://你的网关域名 --gateway-only --verify-boundary --prompt-password
+```
 
 微信接入层通过进程日志输出 `[miniprogram_gate]` 记录，包含操作名、接入层 HTTP 状态、结果类别、处理总耗时及服务端生成的请求编号。联调时可从 Network 面板的 `X-Miniprogram-Request-ID` 响应头找到对应记录。对读取请求，这条记录仅覆盖会话校验，成功时记录 `204`，最终数据请求的状态和耗时以 Network 面板为准。已存在的问答上游 `X-Request-ID` 仍用于查 Agent 日志。网关在接入层之前拒绝的请求不会有接入层记录。
 

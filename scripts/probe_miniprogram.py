@@ -7,6 +7,7 @@ import getpass
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 import json
 import os
+import socket
 import ssl
 from time import monotonic
 from urllib.parse import urlsplit
@@ -15,11 +16,15 @@ import warnings
 
 READY = "/api/v1/health/ready"
 TODAY = "/api/v1/reports/today"
+PRIVATE_READ_PATHS = ("/openapi.json", "/docs", READY, "/api/v1/news/sources/health",
+                      "/api/v1/reports/evaluation", "/internal/miniprogram/wechat-read-auth")
+AUTHENTICATED_READ_PATHS = (TODAY, "/api/v1/reports", "/api/v1/news",
+                            "/api/v1/news/00000000-0000-0000-0000-000000000001/timeline")
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 EXIT_CODES = {"ok": 0, "degraded": 1, "failed": 2}
 
 
-def get_json(connection, path, *, headers=None):
+def get_json(connection, path, *, headers=None, read_body=True):
     start = monotonic()
     result = {}
     payload = None
@@ -27,7 +32,8 @@ def get_json(connection, path, *, headers=None):
         connection.request("GET", path, headers=headers or {})
         response = connection.getresponse()
         result["http_status"] = response.status
-        if response.status in (200, 404) and response.headers.get_content_type() == "application/json":
+        if (read_body and response.status in (200, 404)
+                and response.headers.get_content_type() == "application/json"):
             body = response.read(MAX_RESPONSE_BYTES + 1)
             if len(body) > MAX_RESPONSE_BYTES:
                 result["reason"] = "response_too_large"
@@ -38,6 +44,10 @@ def get_json(connection, path, *, headers=None):
                     result["reason"] = "invalid_json"
     except ssl.SSLCertVerificationError:
         result["reason"] = "tls_verification_failed"
+    except socket.gaierror:
+        result["reason"] = "dns_resolution_failed"
+    except ssl.SSLError:
+        result["reason"] = "tls_handshake_failed"
     except TimeoutError:
         result["reason"] = "timeout"
     except (HTTPException, OSError):
@@ -93,6 +103,25 @@ def check_gateway(host, port, context, authorization, timeout):
     return result
 
 
+def check_boundary(host, port, context, authorization, timeout):
+    checks = {}
+    cases = [(path, None, 401) for path in AUTHENTICATED_READ_PATHS]
+    cases.extend((path, authorization, 404) for path in PRIVATE_READ_PATHS)
+    for path, credential, expected in cases:
+        connection = HTTPSConnection(host, port, context=context, timeout=timeout)
+        headers = {"Authorization": credential} if credential else None
+        result, _ = get_json(connection, path, headers=headers, read_body=False)
+        passed = result.get("http_status") == expected and "reason" not in result
+        result.update(status="ok" if passed else "failed", expected_status=expected)
+        if not passed:
+            result.setdefault("reason", "unexpected_access_status")
+        checks[path] = result
+        if "http_status" not in result:
+            break
+    return {"status": "failed" if any(check["status"] == "failed" for check in checks.values()) else "ok",
+            "checks": checks}
+
+
 def gateway_address(value):
     try:
         url = urlsplit(value)
@@ -111,6 +140,8 @@ def main():
     parser.add_argument("--upstream-port", type=int, default=8000)
     parser.add_argument("--ca-file", help="CA certificate for a gateway using a local issuer")
     parser.add_argument("--prompt-password", action="store_true", help="read the password interactively")
+    parser.add_argument("--gateway-only", action="store_true", help="skip the local FastAPI readiness check")
+    parser.add_argument("--verify-boundary", action="store_true", help="check anonymous and private-route denials")
     parser.add_argument("--timeout", type=int, default=5, help="socket timeout in seconds")
     args = parser.parse_args()
     if not 1 <= args.upstream_port <= 65535 or args.timeout < 1:
@@ -133,11 +164,22 @@ def main():
     except OSError:
         parser.error("could not load the gateway CA file")
 
-    readiness = check_readiness(args.upstream_port, args.timeout)
     host, port = args.gateway
-    gateway = check_gateway(host, port, context, "Basic " + credentials, args.timeout)
-    status = max((readiness["status"], gateway["status"]), key=EXIT_CODES.get)
-    print(json.dumps({"status": status, "readiness": readiness, "gateway": gateway}))
+    authorization = "Basic " + credentials
+    readiness = {"status": "skipped"} if args.gateway_only else check_readiness(args.upstream_port, args.timeout)
+    gateway = check_gateway(host, port, context, authorization, args.timeout)
+    output = {"readiness": readiness, "gateway": gateway}
+    statuses = [gateway["status"]]
+    if not args.gateway_only:
+        statuses.append(readiness["status"])
+    if args.verify_boundary:
+        if gateway["status"] == "failed":
+            output["boundary"] = {"status": "skipped", "reason": "gateway_check_failed"}
+        else:
+            output["boundary"] = check_boundary(host, port, context, authorization, args.timeout)
+            statuses.append(output["boundary"]["status"])
+    status = max(statuses, key=EXIT_CODES.get)
+    print(json.dumps({"status": status, **output}))
     return EXIT_CODES[status]
 
 
