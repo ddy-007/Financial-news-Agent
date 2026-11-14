@@ -5,6 +5,7 @@ const MAX_QUESTION_LENGTH = 1000
 const MAX_HISTORY_TURNS = 3
 const MAX_HISTORY_LENGTH = 8000
 const TRUNCATED_ANSWER = '\n[较长回答已截断]'
+const ARCHIVED_NEWS_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 
 function requestHistory(turns) {
   const history = []
@@ -36,6 +37,7 @@ function displaySources(sources) {
     results.push({
       id: source.id,
       title: source.title,
+      hasArchiveRoute: ARCHIVED_NEWS_ID.test(source.id),
       publishedAt: typeof source.published_at === 'string' ? source.published_at.replace('T', ' ') : '',
       url: typeof source.url === 'string' && /^https?:\/\/[^\s\\]+$/i.test(source.url) ? source.url : ''
     })
@@ -134,6 +136,13 @@ Page({
   copySource(event) {
     const source = this.data.sources[Number(event.currentTarget.dataset.index)]
     if (source && source.url) this.copyText(source.url, '链接复制失败')
+  },
+
+  openSourceArchive(event) {
+    const source = this.data.sources.find(item => item.id === event.currentTarget.dataset.id)
+    if (source && source.hasArchiveRoute) {
+      wx.navigateTo({ url: `/pages/timeline/index?newsId=${encodeURIComponent(source.id)}` })
+    }
   },
 
   copyText(data, failureMessage) {

@@ -71,8 +71,9 @@
       <view class="muted source-note">以下为本轮检索到的库内新闻。合并记录的关联链接可能指向同一事件的另一篇报道。</view>
       <view wx:for="{{sources}}" wx:key="id" class="source-row">
         <text class="source-title" user-select="true">{{item.title}}</text>
-        <view wx:if="{{item.publishedAt || item.url}}" class="source-meta">
+        <view wx:if="{{item.publishedAt || item.url || item.hasArchiveRoute}}" class="source-meta">
           <text wx:if="{{item.publishedAt}}" class="muted">记录时间 {{item.publishedAt}}</text>
+          <button wx:if="{{item.hasArchiveRoute}}" class="copy action" size="mini" data-id="{{item.id}}" bindtap="openSourceArchive">查看归档</button>
           <button wx:if="{{item.url}}" class="copy action" size="mini" data-index="{{index}}" bindtap="copySource">复制关联链接</button>
         </view>
       </view>

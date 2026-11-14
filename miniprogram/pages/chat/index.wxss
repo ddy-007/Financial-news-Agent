@@ -176,4 +176,5 @@
   align-items: center;
   justify-content: space-between;
   margin-top: 8rpx;
+  gap: 8rpx;
 }
