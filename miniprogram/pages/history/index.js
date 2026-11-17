@@ -22,11 +22,12 @@ Page({
     try {
       const records = await getDailyReports()
       if (this._unloaded) return
-      if (!Array.isArray(records)) {
-        this.setData({ error: '日报列表格式异常，请重试。' })
+      const reports = historyReports(records)
+      if (reports === null) {
+        const message = '日报列表格式异常，请重试。'
+        this.setData({ error: this.data.reports.length ? `仍显示上次加载的历史日报。${message}` : message })
         return
       }
-      const reports = historyReports(records)
       const datedReports = reports.filter(report => report.date !== '—')
       const compareDay = this._compareDay
       const previousDay = this.data.datedReports[this.data.secondIndex]?.date

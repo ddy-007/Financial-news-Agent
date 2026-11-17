@@ -1,5 +1,5 @@
 const { getLatestReport, requestErrorMessage } = require('../../utils/api')
-const { displayReport, reportDateNotice } = require('../../utils/report')
+const { displayDailyReport, reportDateNotice } = require('../../utils/report')
 
 Page({
   data: { report: null, dateNotice: '', loading: false, empty: false, error: '' },
@@ -35,9 +35,7 @@ Page({
     try {
       const payload = await getLatestReport()
       if (this._unloaded) return
-      const isDailyReport = payload?.report_type === 'daily' &&
-        typeof payload.id === 'string' && payload.id.trim() !== ''
-      const report = isDailyReport ? displayReport(payload) : null
+      const report = displayDailyReport(payload)
       if (report) {
         this.setData({ report, dateNotice: reportDateNotice(report.date) })
       } else {

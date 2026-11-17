@@ -78,12 +78,18 @@ function displayReport(report) {
   }
 }
 
+function displayDailyReport(record) {
+  if (record?.report_type !== 'daily' || !text(record.id)) return null
+  return displayReport(record)
+}
+
 function historyReports(records) {
+  if (!Array.isArray(records)) return null
   const dated = new Map()
   const undated = []
-  records.forEach((record, index) => {
-    const display = displayReport(record)
-    if (!display) return
+  for (const [index, record] of records.entries()) {
+    const display = displayDailyReport(record)
+    if (!display) return null
     const entry = {
       ...display, key: index, id: text(record.id),
       scoreValue: Number.isFinite(record.score) ? record.score : null
@@ -94,7 +100,7 @@ function historyReports(records) {
       // The API orders by generation time descending, so the first record wins.
       dated.set(entry.date, entry)
     }
-  })
+  }
   return [...dated.keys()].sort().reverse().map(day => dated.get(day)).concat(undated)
 }
 
@@ -110,4 +116,4 @@ function compareReports(first, second) {
   return { newer, older, scoreChange }
 }
 
-module.exports = { displayReport, reportDateNotice, historyReports, compareReports }
+module.exports = { displayReport, displayDailyReport, reportDateNotice, historyReports, compareReports }

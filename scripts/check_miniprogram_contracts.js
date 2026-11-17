@@ -4,6 +4,10 @@ const { test } = require('node:test')
 const { displayReport, reportDateNotice, historyReports, compareReports } = require('../miniprogram/utils/report')
 const { formatAnswer } = require('../miniprogram/utils/answer')
 
+function dailyReport(id, fields) {
+  return { id, report_type: 'daily', ...fields }
+}
+
 test('体验版和正式版只在网关配置齐全时发请求', async (t) => {
   const config = require('../miniprogram/utils/chat-config')
   const path = require.resolve('../miniprogram/utils/api')
@@ -323,13 +327,13 @@ test('关注切换丢弃过期响应，网络错误可重试，存储失败不�
 
 test('历史日报按业务日排序去重，保留旧日期来源和无日期详情', () => {
   const reports = historyReports([
-    { report_day: '2026-11-06', date: '2026-11-10T10:00:00', title: '回补的周五', score: 0 },
-    { report_day: '2026-11-09', date: '2026-11-09T18:00:00', title: '周一', score: -0.54,
-      content: { is_passed: false, critic_status: 'rejected', data_freshness: { coverage_incomplete: true } } },
-    { report_day: '2026-11-06', date: '2026-11-06T18:00:00', title: '较早的周五', score: 0.44 },
-    { date: '2026-11-05T18:00:00', score: null,
-      content: { data_freshness: { readiness_scope: 'historical_unknown', coverage_incomplete: false, evidence_excluded_count: 0 } } },
-    { title: '无日期但可查看摘要', content: { market_summary: '摘要' } }, null
+    dailyReport('fri-new', { report_day: '2026-11-06', date: '2026-11-10T10:00:00', title: '回补的周五', score: 0 }),
+    dailyReport('mon', { report_day: '2026-11-09', date: '2026-11-09T18:00:00', title: '周一', score: -0.54,
+      content: { is_passed: false, critic_status: 'rejected', data_freshness: { coverage_incomplete: true } } }),
+    dailyReport('fri-old', { report_day: '2026-11-06', date: '2026-11-06T18:00:00', title: '较早的周五', score: 0.44 }),
+    dailyReport('thu', { date: '2026-11-05T18:00:00', score: null,
+      content: { data_freshness: { readiness_scope: 'historical_unknown', coverage_incomplete: false, evidence_excluded_count: 0 } } }),
+    dailyReport('undated', { title: '无日期但可查看摘要', content: { market_summary: '摘要' } })
   ])
   assert.deepEqual(reports.map(report => report.date), ['2026-11-09', '2026-11-06', '2026-11-05', '—'])
   assert.equal(reports[1].title, '回补的周五')
@@ -365,9 +369,9 @@ test('首页入口与历史页用真实接口形状联通，可查看详情和�
   assert.match(requests[0].url, /\/api\/v1\/reports\?report_type=daily&limit=10$/)
   assert.equal(requests[0].method, 'GET')
   requests[0].success({ statusCode: 200, data: [
-    { report_day: '2026-11-10', score: 0.3 },
-    { report_day: '2026-11-09', score: -0.54 },
-    { report_day: '2026-11-06', score: 0.44, content: { market_summary: '周五摘要' } }
+    dailyReport('daily-10', { report_day: '2026-11-10', score: 0.3 }),
+    dailyReport('daily-09', { report_day: '2026-11-09', score: -0.54 }),
+    dailyReport('daily-06', { report_day: '2026-11-06', score: 0.44, content: { market_summary: '周五摘要' } })
   ] })
   await pending
   assert.equal(history.data.showCompare, true)
@@ -397,7 +401,7 @@ test('历史请求可从网络错误恢复，区分空列表和没有上期', as
   assert.equal(history.data.loaded, true)
   assert.deepEqual(history.data.reports, [])
   pending = history.loadReports()
-  requests[2].success({ statusCode: 200, data: [{ report_day: '2026-11-10', score: 1 }] })
+  requests[2].success({ statusCode: 200, data: [dailyReport('daily-10', { report_day: '2026-11-10', score: 1 })] })
   await pending
   assert.equal(history.data.showCompare, true)
   assert.equal(history.data.comparison, null)
@@ -409,10 +413,10 @@ test('历史刷新用 ID 恢复无日期日报的详情，且不影响两期对�
   const requests = mockRequests(t)
   const history = loadPage('history')
   wx.pageScrollTo = () => {}
-  const older = { report_day: '2026-11-06', score: 0 }
-  const newer = { report_day: '2026-11-09', score: 1 }
-  const undated = { id: 'undated-1', title: '无日期旧日报' }
-  const other = { id: 'undated-2', title: '另一份无日期日报' }
+  const older = dailyReport('older', { report_day: '2026-11-06', score: 0 })
+  const newer = dailyReport('newer', { report_day: '2026-11-09', score: 1 })
+  const undated = dailyReport('undated-1', { title: '无日期旧日报' })
+  const other = dailyReport('undated-2', { title: '另一份无日期日报' })
   let pending = history.onLoad({})
   requests[0].success({ statusCode: 200, data: [newer, undated, older, other] })
   await pending
@@ -430,6 +434,46 @@ test('历史刷新用 ID 恢复无日期日报的详情，且不影响两期对�
   requests[2].success({ statusCode: 200, data: [newer, older, other] })
   await pending
   assert.equal(history.data.selected, null)
+})
+
+test('畸形历史响应保留列表、已选详情和两期对照，有效空列表可清空', async (t) => {
+  const requests = mockRequests(t)
+  const history = loadPage('history')
+  wx.pageScrollTo = () => {}
+  const oldReport = dailyReport('old', { report_day: '2026-11-06', score: 0 })
+  const newReport = dailyReport('new', { report_day: '2026-11-09', score: 1 })
+  const titledError = { title: 'Bad Gateway', detail: '测试错误' }
+  const refresh = async (data) => {
+    const pending = history.loadReports()
+    requests.at(-1).success({ statusCode: 200, data })
+    await pending
+  }
+
+  await refresh([titledError])
+  assert.equal(history.data.loaded, false)
+  assert.match(history.data.error, /格式异常/)
+  await refresh([newReport, oldReport])
+  history.selectReport({ currentTarget: { dataset: { index: 0 } } })
+  const { reports, selected, comparison } = history.data
+
+  for (const data of [
+    { detail: '测试错误' }, [{ detail: '测试错误' }], [titledError], [newReport, titledError],
+    [null], [dailyReport('weekly', { report_type: 'weekly', title: '周报' })],
+    [dailyReport(' ', { title: '没有主键' })], [dailyReport('missing-content', {})]
+  ]) {
+    await refresh(data)
+    assert.equal(history.data.reports, reports)
+    assert.equal(history.data.selected, selected)
+    assert.equal(history.data.comparison, comparison)
+    assert.match(history.data.error, /仍显示上次加载的历史日报.*格式异常/)
+  }
+
+  await refresh([])
+  assert.equal(history.data.loaded, true)
+  assert.deepEqual(history.data.reports, [])
+  assert.equal(history.data.selected, null)
+  assert.equal(history.data.comparison, null)
+  assert.equal(history.data.error, '')
 })
 
 test('日报格式化保留业务日期与零分，兼容旧摘要并避免渲染异常值', () => {

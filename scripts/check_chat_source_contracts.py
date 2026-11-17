@@ -9,17 +9,18 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from httpx import Request, Response
 from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from loguru import logger
-from openai import APITimeoutError
-from httpx import Request
+from openai import APITimeoutError, AuthenticationError, RateLimitError
 
 from app.agent import react_agent, tools
 from app.agent.chat_sources import ChatSource
+from app.agent.llm import InsufficientBalanceError
 from app.api import routes_agent
 from app.api.routes_agent import router
 from app.rag.retriever import Hit
@@ -108,7 +109,14 @@ class ChatSourceContracts(unittest.TestCase):
     def test_latency_records_outcomes_without_request_or_error_text(self):
         app = FastAPI()
         app.include_router(router)
-        timeout = APITimeoutError(request=Request("POST", "https://example.invalid/private-url"))
+        upstream = Request("POST", "https://example.invalid/private-url")
+        timeout = APITimeoutError(request=upstream)
+        auth = AuthenticationError("private-auth-error", response=Response(401, request=upstream), body=None)
+        limited = RateLimitError("private-rate-error", response=Response(429, request=upstream), body=None)
+        quota = RateLimitError(
+            "private-quota-error", response=Response(429, request=upstream), body={"code": "insufficient_quota"},
+        )
+        balance = InsufficientBalanceError("private-balance-error")
         with TemporaryDirectory() as directory:
             path = Path(directory) / "chat.log"
             sink = logger.add(path, format="{message}", filter=lambda record: record["name"] == routes_agent.__name__)
@@ -116,12 +124,13 @@ class ChatSourceContracts(unittest.TestCase):
                 with (TestClient(app, raise_server_exceptions=False) as client,
                       patch.object(routes_agent, "chat_with_sources", side_effect=[
                           ("private-answer", []), ("", []), timeout, RuntimeError("private-exception"),
+                          auth, limited, quota, balance, (None, []),
                       ])):
-                    responses = [client.post("/api/v1/agent/chat", json={"query": "private-query"}) for _ in range(4)]
+                    responses = [client.post("/api/v1/agent/chat", json={"query": "private-query"}) for _ in range(9)]
             finally:
                 logger.remove(sink)
 
-            self.assertEqual([res.status_code for res in responses], [200, 200, 500, 500])
+            self.assertEqual([res.status_code for res in responses], [200, 200] + [500] * 7)
             log = path.read_text(encoding="utf-8")
             request_ids = {res.headers["X-Request-ID"] for res in responses}
             self.assertEqual(len(request_ids), len(responses))
@@ -129,14 +138,49 @@ class ChatSourceContracts(unittest.TestCase):
                 self.assertRegex(res.headers["X-Request-ID"], r"^[0-9a-f]{32}$")
                 self.assertRegex(res.headers["Server-Timing"], r"^chat;dur=\d+\.\d$")
                 self.assertIn(res.headers["X-Request-ID"], log)
-            for res in responses[2:]:
+            diagnostics = [
+                ("timeout", "-"), ("execution", "-"), ("provider_auth", "401"),
+                ("provider_rate_limit", "429"), ("provider_quota", "429"),
+                ("provider_payment_required", "402"), ("validation", "-"),
+            ]
+            for res, (category, status) in zip(responses[2:], diagnostics, strict=True):
                 self.assertEqual(res.text, "Internal Server Error")
+                self.assertRegex(log, rf"\[chat_error\] request_id={res.headers['X-Request-ID']} "
+                                      rf"category={category} status_code={status} location=app/api/routes_agent.py:\d+")
+            self.assertEqual(log.count("[chat_error]"), len(diagnostics))
             self.assertNotIn("private-", log)
             result = summarize([path, path])  # File and console may contain the same requests.
-            self.assertEqual(result["completed_requests"], 4)
-            self.assertEqual(result["outcomes"], {"answered": 1, "empty": 1, "error": 2})
-            self.assertEqual(result["error_kinds"], {"timeout": 1, "execution": 1})
+            self.assertEqual(result["completed_requests"], 9)
+            self.assertEqual(result["outcomes"], {"answered": 1, "empty": 1, "error": 7})
+            self.assertEqual(result["error_kinds"], {"timeout": 1, "execution": 6})
             self.assertEqual(result["answered_latency_ms"]["p50"], result["answered_latency_ms"]["p95"])
+
+    def test_http_exception_keeps_business_headers_and_replaces_correlation_headers(self):
+        app = FastAPI()
+        app.include_router(router)
+        error = HTTPException(429, "Retry later", headers={
+            "x-request-id": "a" * 32,
+            "X-REQUEST-ID": "b" * 32,
+            "SERVER-TIMING": "old;dur=3",
+            "Retry-After": "3",
+        })
+        records = []
+        sink = logger.add(records.append, format="{message}", filter=lambda record: record["name"] == routes_agent.__name__)
+        try:
+            with TestClient(app) as client, patch.object(routes_agent, "chat_with_sources", side_effect=error):
+                response = client.post("/api/v1/agent/chat", json={"query": "private-query"})
+        finally:
+            logger.remove(sink)
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json(), {"detail": "Retry later"})
+        self.assertEqual(response.headers["Retry-After"], "3")
+        request_ids = response.headers.get_list("X-Request-ID")
+        self.assertEqual(len(request_ids), 1)
+        self.assertRegex(request_ids[0], r"^[a-f0-9]{32}$")
+        self.assertNotIn(request_ids[0], ["a" * 32, "b" * 32])
+        self.assertEqual(len(response.headers.get_list("Server-Timing")), 1)
+        self.assertRegex(response.headers["Server-Timing"], r"^chat;dur=\d+\.\d$")
+        self.assertIn(f"[chat_error] request_id={request_ids[0]} category=http_exception status_code=429 ", "".join(records))
 
     def test_latency_summary_percentiles_and_empty_input(self):
         with TemporaryDirectory() as directory:

@@ -70,6 +70,8 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 
 遇到 `429` 时，`local_login_limit` 表示本地登录交换额度不足，`wechat_login_limit` 表示微信返回限流，`chat_quota_reached` 表示问答日配额用完。接入层日志不记录问题正文、微信凭证、请求来源地址或会话令牌。启动命令仍使用 `--no-access-log`。日志格式随接入层和 Caddy 配置一起部署或回退。
 
+用 Agent 的 `X-Request-ID` 同时查找 `[chat_request]` 和失败时的 `[chat_error]`。后者记录受控错误类别、已知 HTTP 状态码和项目内代码位置。供应商的鉴权失败、余额不足（HTTP 402）、额度用尽与限流分别记为 `provider_auth`、`provider_payment_required`、`provider_quota` 与 `provider_rate_limit`。日志省略原始异常消息、响应正文和认证信息。
+
 ## 本机问答内测
 
 `MINIPROGRAM_CHAT_ENABLED=1` 让 Caddy 将来自回环地址的 `POST /api/v1/agent/chat` 转发给独立接入层。内测时让 Caddy、接入层和原 FastAPI 均监听回环地址，并从同一台主机直接连接 Caddy。内测通过独立分发的 Bearer 凭据识别具名测试者。额度只约束网关路径，能在本机访问原 FastAPI 的用户仍能直接调用原接口，内测应在受信任的主机上进行。现有小程序仍使用原联调方式。采集、报告生成、诊断和内部路径始终返回 `404`。
