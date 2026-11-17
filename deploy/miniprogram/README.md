@@ -66,7 +66,7 @@ $env:MINIPROGRAM_GATEWAY_USER = 'tester'
 .\.venv\Scripts\python.exe -B scripts/probe_miniprogram.py --gateway https://你的网关域名 --gateway-only --verify-boundary --prompt-password
 ```
 
-微信接入层通过进程日志输出 `[miniprogram_gate]` 记录，包含操作名、接入层 HTTP 状态、结果类别、处理总耗时及服务端生成的请求编号。联调时可从 Network 面板的 `X-Miniprogram-Request-ID` 响应头找到对应记录。对读取请求，这条记录仅覆盖会话校验，成功时记录 `204`，最终数据请求的状态和耗时以 Network 面板为准。已存在的问答上游 `X-Request-ID` 仍用于查 Agent 日志。网关在接入层之前拒绝的请求不会有接入层记录。
+微信接入层通过进程日志输出 `[miniprogram_gate]` 记录，包含操作名、接入层 HTTP 状态、结果类别、处理总耗时及服务端生成的请求编号。联调时可从 Network 面板的 `X-Miniprogram-Request-ID` 响应头找到对应记录。对读取请求，这条记录仅覆盖会话校验，成功时记录 `204`，最终数据请求的状态和耗时以 Network 面板为准。问答上游返回有效的 `X-Request-ID` 时，接入层会在响应中透传该编号，并记录为 `upstream_request_id`，用于查 Agent 日志。接入层在收到上游响应前超时时，可先查接入层自己的请求编号。网关在接入层之前拒绝的请求不会有接入层记录。
 
 遇到 `429` 时，`local_login_limit` 表示本地登录交换额度不足，`wechat_login_limit` 表示微信返回限流，`chat_quota_reached` 表示问答日配额用完。接入层日志不记录问题正文、微信凭证、请求来源地址或会话令牌。启动命令仍使用 `--no-access-log`。日志格式随接入层和 Caddy 配置一起部署或回退。
 

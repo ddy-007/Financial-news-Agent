@@ -1,5 +1,7 @@
 // 开发版可以使用本机 FastAPI。体验版和正式版统一通过鉴权网关。
 const BASE_URL = 'http://127.0.0.1:8000'
+const LATEST_REPORT_PATH = '/api/v1/reports/today'
+const NO_DAILY_REPORT_DETAIL = '暂无研判报告，请先触发生成'
 const { wechatChatOrigin, wechatReadEnabled } = require('./chat-config')
 let chatSession
 let loginInFlight
@@ -13,6 +15,7 @@ function requestError(kind, statusCode) {
 
 function requestErrorMessage(error, page) {
   if (error.kind === 'config') return '服务地址配置不完整，请联系小程序管理员。'
+  if (error.kind === 'no_daily_report') return '暂无日报。'
   if (error.kind === 'login' && error.statusCode === 429) return '微信登录请求过于频繁，请稍后重试。'
   if (error.kind === 'login' && error.statusCode === 403) return '微信暂未允许本次登录。'
   if (error.kind === 'login') return page === 'chat' ? '微信登录失败，请稍后重新发送。' : '微信登录失败，请稍后重试。'
@@ -25,7 +28,6 @@ function requestErrorMessage(error, page) {
   if (error.kind === 'network') return '无法连接后端，请检查服务地址和网络。'
   if (error.kind === 'http') {
     const status = error.statusCode
-    if (status === 404 && page === 'report') return '暂无日报。'
     if (status === 400 || status === 422) return '请求内容或格式有误，请检查后重试。'
     if (status === 401 || status === 403) return '服务访问受限，请检查访问权限。'
     if (status === 429) return '请求过于频繁，请稍后重试。'
@@ -51,7 +53,9 @@ function request(path, { method = 'GET', data, timeout, origin = BASE_URL, token
           resolve(body)
           return
         }
-        reject(requestError('http', statusCode))
+        const noDailyReport = path === LATEST_REPORT_PATH && statusCode === 404 &&
+          body?.detail === NO_DAILY_REPORT_DETAIL
+        reject(requestError(noDailyReport ? 'no_daily_report' : 'http', statusCode))
       },
       fail({ errMsg = '' } = {}) {
         reject(requestError(/timeout|timed out/i.test(errMsg) ? 'timeout' : 'network'))
@@ -82,7 +86,7 @@ async function loginForChat() {
 }
 
 function getLatestReport() {
-  return read('/api/v1/reports/today', { timeout: 12000 })
+  return read(LATEST_REPORT_PATH, { timeout: 12000 })
 }
 
 function getDailyReports() {

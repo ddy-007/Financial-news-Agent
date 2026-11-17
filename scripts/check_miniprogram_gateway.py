@@ -52,6 +52,8 @@ class StubUpstream(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Stub-Upstream", "1")
+        for name, value in self.server.response_headers.get(url.path, {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -86,6 +88,7 @@ class GatewayChecks(unittest.TestCase):
         work = Path(cls.enterClassContext(TemporaryDirectory(prefix="ws-miniprogram-gateway-")))
         upstream = cls.enterClassContext(ThreadingHTTPServer((LOOPBACK, 0), StubUpstream))
         upstream.responses = {}
+        upstream.response_headers = {}
         upstream.posts = []
         cls.upstream = upstream
         thread = Thread(target=upstream.serve_forever, daemon=True)

@@ -225,10 +225,18 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
         calls.append((status, headers, "authorize_read", 401, "session_required"))
         self.upstream.responses[CHAT_PATH] = (500, {"detail": "private-upstream-error"})
         self.addCleanup(self.upstream.responses.pop, CHAT_PATH)
-        status, headers, _ = self.post(auth="Bearer " + token, body=b'{"query":"private-question-marker"}')
+        agent_request_id = "ab" * 16
+        self.upstream.response_headers[CHAT_PATH] = {"X-Request-ID": agent_request_id}
+        self.addCleanup(self.upstream.response_headers.pop, CHAT_PATH)
+        status, headers, body = self.post(auth="Bearer " + token, body=b'{"query":"private-question-marker"}')
+        self.assertEqual(headers["X-Request-ID"], agent_request_id)
+        self.assertNotIn(b"private-upstream-error", body)
+        gate_request_id = headers["X-Miniprogram-Request-ID"]
         calls.append((status, headers, "chat", 502, "chat_upstream_failed"))
         self.upstream.responses[CHAT_PATH] = (200, {"answer": "  ", "sources": []})
+        self.upstream.response_headers[CHAT_PATH] = {"X-Request-ID": "malformed-upstream-id"}
         status, headers, _ = self.post(auth="Bearer " + token)
+        self.assertIsNone(headers.get("X-Request-ID"))
         calls.append((status, headers, "chat", 200, "empty_answer"))
         log = self.gate_log_path.read_text(encoding="utf-8", errors="replace")
         for status, headers, operation, logged_status, outcome in calls:
@@ -237,9 +245,10 @@ uvicorn.run('deploy.miniprogram.chat_gate:create_app', factory=True, host='127.0
             self.assertRegex(request_id, r"^[a-f0-9]{32}$")
             self.assertRegex(log, re.escape(f"request_id={request_id} operation={operation} "
                                             f"status={logged_status} outcome={outcome} elapsed_ms=") + r"\d+\.\d")
+        self.assertRegex(log, rf"request_id={gate_request_id}[^\r\n]+ upstream_request_id={agent_request_id}\b")
         for secret in (token, "synthetic-secret", "openid-marker", "key-marker", "private-login-code",
                        "private-question-marker", "private-upstream-error", "private-unexpected-error",
-                       "forged-id-marker"):
+                       "forged-id-marker", "malformed-upstream-id"):
             self.assertNotIn(secret, log)
 
     def test_login_sessions_share_identity_quota_and_expire(self):

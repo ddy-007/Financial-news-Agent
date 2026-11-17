@@ -54,19 +54,23 @@ function displayReport(report) {
   if (!isObject(report)) return null
 
   const content = isObject(report.content) ? report.content : {}
-  const [auditLabel, auditTone, auditNote] = auditDisplay(content)
   const businessDay = validDay(text(report.report_day))
   const day = businessDay || validDay(text(report.date).slice(0, 10))
+  const title = text(report.title)
+  const summary = text(content.market_summary) || text(content.raw)
+  if (!day && !title && !summary) return null
+
+  const [auditLabel, auditTone, auditNote] = auditDisplay(content)
   const confidence = text(report.confidence)
 
   return {
-    title: text(report.title) || '未命名日报',
+    title: title || '未命名日报',
     date: day || '—',
     dateSource: businessDay ? '' : day ? '按生成日期显示' : '报告日期未提供',
     sentiment: text(report.sentiment) || '—',
     score: Number.isFinite(report.score) ? report.score.toFixed(2) : '—',
     confidence: CONFIDENCE_LABELS.get(confidence) || confidence || '—',
-    summary: text(content.market_summary) || text(content.raw) || '暂无摘要。',
+    summary: summary || '暂无摘要。',
     coverage: coverageNotice(content.data_freshness),
     auditLabel,
     auditTone,
@@ -81,7 +85,7 @@ function historyReports(records) {
     const display = displayReport(record)
     if (!display) return
     const entry = {
-      ...display, key: index,
+      ...display, key: index, id: text(record.id),
       scoreValue: Number.isFinite(record.score) ? record.score : null
     }
     if (entry.date === '—') {

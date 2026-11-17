@@ -123,7 +123,14 @@ class ChatSourceContracts(unittest.TestCase):
 
             self.assertEqual([res.status_code for res in responses], [200, 200, 500, 500])
             log = path.read_text(encoding="utf-8")
-            self.assertIn(responses[0].headers["X-Request-ID"], log)
+            request_ids = {res.headers["X-Request-ID"] for res in responses}
+            self.assertEqual(len(request_ids), len(responses))
+            for res in responses:
+                self.assertRegex(res.headers["X-Request-ID"], r"^[0-9a-f]{32}$")
+                self.assertRegex(res.headers["Server-Timing"], r"^chat;dur=\d+\.\d$")
+                self.assertIn(res.headers["X-Request-ID"], log)
+            for res in responses[2:]:
+                self.assertEqual(res.text, "Internal Server Error")
             self.assertNotIn("private-", log)
             result = summarize([path, path])  # File and console may contain the same requests.
             self.assertEqual(result["completed_requests"], 4)

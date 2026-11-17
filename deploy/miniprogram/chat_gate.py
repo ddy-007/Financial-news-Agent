@@ -39,6 +39,7 @@ BUSINESS_TZ = timezone(timedelta(hours=8))
 NO_STORE = {"Cache-Control": "no-store"}
 TOKEN_PATTERN = re.compile(r"Bearer ([A-Za-z0-9_-]{43})", re.IGNORECASE | re.ASCII)
 REQUEST_ID_HEADER = "X-Miniprogram-Request-ID"
+UPSTREAM_REQUEST_ID_HEADER = "X-Request-ID"
 gate_log = logging.getLogger("uvicorn.error")
 
 
@@ -76,8 +77,9 @@ class ObservedRoute(APIRoute):
                 status, outcome = response.status_code, getattr(request.state, "outcome", "ok")
                 return response
             finally:
-                gate_log.info("[miniprogram_gate] request_id=%s operation=%s status=%d outcome=%s elapsed_ms=%.1f",
-                              request_id, self.name, status, outcome, (perf_counter() - started) * 1000)
+                gate_log.info("[miniprogram_gate] request_id=%s operation=%s status=%d outcome=%s elapsed_ms=%.1f "
+                              "upstream_request_id=%s", request_id, self.name, status, outcome,
+                              (perf_counter() - started) * 1000, getattr(request.state, "upstream_request_id", "-"))
 
         return observed
 
@@ -313,19 +315,24 @@ def create_app():
             raise GateError(504, "chat_timeout", "Chat service timed out") from None
         except httpx.RequestError:
             raise GateError(502, "chat_unavailable", "Chat service unavailable") from None
+        headers = {}
+        upstream_id = upstream.headers.get(UPSTREAM_REQUEST_ID_HEADER, "")
+        if re.fullmatch(r"[a-f0-9]{32}", upstream_id):
+            request.state.upstream_request_id = upstream_id
+            headers[UPSTREAM_REQUEST_ID_HEADER] = upstream_id
         if upstream.status_code != 200 or upstream.headers.get("content-type", "").split(";")[0] != "application/json":
-            raise GateError(502, "chat_upstream_failed", "Chat service failed")
+            raise GateError(502, "chat_upstream_failed", "Chat service failed", headers=headers)
         try:
             result = upstream.json()
         except (ValueError, RecursionError):
-            raise GateError(502, "invalid_chat_response", "Invalid chat response") from None
+            raise GateError(502, "invalid_chat_response", "Invalid chat response", headers=headers) from None
         if not (isinstance(result, dict) and isinstance(result.get("answer"), str)
                 and isinstance(result.get("sources"), list)):
-            raise GateError(502, "invalid_chat_response", "Invalid chat response")
+            raise GateError(502, "invalid_chat_response", "Invalid chat response", headers=headers)
         if not result["answer"].strip():
             request.state.outcome = "empty_answer"
-        headers = {**NO_STORE, **{key: upstream.headers[key] for key in ("X-Request-ID", "Server-Timing")
-                                  if key in upstream.headers}}
-        return Response(upstream.content, media_type="application/json", headers=headers)
+        if "Server-Timing" in upstream.headers:
+            headers["Server-Timing"] = upstream.headers["Server-Timing"]
+        return Response(upstream.content, media_type="application/json", headers={**NO_STORE, **headers})
 
     return app

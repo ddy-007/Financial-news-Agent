@@ -21,6 +21,7 @@
         <text class="badge badge--{{report.auditTone}}">{{report.auditLabel}}</text>
       </view>
       <view class="report-title">{{report.title}}</view>
+      <view wx:if="{{report.dateSource && report.date !== '—'}}" class="report-note muted">{{report.dateSource}}</view>
       <view wx:if="{{dateNotice}}" class="report-note muted">{{dateNotice}}</view>
       <view class="report-note muted">{{report.auditNote}}</view>
       <view class="metrics">

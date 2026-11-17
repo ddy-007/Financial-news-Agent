@@ -35,8 +35,10 @@ Page({
       const secondIndex = previousDay
         ? datedReports.findIndex(report => report.date === previousDay)
         : firstIndex >= 0 && firstIndex + 1 < datedReports.length ? firstIndex + 1 : -1
-      const selectedDay = this.data.selected?.date
-      const selected = (selectedDay && selectedDay !== '—' && reports.find(report => report.date === selectedDay)) || null
+      const previous = this.data.selected
+      const selected = previous && (previous.date === '—'
+        ? reports.find(report => previous.id && report.id === previous.id)
+        : reports.find(report => report.date === previous.date)) || null
       const comparison = compareReports(datedReports[firstIndex], datedReports[secondIndex])
       this.setData({
         reports, datedReports, dateOptions: ['请选择', ...datedReports.map(report => report.date)],

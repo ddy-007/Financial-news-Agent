@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict')
+const { readFileSync } = require('node:fs')
 const { test } = require('node:test')
 const { displayReport, reportDateNotice, historyReports, compareReports } = require('../miniprogram/utils/report')
 const { formatAnswer } = require('../miniprogram/utils/answer')
@@ -404,6 +405,33 @@ test('历史请求可从网络错误恢复，区分空列表和没有上期', as
   assert.equal(history.data.error, '')
 })
 
+test('历史刷新用 ID 恢复无日期日报的详情，且不影响两期对照', async (t) => {
+  const requests = mockRequests(t)
+  const history = loadPage('history')
+  wx.pageScrollTo = () => {}
+  const older = { report_day: '2026-11-06', score: 0 }
+  const newer = { report_day: '2026-11-09', score: 1 }
+  const undated = { id: 'undated-1', title: '无日期旧日报' }
+  const other = { id: 'undated-2', title: '另一份无日期日报' }
+  let pending = history.onLoad({})
+  requests[0].success({ statusCode: 200, data: [newer, undated, older, other] })
+  await pending
+  history.selectReport({ currentTarget: { dataset: { index: 2 } } })
+  assert.equal(history.data.selected.id, undated.id)
+
+  pending = history.loadReports()
+  requests[1].success({ statusCode: 200, data: [other, older, { ...undated, title: '更新摘要前的标题' }, newer] })
+  await pending
+  assert.equal(history.data.selected.id, undated.id)
+  assert.equal(history.data.selected.title, '更新摘要前的标题')
+  assert.equal(history.data.comparison.scoreChange, '+1.00')
+
+  pending = history.loadReports()
+  requests[2].success({ statusCode: 200, data: [newer, older, other] })
+  await pending
+  assert.equal(history.data.selected, null)
+})
+
 test('日报格式化保留业务日期与零分，兼容旧摘要并避免渲染异常值', () => {
   const report = displayReport({
     report_day: '2026-11-12', date: '2026-11-13T18:30:00', score: 0,
@@ -417,12 +445,12 @@ test('日报格式化保留业务日期与零分，兼容旧摘要并避免渲�
   assert.equal(report.confidence, '中')
   assert.equal(report.summary, '原始摘要')
   assert.equal(report.coverage, '新闻覆盖范围未记录。')
-  const withCoverage = (data_freshness) => displayReport({ content: { data_freshness } }).coverage
+  const withCoverage = (data_freshness) => displayReport({ title: '日报', content: { data_freshness } }).coverage
   assert.match(withCoverage({ evidence_excluded_count: 35 }), /覆盖受限/)
   assert.equal(withCoverage({ readiness_scope: 'snapshot', coverage_incomplete: false, evidence_excluded_count: 0 }), '')
   assert.match(withCoverage({ readiness_scope: 'historical_unknown', coverage_incomplete: false, evidence_excluded_count: 0 }), /未记录/)
   assert.equal(displayReport({ report_day: '2026-02-30', date: '2026-03-01T00:00:00' }).date, '2026-03-01')
-  assert.equal(displayReport({ content: [] }).summary, '暂无摘要。')
+  assert.equal(displayReport({ title: '旧日报', content: [] }).summary, '暂无摘要。')
   assert.equal(displayReport(null), null)
 })
 
@@ -447,7 +475,7 @@ test('审计徽标只在两个字段一致通过时标绿', () => {
     ['unknown', true, '尚未完成核验', 'pending'],
     [undefined, true, '尚未完成核验', 'pending']
   ]) {
-    const report = displayReport({ content: { critic_status: status, is_passed: flag } })
+    const report = displayReport({ title: '日报', content: { critic_status: status, is_passed: flag } })
     assert.equal(report.auditLabel, label, String(status))
     assert.equal(report.auditTone, tone, String(status))
     assert.ok(report.auditNote)
@@ -465,7 +493,7 @@ test('日报页处理 404、畸形响应和刷新失败，保留上次数据', a
   assert.match(requests[0].url, /\/api\/v1\/reports\/today$/)
   assert.equal(requests[0].method, 'GET')
   assert.equal(requests[0].timeout, 12000)
-  requests[0].success({ statusCode: 404 })
+  requests[0].success({ statusCode: 404, data: { detail: '暂无研判报告，请先触发生成' } })
   await pending
   assert.equal(page.data.empty, true)
   pending = page.loadReport()
@@ -473,7 +501,9 @@ test('日报页处理 404、畸形响应和刷新失败，保留上次数据', a
   await pending
   assert.match(page.data.error, /格式异常/)
   pending = page.loadReport()
-  requests[2].success({ statusCode: 200, data: { title: '测试日报', report_day: '2026-11-01' } })
+  requests[2].success({ statusCode: 200, data: {
+    id: 'daily-1', report_type: 'daily', title: '测试日报', report_day: '2026-11-01'
+  } })
   await pending
   assert.equal(page.data.empty, false)
   assert.equal(page.data.dateNotice, '')
@@ -485,6 +515,48 @@ test('日报页处理 404、畸形响应和刷新失败，保留上次数据', a
   assert.match(page.data.dateNotice, /最近一期/)
   assert.equal(page.data.report.title, '测试日报')
   assert.equal(page.data.loading, false)
+})
+
+test('日报首页区分拒绝访问和无日报，异常对象不会覆盖已有日报', async (t) => {
+  const requests = mockRequests(t)
+  const page = loadPage('report')
+  let pending = page.loadReport()
+  requests[0].success({ statusCode: 404, data: '' })
+  await pending
+  assert.equal(page.data.empty, false)
+  assert.match(page.data.error, /HTTP 404/)
+
+  pending = page.loadReport()
+  requests[1].success({ statusCode: 200, data: {
+    id: 'daily-old', report_type: 'daily', date: '2026-11-06T18:30:00', title: '旧日报'
+  } })
+  await pending
+  const displayed = page.data.report
+  assert.equal(displayed.dateSource, '按生成日期显示')
+  const template = readFileSync(require.resolve('../miniprogram/pages/report/index.wxml'), 'utf8')
+  assert.match(template, /\{\{report\.dateSource\}\}/)
+
+  for (const data of [
+    {},
+    { detail: '上游异常' },
+    { title: '网关错误', detail: '上游异常' },
+    { id: 'weekly-1', report_type: 'weekly', title: '周报' },
+    { id: ' ', report_type: 'daily', title: '没有主键' }
+  ]) {
+    pending = page.loadReport()
+    requests.at(-1).success({ statusCode: 200, data })
+    await pending
+    assert.deepEqual(page.data.report, displayed)
+    assert.match(page.data.error, /仍显示上次加载的日报。日报数据格式异常/)
+  }
+  pending = page.loadReport()
+  requests.at(-1).success({ statusCode: 200, data: {
+    id: 'daily-new', report_type: 'daily', title: '新日报', report_day: '2026-11-09'
+  } })
+  await pending
+  assert.equal(page.data.report.title, '新日报')
+  assert.equal(page.data.report.dateSource, '')
+  assert.equal(page.data.error, '')
 })
 
 test('问答页阻止空白、超长及重复发送，显示等待并支持复制', async (t) => {

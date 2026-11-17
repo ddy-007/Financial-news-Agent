@@ -33,8 +33,11 @@ Page({
     if (this.data.loading || this._unloaded) return
     this.setData({ loading: true, empty: false, error: '' })
     try {
-      const report = displayReport(await getLatestReport())
+      const payload = await getLatestReport()
       if (this._unloaded) return
+      const isDailyReport = payload?.report_type === 'daily' &&
+        typeof payload.id === 'string' && payload.id.trim() !== ''
+      const report = isDailyReport ? displayReport(payload) : null
       if (report) {
         this.setData({ report, dateNotice: reportDateNotice(report.date) })
       } else {
@@ -42,7 +45,7 @@ Page({
       }
     } catch (error) {
       if (this._unloaded) return
-      if (error.kind === 'http' && error.statusCode === 404 && !this.data.report) {
+      if (error.kind === 'no_daily_report' && !this.data.report) {
         this.setData({ empty: true })
       } else {
         this.showLoadError(requestErrorMessage(error, 'report'))
